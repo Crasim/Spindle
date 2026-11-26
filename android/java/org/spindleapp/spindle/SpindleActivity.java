@@ -33,6 +33,35 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     private WebView htmlPreview;
     private PopupWindow htmlPreviewWindow;
     private String htmlPreviewUrl;
+    private boolean handlesBack;
+    private android.window.OnBackInvokedCallback backCallback;
+    private native void nativeBack();
+
+    public void setBackNavigation(boolean enabled) {
+        runOnUiThread(() -> {
+            if (handlesBack == enabled || isDestroyed()) return;
+            handlesBack = enabled;
+            if (android.os.Build.VERSION.SDK_INT >= 33) {
+                if (enabled) {
+                    backCallback = this::nativeBack;
+                    getOnBackInvokedDispatcher().registerOnBackInvokedCallback(
+                            android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, backCallback);
+                } else if (backCallback != null) {
+                    getOnBackInvokedDispatcher().unregisterOnBackInvokedCallback(backCallback);
+                    backCallback = null;
+                }
+            }
+        });
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (handlesBack) {
+            nativeBack();
+        } else {
+            super.onBackPressed();
+        }
+    }
 
     private static final int WEB_LOCATION_PERMISSION = 561;
     private long pendingWebLocation;

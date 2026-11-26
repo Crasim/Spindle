@@ -498,7 +498,7 @@ impl Desktop {
             )
             .clicked()
             {
-                self.page = Page::Settings;
+                self.open_settings();
                 self.preferences_tab = false;
                 self.models_tab = false;
                 self.memory_tab = false;
@@ -513,8 +513,17 @@ impl Desktop {
         }
     }
 
+    pub(super) fn dismiss_settings_forms(&mut self) {
+        self.provider_setup = ProviderSetup::Connections;
+        self.connection = Connection::default();
+        self.settings_feedback.clear();
+        self.browser_setup.manage = None;
+    }
+
     pub(super) fn settings(&mut self, ui: &mut egui::Ui) {
-        ui.set_max_width(ui.available_width().min(780.));
+        let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.);
+        let width = ui.available_width().min(visible_width).min(780.);
+        ui.set_max_width(width);
         ui.add_space(8.);
         if self.provider_setup != ProviderSetup::Connections {
             self.add_provider_panel(ui);
@@ -814,29 +823,39 @@ impl Desktop {
             let mut roster = self.view.state.council.clone();
             for member in self.view.state.council.clone() {
                 let (p, tag) = route(&member);
-                ui.horizontal(|ui| {
-                    symbol(ui, Icon::Chip, accent());
-                    ui.label(format!("{} / {tag}", self.provider_name(p)));
-                    if !self.view.models.contains(&member) {
-                        ui.label("Unavailable");
-                    }
-                    if ui
-                        .add_enabled(roster.len() > 1, egui::Button::new("Remove"))
-                        .clicked()
-                    {
+                let name = format!("{} / {tag}", self.provider_name(p));
+                let available = self.view.models.contains(&member);
+                let row = egui::Layout::right_to_left(egui::Align::Center);
+                ui.allocate_ui_with_layout(egui::vec2(width, 32.), row, |ui| {
+                    let remove = ui.add_enabled(
+                        roster.len() > 1,
+                        egui::Button::new("Remove").min_size(egui::vec2(0., 32.)),
+                    ).on_hover_text(format!("Remove {name} from the council"));
+                    if remove.clicked() {
                         roster.retain(|m| m != &member);
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        symbol(ui, Icon::Chip, accent());
+                        ui.vertical(|ui| {
+                            ui.set_width(ui.available_width());
+                            ui.add(egui::Label::new(name).wrap());
+                            if !available {
+                                ui.weak("Unavailable");
+                            }
+                        });
+                    });
                 });
             }
             if roster.len() < 4 {
                 crate::widgets::InlineChoice::from_id_salt("council-add")
                     .selected_text("Add a model…")
+                    .width(width.min(340.))
                     .show_ui(ui, |ui| {
                         for m in &self.view.models {
                             let (p, tag) = route(m);
                             if !roster.contains(m)
                                 && ui
-                                    .button(format!("{} / {tag}", self.provider_name(p)))
+                                    .add(egui::Button::new(format!("{} / {tag}", self.provider_name(p))).wrap())
                                     .clicked()
                             {
                                 roster.push(m.clone());
@@ -1141,10 +1160,10 @@ impl Desktop {
     }
 
     fn browser_management(&mut self, ui: &mut egui::Ui, browser: crate::browser::LinkBrowser) {
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Back").clicked() { self.browser_setup.manage = None; }
-            ui.strong(browser.label());
-        });
+        if super::panel_header(ui, browser.label(), "Back") {
+            self.browser_setup.manage = None;
+            return;
+        }
         ui.add_space(8.);
         ui.horizontal_wrapped(|ui| {
             ui.label("Allow Spindle access in this workspace");

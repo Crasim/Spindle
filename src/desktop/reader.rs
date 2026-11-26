@@ -759,15 +759,7 @@ impl ReaderPane {
                 }
                 ui.horizontal_top(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
-                        let close = ui.add(
-                            egui::Button::new(Text::new("×").size(20.))
-                                .frame(false)
-                                .min_size(egui::vec2(30., 30.)),
-                        );
-                        close.widget_info(|| egui::WidgetInfo::labeled(
-                            egui::WidgetType::Button, ui.is_enabled(), "Close side panel",
-                        ));
-                        if close.on_hover_text("Close side panel").clicked() {
+                        if crate::widgets::close_button(ui, "Close side panel").clicked() {
                             self.open = false;
                             self.preview.hide();
                             self.browser.hide();
@@ -1160,7 +1152,7 @@ pub(super) fn file_card(ui: &mut egui::Ui, name: &str, bytes: usize) -> Option<F
             if options {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    if ui.small_button("Close").clicked() {
+                    if crate::widgets::close_button(ui, "Close file options").clicked() {
                         options = false;
                     }
                     if (readable || html) && ui.button("View source").clicked() {

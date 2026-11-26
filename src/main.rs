@@ -89,6 +89,27 @@ mod android {
         LINK.lock().unwrap().take()
     }
 
+    static BACK_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[unsafe(no_mangle)]
+    pub extern "system" fn Java_org_spindleapp_spindle_SpindleActivity_nativeBack(
+        _env: jni::JNIEnv,
+        _activity: jni::objects::JObject,
+    ) {
+        BACK_REQUESTED.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn take_back() -> bool {
+        BACK_REQUESTED.swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
+
+    pub fn set_back_navigation(enabled: bool) {
+        let _ = java(|env, activity| {
+            env.call_method(activity, "setBackNavigation", "(Z)V", &[enabled.into()])?;
+            Ok(())
+        });
+    }
+
     /// Whether the camera may be used (asked for the first time the scanner opens).
     pub fn camera_allowed() -> bool {
         java(|env, activity| {

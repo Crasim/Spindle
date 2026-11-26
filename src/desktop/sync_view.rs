@@ -367,7 +367,7 @@ impl Desktop {
                             if ui.button("Copy").clicked() {
                                 ui.ctx().copy_text(r.clone());
                             }
-                            if ui.button("Close").clicked() {
+                            if crate::widgets::close_button(ui, "Close sync report").clicked() {
                                 f.check = None;
                             }
                             #[cfg(not(target_os = "android"))]
@@ -446,7 +446,12 @@ impl Desktop {
                             send.push(change("sync", enabled));
                         }
                         let open = f.manage_device.as_deref() == Some(id.as_str());
-                        if ui.button(if open { "Close" } else { "Manage" }).clicked() {
+                        let toggle = if open {
+                            crate::widgets::close_button(ui, "Close device settings")
+                        } else {
+                            ui.button("Manage")
+                        };
+                        if toggle.clicked() {
                             f.manage_device = if open { None } else { Some(id.clone()) };
                         }
                     }

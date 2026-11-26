@@ -59,7 +59,7 @@ impl InlineChoice {
             let inner = if open {
                 ui.group(|ui| {
                     ui.set_max_width(width);
-                    if ui.small_button("Close choices").clicked() {
+                    if close_button(ui, "Close choices").clicked() {
                         open = false;
                         return None;
                     }
@@ -81,6 +81,16 @@ impl InlineChoice {
             egui::InnerResponse { inner, response }
         }).inner
     }
+}
+
+pub fn close_button(ui: &mut Ui, label: &str) -> Response {
+    let response = ui.add(
+        egui::Button::new(egui::RichText::new("×").size(20.))
+            .frame(false)
+            .min_size(vec2(30., 30.)),
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label));
+    response.on_hover_text(label)
 }
 
 pub fn switch(ui: &mut Ui, enabled: &mut bool, label: &str) -> Response {
@@ -259,6 +269,7 @@ pub enum Icon {
     Attach,
     Chip,
     Arrow,
+    Back,
     Star,
     Plug,
     Check,
@@ -576,6 +587,10 @@ pub fn draw_with(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32
         Icon::Clock => {
             circle(12., 12., 9.);
             path(&[(12., 6.), (12., 12.), (16., 15.)]);
+        }
+        Icon::Back => {
+            path(&[(12., 5.), (5., 12.), (12., 19.)]);
+            path(&[(5., 12.), (19., 12.)]);
         }
         Icon::Chevron => path(&[(7., 10.), (12., 15.), (17., 10.)]),
         Icon::Memory => path(&[

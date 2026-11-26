@@ -796,7 +796,8 @@ impl Desktop {
                 self.memory_tab = false;
                 self.sandbox_tab = true;
                 self.integration_tab = None;
-                self.page = Page::Settings;
+                self.sync_tab = false;
+                self.open_settings();
             }
             NoteAction::ShowPlan(changed) => {
                 self.plan.highlight = changed;
@@ -1235,7 +1236,8 @@ impl Desktop {
         self.memory_tab = true;
         self.sandbox_tab = false;
         self.integration_tab = None;
-        self.page = Page::Settings;
+        self.sync_tab = false;
+            self.open_settings();
     }
 
     /// Settings › Memory: the switches, and everything Spindle remembers to read, edit or forget.
@@ -2275,7 +2277,7 @@ mod tests {
         // The menu button at the top left opens the drawer.
         let labels = tap(&mut app, Pos2::new(28., 25.));
         assert!(app.drawer, "{:?}", labels.keys());
-        assert!(labels.contains_key("Close") && labels.contains_key("Settings"));
+        assert!(labels.contains_key("×") && labels.contains_key("Settings"));
         // Choosing a page closes it.
         let labels = tap(&mut app, labels["Settings"]);
         assert!(!app.drawer);
@@ -2285,8 +2287,16 @@ mod tests {
         run_at(&mut app, &ctx, vec![], phone);
         let labels = run_at(&mut app, &ctx, vec![], phone);
         assert!(labels.contains_key("Start syncing"), "{:?}", labels.keys());
-        // The side panel covers the screen and Close brings the chat back.
-        app.page = Page::Chat;
+        // Back from Preferences returns to the chat and keeps its draft.
+        let chat = app.view.state.chat_id;
+        app.draft = "draft before settings".into();
+        tap(&mut app, labels["Preferences"]);
+        assert!(app.preferences_tab);
+        tap(&mut app, Pos2::new(23., 25.));
+        assert_eq!(app.page, Page::Chat);
+        assert_eq!(app.view.state.chat_id, chat);
+        assert_eq!(app.draft, "draft before settings");
+        // The side panel covers the screen and × brings the chat back.
         app.reader.open = true;
         run_at(&mut app, &ctx, vec![], phone);
         let labels = run_at(&mut app, &ctx, vec![], phone);
@@ -2301,6 +2311,64 @@ mod tests {
         assert!(close.x > 300., "{close:?}");
         tap(&mut app, close);
         assert!(!app.reader.open);
+    }
+
+    #[test]
+    fn mobile_settings_back_restores_the_origin_even_from_a_detail_panel() {
+        let phone = egui::vec2(320., 720.);
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = std::sync::mpsc::channel();
+        let (_, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        app.page = Page::Project;
+        app.open_settings();
+        app.open_settings();
+        app.details = true;
+        run_at(&mut app, &ctx, vec![], phone);
+        app.go_back(&ctx);
+        run_at(&mut app, &ctx, vec![], phone);
+        assert_eq!(app.page, Page::Project);
+        assert!(!app.details);
+        app.go_back(&ctx);
+        assert_eq!(app.page, Page::Chat);
+    }
+
+    #[test]
+    fn long_council_names_keep_remove_and_add_visible_on_a_phone() {
+        let phone = egui::vec2(320., 3200.);
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = std::sync::mpsc::channel();
+        let (_, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        app.view.state.preferences.text_size = 22;
+        app.open_settings();
+        app.preferences_tab = true;
+        let members = [
+            "qwen3.5:9b",
+            "Maternion/spark-x2.6:4b-Q8_0-some-very-long-unbroken-model-tag",
+        ];
+        for (kept, removed) in [(members[0], members[1]), (members[1], members[0])] {
+            app.view.state.council = vec![kept.into(), removed.into()];
+            run_at(&mut app, &ctx, vec![], phone);
+            let labels = run_at(&mut app, &ctx, vec![], phone);
+            let pos = labels["Remove"];
+            assert!(pos.x > 230. && pos.x < 288., "{pos:?}");
+            assert!(labels.keys().any(|label| label.ends_with("Add a model…")));
+            for pressed in [true, false] {
+                run_at(&mut app, &ctx, vec![
+                    Event::PointerMoved(pos),
+                    Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() },
+                ], phone);
+            }
+            let sent: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+            assert!(sent.contains(&format!("/council set {kept}")), "{sent:?}");
+        }
     }
 
     /// A project from another device: Spindle asks where projects go, and the folder can be

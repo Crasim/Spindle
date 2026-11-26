@@ -112,7 +112,7 @@ impl Desktop {
             self.page = Page::Queue;
         } else if open_sync {
             self.execution_panel = None;
-            self.page = Page::Settings;
+            self.open_settings();
             self.sync_tab = true;
             self.integration_tab = None;
         }

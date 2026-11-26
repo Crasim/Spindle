@@ -213,7 +213,7 @@ use crate::widgets::*;
 use std::{path::PathBuf, sync::mpsc::Receiver, time::Duration};
 use tokio::sync::mpsc::UnboundedSender;
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Page {
     Projects,
     Project,
@@ -224,17 +224,33 @@ enum Page {
     Settings,
 }
 
+// A system Back request uses the detail panel's existing dismissal path.
+const PANEL_BACK: &str = "mobile-panel-back";
+const PANEL_DISMISSED: &str = "mobile-panel-dismissed";
+
 fn panel_header(ui: &mut egui::Ui, title: &str, button: &str) -> bool {
     let closed = ui
         .horizontal_wrapped(|ui| {
-            let closed = ui.button(button).clicked();
+            let closed = if button == "Close" {
+                crate::widgets::close_button(ui, "Close panel").clicked()
+            } else {
+                ui.button(button).clicked()
+            };
             ui.heading(title);
             closed
         })
         .inner
-        || ui.input(|input| input.key_pressed(egui::Key::Escape));
+        || ui.input(|input| input.key_pressed(egui::Key::Escape))
+        || ui.data_mut(|data| data.remove_temp::<bool>(egui::Id::new(PANEL_BACK))).unwrap_or(false);
+    if closed && mobile_navigation(ui.ctx()) {
+        ui.data_mut(|data| data.insert_temp(egui::Id::new(PANEL_DISMISSED), true));
+    }
     ui.separator();
     closed
+}
+
+fn mobile_navigation(ctx: &egui::Context) -> bool {
+    cfg!(target_os = "android") || narrow(ctx)
 }
 
 fn detail_panel(
@@ -282,6 +298,9 @@ pub struct Desktop {
     ollama_key: String,
     /// The page and chat when the drawer opened: moving to another closes it.
     drawer_at: Option<(std::mem::Discriminant<Page>, u64)>,
+    settings_return: Page,
+    #[cfg(target_os = "android")]
+    handles_system_back: bool,
     reported_view: Option<u64>,
     message_editors: message_edit::MessageEditors,
     paste_drafts: paste::PasteDrafts,
@@ -866,6 +885,9 @@ impl Desktop {
             sync_form: Default::default(),
             drawer: false,
             drawer_at: None,
+            settings_return: Page::Chat,
+            #[cfg(target_os = "android")]
+            handles_system_back: false,
             reported_view: None,
             ollama_address: None,
             ollama_key: String::new(),
@@ -1233,8 +1255,8 @@ impl Desktop {
                     }
                     if drawer {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.button(Text::new("Close").size(16.)).clicked() {
-                                self.drawer = false;
+                            if crate::widgets::close_button(ui, "Close sidebar").clicked() {
+                                self.go_back(ctx);
                             }
                         });
                     }
@@ -1318,7 +1340,7 @@ impl Desktop {
                         .on_hover_text("Settings")
                         .clicked()
                         {
-                            self.page = Page::Settings;
+                            self.open_settings();
                         }
                         if !compact {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1375,7 +1397,7 @@ impl Desktop {
                         Page::Project => self.projects.home_title(),
                     }.to_owned();
                     let label = |s: &'static str| if compact { "" } else { s };
-                        if control(
+                        if (!mobile_navigation(ctx) || self.page != Page::Settings) && control(
                             ui,
                             Icon::Reader,
                             label("Panel"),
@@ -1396,6 +1418,11 @@ impl Desktop {
                         }
                     // Give the title exactly the space left over after the actions.
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        if mobile_navigation(ctx) && self.page != Page::Chat && !self.has_detail_panel()
+                            && small(ui, Icon::Back, "Back to workspace")
+                        {
+                            self.go_back(ctx);
+                        }
                         if phone {
                             if control(ui, Icon::Sidebar, "", egui::vec2(40., 34.), false)
                                 .on_hover_text("Chats, projects and settings")
@@ -1659,7 +1686,7 @@ impl Desktop {
                     let rows = commands.len().min(8);
                     ui.horizontal(|ui| {
                         ui.strong("Commands");
-                        if ui.small_button("Close").clicked() {
+                        if crate::widgets::close_button(ui, "Close status").clicked() {
                             self.commands_dismissed = self.draft.clone();
                         }
                     });
@@ -2282,7 +2309,8 @@ impl Desktop {
                     self.memory_tab = false;
                     self.sandbox_tab = false;
                     self.integration_tab = None;
-                    self.page = Page::Settings;
+                    self.sync_tab = false;
+                    self.open_settings();
                 }
             });
         });
@@ -2465,6 +2493,56 @@ impl Desktop {
             || self.projects.has_dialog()
             || self.sync_form.browse.is_some()
             || self.needs_projects_folder()
+    }
+
+    fn open_settings(&mut self) {
+        if self.page != Page::Settings {
+            self.settings_return = self.page;
+        }
+        self.page = Page::Settings;
+        self.drawer = false;
+    }
+
+    fn close_reader(&mut self) {
+        self.reader.open = false;
+        self.reader.preview.hide();
+        self.reader.browser.hide();
+    }
+
+    fn leave_settings(&mut self) {
+        self.page = self.settings_return;
+        self.settings_return = Page::Chat;
+        self.dismiss_settings_forms();
+        self.close_reader();
+        self.focus = false;
+    }
+
+    fn go_back(&mut self, ctx: &egui::Context) {
+        if self.drawer {
+            self.drawer = false;
+            self.drawer_at = None;
+            if self.page == Page::Settings {
+                self.leave_settings();
+            }
+        } else if self.has_detail_panel() {
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new(PANEL_BACK), true));
+        } else if self.page == Page::Settings {
+            self.leave_settings();
+        } else if self.reader.open {
+            self.close_reader();
+        } else {
+            self.page = Page::Chat;
+            self.focus = false;
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn update_system_back(&mut self) {
+        let enabled = self.drawer || self.reader.open || self.has_detail_panel() || self.page != Page::Chat;
+        if enabled != self.handles_system_back {
+            crate::android::set_back_navigation(enabled);
+            self.handles_system_back = enabled;
+        }
     }
 
     fn render_detail_panel(&mut self, ui: &mut egui::Ui) {
@@ -2781,10 +2859,9 @@ impl eframe::App for Desktop {
         {
             // Opened by scanning the pairing QR code: join straight away.
             if let Some(link) = crate::android::take_link() {
-                self.page = Page::Settings;
+                self.open_settings();
                 self.sync_tab = true;
                 self.integration_tab = None;
-                self.drawer = false;
                 if self.view.state.space.is_some() {
                     self.notice = "This phone already syncs. To pair it again, leave sync first (Settings › Sync).".into();
                 } else {
@@ -2793,6 +2870,9 @@ impl eframe::App for Desktop {
                         crate::sync::live::hostname()
                     ));
                 }
+            }
+            if crate::android::take_back() {
+                self.go_back(ctx);
             }
         }
         if narrow(ctx) {
@@ -2812,7 +2892,10 @@ impl eframe::App for Desktop {
                 }
                 self.report_view(None);
                 #[cfg(target_os = "android")]
-                self.android_ime.finish_frame(ctx);
+                {
+                    self.update_system_back();
+                    self.android_ime.finish_frame(ctx);
+                }
                 return;
             }
         } else {
@@ -2821,6 +2904,9 @@ impl eframe::App for Desktop {
         }
         self.header(ctx);
         self.show_notice(ctx);
+        if self.page == Page::Settings && self.reader.open && mobile_navigation(ctx) {
+            self.close_reader();
+        }
         let detail = self.has_detail_panel();
         if detail {
             self.reader.preview.hide();
@@ -2968,6 +3054,13 @@ impl eframe::App for Desktop {
                     }
                 }
             });
+        let panel_dismissed = ctx.data_mut(|data| {
+            data.remove::<bool>(egui::Id::new(PANEL_BACK));
+            data.remove_temp::<bool>(egui::Id::new(PANEL_DISMISSED)).unwrap_or(false)
+        });
+        if panel_dismissed && self.page == Page::Settings {
+            self.leave_settings();
+        }
         let viewing = self.page == Page::Chat
             && self.view.state.thread.started
             && !self.has_detail_panel()
@@ -2975,7 +3068,10 @@ impl eframe::App for Desktop {
             && ctx.input(|i| i.focused);
         self.report_view(viewing.then_some(self.view.state.chat_id));
         #[cfg(target_os = "android")]
-        self.android_ime.finish_frame(ctx);
+        {
+            self.update_system_back();
+            self.android_ime.finish_frame(ctx);
+        }
     }
 }
 
@@ -3375,7 +3471,7 @@ impl Desktop {
         if let State::Found(text) = &state {
             crate::scan::end();
             if text.starts_with("spindle://pair") {
-                self.page = Page::Settings;
+                self.open_settings();
                 self.sync_tab = true;
                 self.integration_tab = None;
                 self.send(format!(
