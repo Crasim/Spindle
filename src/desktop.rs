@@ -2874,6 +2874,13 @@ impl eframe::App for Desktop {
             if crate::android::take_back() {
                 self.go_back(ctx);
             }
+            if let Some(chat) = crate::android_background::take_reply_chat() {
+                self.page = Page::Chat;
+                self.drawer = false;
+                self.close_reader();
+                self.send(format!("/open {chat}"));
+                self.focus = false;
+            }
         }
         if narrow(ctx) {
             if self.drawer {

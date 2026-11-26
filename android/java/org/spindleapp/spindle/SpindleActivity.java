@@ -30,12 +30,108 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
 public final class SpindleActivity extends NativeActivity implements TextWatcher {
+    static {
+        // Register this library with ART for the Java-to-Rust callbacks.
+        System.loadLibrary("spindle");
+    }
+
     private WebView htmlPreview;
     private PopupWindow htmlPreviewWindow;
     private String htmlPreviewUrl;
     private boolean handlesBack;
     private android.window.OnBackInvokedCallback backCallback;
     private native void nativeBack();
+    static native void nativeBackgroundState(boolean visible, boolean active);
+    private native void nativeOpenReply(long chat);
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        SpindleBackgroundService.setVisible(true);
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        startBackgroundServiceIfEnabled();
+    }
+
+    @Override
+    protected void onStop() {
+        SpindleBackgroundService.setVisible(false);
+        super.onStop();
+    }
+
+    @Override
+    protected void onNewIntent(android.content.Intent intent) {
+        super.onNewIntent(intent);
+        openReply(intent);
+    }
+
+    private void openReply(android.content.Intent intent) {
+        android.net.Uri uri = intent == null ? null : intent.getData();
+        if (uri == null || !"spindle".equals(uri.getScheme()) || !"reply".equals(uri.getHost())) return;
+        try {
+            long chat = Long.parseLong(uri.getLastPathSegment());
+            if (chat >= 0) nativeOpenReply(chat);
+        } catch (NumberFormatException ignored) { }
+    }
+
+    private void startBackgroundServiceIfEnabled() {
+        if (!SpindleBackgroundService.enabled(this) || SpindleBackgroundService.active()) return;
+        try {
+            startForegroundService(new android.content.Intent(this, SpindleBackgroundService.class));
+        } catch (RuntimeException error) {
+            android.util.Log.w("Spindle", "Background work unavailable", error);
+        }
+    }
+
+    public void setBackgroundEnabled(boolean enabled) {
+        runOnUiThread(() -> {
+            SpindleBackgroundService.setEnabled(this, enabled);
+            if (enabled) {
+                startBackgroundServiceIfEnabled();
+                requestBackgroundNotifications();
+            } else {
+                stopService(new android.content.Intent(this, SpindleBackgroundService.class));
+            }
+        });
+    }
+
+    public void setBackgroundBusy(boolean busy) {
+        runOnUiThread(() -> SpindleBackgroundService.setBusy(busy));
+    }
+
+    public void notifyBackgroundReply(long chat) {
+        runOnUiThread(() -> SpindleBackgroundService.notifyReply(chat));
+    }
+
+    public int backgroundStatus() {
+        android.os.PowerManager power = getSystemService(android.os.PowerManager.class);
+        return (SpindleBackgroundService.enabled(this) ? 1 : 0)
+                | (SpindleBackgroundService.active() ? 2 : 0)
+                | (SpindleBackgroundService.repliesEnabled(this) ? 4 : 0)
+                | (power.isIgnoringBatteryOptimizations(getPackageName()) ? 8 : 0);
+    }
+
+    private void requestBackgroundNotifications() {
+        if (android.os.Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {android.Manifest.permission.POST_NOTIFICATIONS}, 562);
+        }
+    }
+
+    public void openBackgroundSettings(boolean notifications) {
+        runOnUiThread(() -> {
+            android.content.Intent intent = notifications
+                    ? new android.content.Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, getPackageName())
+                    : new android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                            android.net.Uri.fromParts("package", getPackageName(), null));
+            startActivity(intent);
+        });
+    }
 
     public void setBackNavigation(boolean enabled) {
         runOnUiThread(() -> {
@@ -58,6 +154,8 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     public void onBackPressed() {
         if (handlesBack) {
             nativeBack();
+        } else if (SpindleBackgroundService.active()) {
+            moveTaskToBack(true);
         } else {
             super.onBackPressed();
         }
@@ -243,6 +341,9 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     @Override
     protected void onDestroy() {
         removeHtmlPreview();
+        if (isFinishing()) {
+            stopService(new android.content.Intent(this, SpindleBackgroundService.class));
+        }
         super.onDestroy();
     }
 
@@ -399,6 +500,7 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
+        openReply(getIntent());
         ViewGroup content = findViewById(android.R.id.content);
         nativeView = content.getChildAt(0);
         editor = new ComposerEditor(this);

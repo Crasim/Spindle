@@ -769,6 +769,11 @@ impl Desktop {
                 }
                 ui.add_space(14.);
             }
+            #[cfg(target_os = "android")]
+            {
+                crate::android_background::settings(ui);
+                ui.add_space(14.);
+            }
             ui.heading("Model guidance");
             changed |= ui.checkbox(&mut prefs.over_18, "I’m over 18").changed();
             ui.weak("When unchecked, Spindle asks models to respond in a way suitable for minors. Models may ignore this guidance. Parental supervision is still needed.");

@@ -2,6 +2,8 @@
 
 mod artifacts;
 mod android_apk;
+#[cfg(target_os = "android")]
+mod android_background;
 mod automation;
 mod browser;
 mod location;
@@ -222,7 +224,7 @@ mod android {
     }
 
     /// Run some JNI with the activity, clearing any Java exception it leaves.
-    fn java<T>(
+    pub(super) fn java<T>(
         f: impl FnOnce(&mut jni::JNIEnv, &jni::objects::JObject) -> jni::errors::Result<T>,
     ) -> jni::errors::Result<T> {
         let app = APP.get().ok_or(jni::errors::Error::NullPtr("app"))?;
@@ -809,10 +811,24 @@ fn main() -> Result<()> {
     let desktop_context = std::sync::Arc::new(std::sync::OnceLock::<eframe::egui::Context>::new());
     let repaint = desktop_context.clone();
     thread::spawn(move || {
+        #[cfg(target_os = "android")]
+        let mut delivered_notice = String::new();
         for view in engine_views {
             if let Some(c) = &forward_control {
                 c.publish(&view);
             }
+            // A long Android session can run while the renderer is suspended. Keep
+            // one-shot UI receipts and send a fresh snapshot when the activity returns.
+            #[cfg(target_os = "android")]
+            if !android_background::activity().visible
+                && view.composer_receipt.is_none()
+                && (delivered_notice == view.notice
+                    || (view.notice != "Plan revision queued" && !view.notice.starts_with("Scheduled #")))
+            {
+                continue;
+            }
+            #[cfg(target_os = "android")]
+            delivered_notice.clone_from(&view.notice);
             if !serving {
                 if output.send(view).is_err() { break; }
                 if let Some(ctx) = repaint.get() { ctx.request_repaint(); }
@@ -943,6 +959,8 @@ fn main() -> Result<()> {
                     while stream.changed().await.is_ok() {
                         tokio::time::sleep(std::time::Duration::from_millis(33)).await;
                         drop(stream.borrow_and_update());
+                        #[cfg(target_os = "android")]
+                        if !android_background::activity().visible { continue; }
                         ctx.request_repaint();
                     }
                 });

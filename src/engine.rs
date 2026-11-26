@@ -3940,6 +3940,10 @@ impl Engine {
                 p.approved && !(p.call.call.background() && self.jobs.running.is_some())
             })
         {
+            #[cfg(target_os = "android")]
+            if !crate::android_background::activity().can_work() {
+                break;
+            }
             let mut p = self.state.requests.remove(at);
             let mut summary = p.call.call.summary();
             if let Some(remote) = &p.remote && let Some(sync) = &self.state.space {
@@ -4264,6 +4268,27 @@ fn accept_segment(
             finish_turn(state, answer, turn, root)
         }
     }
+}
+
+/// The model saved a final answer instead of asking for a tool or another turn.
+#[cfg(any(target_os = "android", test))]
+fn finished_reply(state: &State, chat: u64, previous_messages: usize) -> bool {
+    let Some((thread, history)) = state.thread_data(chat) else {
+        return false;
+    };
+    let index = previous_messages + 1;
+    let (Some(reply), Some(turn)) = (history.get(index), thread.turns.get(&index)) else {
+        return false;
+    };
+    reply.role == "assistant"
+        && (!reply.content.trim().is_empty() || !turn.artifacts.is_empty())
+        && !turn.failed
+        && turn.call.is_none()
+        && turn.tool.is_none()
+        && !state.requests.iter().any(|request| request.chat == chat)
+        && !state.queue.iter().any(|task| {
+            task.origin.unwrap_or(state.chat_id) == chat && (task.tool_result || task.steps > 0)
+        })
 }
 
 fn fallback_after_disconnect(state: &mut State, model: &str, error: &anyhow::Error) -> Option<String> {
@@ -5158,6 +5183,29 @@ mod tests {
             api: Ollama::new().unwrap(),
             jobs: Default::default(),
         }
+    }
+
+    #[test]
+    fn only_complete_model_replies_are_eligible_for_an_android_notice() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut engine = fixture(root.path());
+        let chat = engine.state.chat_id;
+        engine.command("Give me a short answer", false)?;
+        accept_segment(&mut engine.state, "Here is".into(), true, Turn::default(), None)?;
+        assert!(!finished_reply(&engine.state, chat, 0), "partial stream");
+        accept_segment(&mut engine.state, " the finished answer.".into(), false, Turn::default(), None)?;
+        assert!(finished_reply(&engine.state, chat, 0));
+
+        let len = engine.state.history.len();
+        engine.command("List the files in the project", false)?;
+        finish(&mut engine.state, r#"{"name":"list","args":{"path":"."}}"#.into())?;
+        assert!(!finished_reply(&engine.state, chat, len), "intermediate tool call");
+
+        let mut engine = fixture(root.path());
+        engine.command("Give me a short answer", false)?;
+        stop_failed_task(&mut engine.state, "Provider timed out");
+        assert!(!finished_reply(&engine.state, chat, 0), "failed reply");
+        Ok(())
     }
 
     #[test]
@@ -7464,7 +7512,36 @@ impl Engine {
         let mut next_usage = tokio::time::Instant::now();
         let mut next_inbox = tokio::time::Instant::now();
         let mut next_sync = std::time::Instant::now();
+        #[cfg(target_os = "android")]
+        let mut android = crate::android_background::subscribe();
+        #[cfg(target_os = "android")]
+        let mut cpu = crate::android_background::Work::default();
+        #[cfg(target_os = "android")]
+        let mut needs_resume = false;
+        #[cfg(target_os = "android")]
+        let mut completed_reply = None;
         loop {
+            #[cfg(not(target_os = "android"))]
+            let may_work = true;
+            #[cfg(target_os = "android")]
+            let may_work = android.borrow_and_update().can_work();
+            #[cfg(target_os = "android")]
+            {
+                if may_work && needs_resume {
+                    next_sync = std::time::Instant::now();
+                    next_inbox = tokio::time::Instant::now();
+                    if let Err(err) = self.dispatch_ready(active.is_some()) {
+                        notice = format!("A tool action didn't run: {err:#}");
+                    }
+                }
+                needs_resume = !may_work;
+                if !may_work && let Some(handle) = active.take() {
+                    handle.abort();
+                    let _ = handle.await;
+                    active_task_id = None;
+                }
+                cpu.set(active.is_some() || self.jobs.running.is_some());
+            }
             let time = automation::now();
             if window_for != self.state.model {
                 window_for = self.state.model.clone();
@@ -7484,7 +7561,7 @@ impl Engine {
                     self.state.balances = balances.into_iter().collect();
                 }
             }
-            if usage_fetch.is_none() && tokio::time::Instant::now() >= next_usage && !background {
+            if may_work && usage_fetch.is_none() && tokio::time::Instant::now() >= next_usage && !background {
                 if credit_fetch.is_none() {
                     let client = self.api.0.clone();
                     let providers = self.state.providers.clone();
@@ -7505,7 +7582,7 @@ impl Engine {
                 }));
                 next_usage = tokio::time::Instant::now() + std::time::Duration::from_secs(300);
             }
-            if !background && tokio::time::Instant::now() >= next_inbox {
+            if may_work && !background && tokio::time::Instant::now() >= next_inbox {
                 if let Some(store) = &self.store {
                     match crate::threads::receive(store, &mut self.state) {
                         Ok(n) if n > 0 => notice = format!("Received {n} project thread(s)"),
@@ -7517,27 +7594,31 @@ impl Engine {
             }
             let previous_task = self.state.queue.front().map(|q| q.id);
             let syncing = self.state.sync.as_ref().is_some_and(|p| p.enabled);
-            if syncing && (std::time::Instant::now() >= next_sync || active.is_none()) {
+            if may_work && syncing && (std::time::Instant::now() >= next_sync || active.is_none()) {
+                #[cfg(target_os = "android")]
+                cpu.set(true);
                 self.state.sync_status = match crate::sync::refresh(&self.root, &mut self.state) {
                     Ok(_) => format!("Synced at {}", automation::local_time(time)),
                     Err(e) => format!("Sync pending · {e:#}"),
                 };
                 next_sync = std::time::Instant::now() + std::time::Duration::from_secs(8);
             }
-            if !background
+            if may_work && !background
                 && let Some(n) = crate::sync::live::pair_poll(&mut self.state).await
                 && !notice.starts_with("ext:")
             {
                 notice = n;
             }
-            if !background {
+            if may_work && !background {
                 crate::sync::live::notice_changes(&mut self.state, active.is_some());
             }
-            if !background
+            if may_work && !background
                 && self.jobs.running.is_none()
                 && let Some(why) = crate::sync::live::due(&self.state)
                 && (active.is_none() || why != crate::sync::adapter::Want::Now)
             {
+                #[cfg(target_os = "android")]
+                cpu.set(true);
                 let previous_ollama = (self.state.preferences.ollama_on, self.state.preferences.ollama.clone());
                 if let Some(n) = crate::sync::live::run(&mut self.state, why).await
                     && !notice.starts_with("ext:")
@@ -7612,7 +7693,7 @@ impl Engine {
                 self.close_browser_link();
             }
             self.state.automation.recover(time);
-            if !background && active.is_none() {
+            if may_work && !background && active.is_none() {
                 automation::due(&mut self.state, time);
             }
             if background && (self.state.held || self.state.queue.front().map(|q| q.id) != admitted)
@@ -7635,8 +7716,10 @@ impl Engine {
                 handle.abort();
                 let _ = handle.await;
             }
-            let web_region_prompt = if active.is_none() && !background { self.web_region_prompt() } else { None };
-            if active.is_none() && !self.state.held && !checking_cloud && web_region_prompt.is_none() {
+            #[cfg(target_os = "android")]
+            let may_work = may_work && crate::android_background::activity().can_work();
+            let web_region_prompt = if may_work && active.is_none() && !background { self.web_region_prompt() } else { None };
+            if may_work && active.is_none() && !self.state.held && !checking_cloud && web_region_prompt.is_none() {
                 if let Some(task) = self.state.queue.front() {
                     match request(&self.state, task) {
                         Err(e) => {
@@ -7771,6 +7854,10 @@ impl Engine {
             if let Some(store) = &self.store {
                 store.save(&self.state)?;
             }
+            #[cfg(target_os = "android")]
+            if let Some(chat) = completed_reply.take() {
+                crate::android_background::reply_ready(chat);
+            }
             if background && self.state.held {
                 break;
             }
@@ -7819,12 +7906,20 @@ impl Engine {
             {
                 break;
             }
-            if !background && job.is_none() && self.jobs.started.is_none() { self.start_remote()?; }
+            if may_work && !background && job.is_none() && self.jobs.started.is_none() { self.start_remote()?; }
             if job.is_none() {
                 job = self.jobs.started.take();
             }
+            #[cfg(target_os = "android")]
+            cpu.set(active.is_some() || job.is_some());
             tokio::select! {
                 biased;
+                _ = async {
+                    #[cfg(target_os = "android")]
+                    { let _ = android.changed().await; }
+                    #[cfg(not(target_os = "android"))]
+                    std::future::pending::<()>().await;
+                } => {}
                 done = async { job.as_mut().unwrap().await }, if job.is_some() => {
                     job = None;
                     notice = match done {
@@ -7838,8 +7933,8 @@ impl Engine {
                         notice = format!("A tool action didn't run: {err:#}");
                     }
                 }
-                _=tokio::time::sleep_until(next_inbox),if !background=>{}
-                _=tokio::time::sleep_until(next_usage),if !background && usage_fetch.is_none()=>{}
+                _=tokio::time::sleep_until(next_inbox),if may_work && !background=>{}
+                _=tokio::time::sleep_until(next_usage),if may_work && !background && usage_fetch.is_none()=>{}
                 snapshot=async{usage_fetch.as_mut().unwrap().await},if usage_fetch.is_some()=>{
                     usage_fetch=None;
                     if let Ok(snapshot)=snapshot {
@@ -7847,8 +7942,8 @@ impl Engine {
                         self.state.automation.cloud_usage=snapshot;
                     }
                 }
-                _=tokio::time::sleep_until(next_sync.into()),if syncing=>{}
-                _=tokio::time::sleep(automation::next_tick(&self.state,time)),if active.is_none() && !background=>{}
+                _=tokio::time::sleep_until(next_sync.into()),if may_work && syncing=>{}
+                _=tokio::time::sleep(automation::next_tick(&self.state,time)),if may_work && active.is_none() && !background=>{}
                 line = input.recv() => {
                     let Some(input) = line else {break};
                     let (tag, line) = split(&input);
@@ -7953,6 +8048,11 @@ impl Engine {
                 }
                 result = async {active.as_mut().unwrap().await}, if active.is_some() => {
                     active = None;
+                    #[cfg(target_os = "android")]
+                    let reply = self.state.queue.front().and_then(|task| {
+                        let chat = task.origin.unwrap_or(self.state.chat_id);
+                        self.state.thread_data(chat).map(|(_, history)| (chat, history.len()))
+                    });
                     let outcome=result.context("Inference task stopped").and_then(|(model,obs,answer)|{
                         let meter=self.state.automation.meters.entry(model.clone()).or_default();
                         if !obs.headers.is_empty(){self.state.automation.provider_stats.insert(route(&model).0.into(),(automation::now(),obs.headers.clone()));}
@@ -7987,7 +8087,16 @@ impl Engine {
                         accept_segment(&mut self.state, answer?, obs.output_limited, turn, Some(&self.root))
                     });
                     match outcome {
-                        Ok(msg) => notice=msg,
+                        Ok(msg) => {
+                            #[cfg(target_os = "android")]
+                            if let Some((chat, len)) = reply
+                                && crate::android_background::activity().notify_reply()
+                                && finished_reply(&self.state, chat, len)
+                            {
+                                completed_reply = Some(chat);
+                            }
+                            notice = msg;
+                        }
                         Err(err) => {
                             let timed_out = err.chain().any(|cause| {
                                 cause.downcast_ref::<reqwest::Error>().is_some_and(reqwest::Error::is_timeout)

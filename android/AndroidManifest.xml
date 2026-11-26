@@ -12,6 +12,10 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- Hearing your other devices' announcements on Wi-Fi -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Speaking to Spindle (asked for the first time you use the microphone) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Scanning the pairing QR code (asked the first time you scan) -->
@@ -36,6 +40,8 @@
         android:requestLegacyExternalStorage="true">
         <service android:name=".builder.ApkBuildService" android:exported="false"
             android:isolatedProcess="true" />
+        <service android:name=".SpindleBackgroundService" android:exported="false"
+            android:foregroundServiceType="dataSync" android:stopWithTask="true" />
         <provider android:name=".UpdateApkProvider" android:authorities="org.spindleapp.spindle.updates"
             android:exported="false">
             <grant-uri-permission android:pathPrefix="/release/" />
