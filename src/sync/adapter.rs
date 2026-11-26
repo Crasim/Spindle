@@ -160,6 +160,8 @@ pub struct SyncState {
     pub project_deletions: BTreeMap<String, bool>,
     #[serde(default)]
     pub provider_host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub peer_dns: String,
     #[serde(default)]
     pub imported_providers: BTreeMap<String, (String, String)>,
     #[serde(default)]
@@ -254,6 +256,8 @@ pub struct DetachedSpace {
     dropped: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     provider_host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    peer_dns: String,
     #[serde(default)]
     imported_providers: BTreeMap<String, (String, String)>,
     #[serde(default)]
@@ -286,6 +290,7 @@ pub fn disconnect(state: &mut State) {
                 main: sync.main,
                 dropped: sync.dropped,
                 provider_host: sync.provider_host,
+                peer_dns: sync.peer_dns,
                 imported_providers: sync.imported_providers,
                 imported_ollama: sync.imported_ollama,
                 device_rules: sync.device_rules,
@@ -309,6 +314,7 @@ pub fn reconnect(state: &mut State, identity: Identity) -> SyncState {
         sync.main = previous.main;
         sync.dropped = previous.dropped;
         sync.provider_host = previous.provider_host;
+        sync.peer_dns = previous.peer_dns;
         sync.imported_providers = previous.imported_providers;
         sync.imported_ollama = previous.imported_ollama;
         sync.device_rules = previous.device_rules;
@@ -332,6 +338,7 @@ impl SyncState {
             remote_projects: BTreeMap::new(),
             project_deletions: BTreeMap::new(),
             provider_host: String::new(),
+            peer_dns: String::new(),
             imported_providers: BTreeMap::new(),
             imported_ollama: None,
             pending_removals: BTreeMap::new(),

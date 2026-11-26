@@ -17,6 +17,7 @@ pub(super) struct SyncForm {
     show_removed: bool,
     manage_device: Option<String>,
     provider_host: Option<String>,
+    peer_dns: Option<String>,
     pair_number: String,
     /// The projects folder being typed (None: show the saved one or the suggestion).
     projects_dir: Option<String>,
@@ -650,12 +651,12 @@ impl Desktop {
                 });
             }
             ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut f.peer)
-                        .id_salt("sync_view-field-10")
-                        .hint_text("Another device's address (IP:port), if it isn't found")
-                        .desired_width((ui.available_width().max(230.)).min(300.)),
-                );
+                let width = ui.available_width().min(300.);
+                self.android_ime.field(ui, "sync-peer-address", &mut f.peer, Default::default(), |field| {
+                    field
+                        .hint_text("DNS name or IP of another device")
+                        .desired_width(width)
+                });
                 if ui
                     .add_enabled(!f.peer.trim().is_empty(), egui::Button::new("Add device"))
                     .clicked()
@@ -665,13 +666,26 @@ impl Desktop {
                 }
             });
             if let Some(p) = crate::sync::peer::port() {
-                ui.weak(format!(
-                    "This device listens on {}",
-                    crate::sync::pair::addresses(p)
-                        .map(|a| a.replace(',', ", "))
-                        .unwrap_or_else(|| format!("port {p}"))
-                ));
+                let addresses = crate::sync::live::local_peer_endpoints(p, &sync.peer_dns);
+                ui.weak(format!("This device listens on port {p}"));
+                if !addresses.is_empty() {
+                    ui.add(egui::Label::new(egui::RichText::new(addresses.replace(',', ", ")).weak()).wrap());
+                }
             }
+            ui.weak("A DNS name is shared alongside this device’s IPs. Leave it blank to use names Spindle discovers.");
+            let name = f.peer_dns.get_or_insert_with(|| sync.peer_dns.clone());
+            ui.horizontal_wrapped(|ui| {
+                let width = ui.available_width().min(260.);
+                self.android_ime.field(ui, "sync-peer-dns", name, Default::default(), |field| {
+                    field
+                        .hint_text("This device’s DNS name")
+                        .desired_width(width)
+                });
+                if ui.add_enabled(name.trim() != sync.peer_dns, egui::Button::new("Save DNS name")).clicked() {
+                    *name = name.trim().trim_end_matches('.').to_ascii_lowercase();
+                    send.push(format!("/sync peer-dns {name}"));
+                }
+            });
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut f.server)

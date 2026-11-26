@@ -4848,6 +4848,7 @@ impl Engine {
                 &mut self.state,
                 need(rest, "Use /sync projects-folder <full path>")?,
             ),
+            "peer-dns" => live::peer_dns(&mut self.state, rest),
             "peer" => live::add_peer(
                 &mut self.state,
                 need(rest, "Use /sync peer <IP:port or computer name>")?,

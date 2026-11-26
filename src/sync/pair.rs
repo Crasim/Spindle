@@ -391,12 +391,9 @@ pub(crate) fn local_ips() -> Vec<std::net::IpAddr> {
 }
 
 /// Addresses at a port, comma-separated, as links and invites carry them.
-pub(crate) fn addresses(port: u16) -> Option<String> {
-    let list: Vec<String> = local_ips()
-        .into_iter()
-        .map(|ip| std::net::SocketAddr::new(ip, port).to_string())
-        .collect();
-    (!list.is_empty()).then(|| list.join(","))
+fn addresses(port: u16, dns: &str) -> Option<String> {
+    let list = super::routes::local_endpoints(port, dns);
+    (!list.is_empty()).then_some(list)
 }
 
 /// Start pairing on the existing device. `keys` are sent once the person types the number;
@@ -410,7 +407,7 @@ pub async fn host(
     lan: bool,
     short: bool,
 ) -> Result<Host> {
-    start(keys, links, records, relay, lan, short)
+    start(keys, links, records, relay, lan, short, "")
 }
 
 /// The same as [`host`], callable from inside the engine (needs a running Tokio runtime).
@@ -421,6 +418,7 @@ pub fn start(
     relay: Option<String>,
     lan: bool,
     short: bool,
+    dns: &str,
 ) -> Result<Host> {
     let listener = if lan {
         let l = std::net::TcpListener::bind("0.0.0.0:0")?;
@@ -430,7 +428,7 @@ pub fn start(
         None
     };
     let addr = match &listener {
-        Some(l) => addresses(l.local_addr()?.port()),
+        Some(l) => addresses(l.local_addr()?.port(), dns),
         None => None,
     };
     ensure!(

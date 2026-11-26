@@ -9,6 +9,7 @@ mod provider_sync;
 pub(crate) mod project_sync;
 pub mod pair;
 pub mod peer;
+pub(super) mod routes;
 pub mod space;
 pub mod transport;
 

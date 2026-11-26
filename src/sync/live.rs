@@ -192,7 +192,7 @@ pub fn want(state: &mut State, why: Want) {
 fn transports(sync: &SyncState, members: &[String]) -> Result<Vec<(usize, Transport)>> {
     let me = super::peer::Me {
         identity: sync.identity.clone(),
-        members: members.to_vec(),
+        members: members.iter().filter(|id| !sync.source_paused(id)).cloned().collect(),
         port: super::peer::port().unwrap_or(0),
     };
     sync.links
@@ -223,55 +223,64 @@ fn transports(sync: &SyncState, members: &[String]) -> Result<Vec<(usize, Transp
         .collect()
 }
 
-/// Add or update links for this space's devices heard on the network.
-fn merge_peers(sync: &mut SyncState) {
-    let me = sync.identity.device.id.clone();
-    for (device, addr) in super::peer::discovered() {
-        if device == me {
+/// Read current routes from the signed sync records and include any fresh LAN discovery.
+fn merge_peers(sync: &mut SyncState, space: &Space, discovered: &[(String, String)]) -> bool {
+    let mut changed = false;
+    for member in space.members() {
+        let device = member.id;
+        if member.removed.is_some() || device == sync.identity.device.id || sync.source_paused(&device) {
             continue;
         }
-        let has = |list: &str| list.split(',').any(|a| a.trim() == addr);
-        // A link typed by hand (or from pairing) at this address: now we know who's there.
-        if let Some(l) = sync
-            .links
-            .iter_mut()
-            .find(|l| matches!(&l.place, Place::Peer { device: None, addr: a } if has(a)))
-        {
-            if let Place::Peer { device: d, .. } = &mut l.place {
-                *d = Some(device);
-            }
+        let observed = discovered.iter().find(|(id, _)| *id == device)
+            .map_or("", |(_, addr)| addr.as_str());
+        let fresh = super::routes::merge(observed, &super::routes::advertised(space, &device));
+        if fresh.is_empty() {
             continue;
         }
-        match sync
-            .links
-            .iter_mut()
-            .find(|l| matches!(&l.place, Place::Peer { device: Some(d), .. } if *d == device))
-        {
-            // A device can be reached several ways (home network, Tailscale): keep them,
-            // the newest first, at most four.
-            Some(l) => {
-                if let Place::Peer { addr: a, .. } = &mut l.place
-                    && !has(a)
-                {
-                    let mut list: Vec<String> = vec![addr.clone()];
-                    list.extend(
-                        a.split(',')
-                            .map(|x| x.trim().to_owned())
-                            .filter(|x| !x.is_empty()),
-                    );
-                    list.truncate(4);
-                    *a = list.join(",");
-                }
-            }
-            None => sync.links.push(Link {
-                place: Place::Peer {
-                    device: Some(device),
-                    addr,
-                },
+        if let Some(addr) = sync.links.iter_mut().find_map(|link| match &mut link.place {
+            Place::Peer { device: Some(id), addr } if *id == device => Some(addr),
+            _ => None,
+        }) {
+            let merged = super::routes::merge(&fresh, addr);
+            changed |= merged != *addr;
+            *addr = merged;
+        } else if !sync.links.iter().any(|link| matches!(&link.place,
+            Place::Peer { device: None, addr } if addr.split(',').any(|a| fresh.split(',').any(|b| b == a.trim()))
+        )) {
+            sync.links.push(Link {
+                place: Place::Peer { device: Some(device), addr: fresh },
                 progress: Default::default(),
-            }),
+            });
+            changed = true;
         }
     }
+    changed
+}
+
+/// Pin a manually entered name (or an old invite) only after a successful handshake.
+async fn bind_peer_links(sync: &mut SyncState, transports: &[(usize, Transport)]) {
+    for (i, transport) in transports {
+        if let Transport::Peer(peer) = transport
+            && let Some(Link { place: Place::Peer { device, .. }, .. }) = sync.links.get_mut(*i)
+            && device.is_none()
+        {
+            *device = peer.connected_device().await;
+        }
+    }
+    let mut links: Vec<Link> = Vec::with_capacity(sync.links.len());
+    for link in std::mem::take(&mut sync.links) {
+        if let Place::Peer { device: Some(id), addr } = &link.place
+            && let Some(saved) = links.iter_mut().find_map(|known| match &mut known.place {
+                Place::Peer { device: Some(known), addr } if known == id => Some(addr),
+                _ => None,
+            })
+        {
+            *saved = super::routes::merge(saved, addr);
+            continue;
+        }
+        links.push(link);
+    }
+    sync.links = links;
 }
 
 /// Addresses of devices no longer on the list go; with no other devices left, so do
@@ -310,29 +319,13 @@ static PEER_TRIED: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Add a device's network address by hand (when announcements don't get through).
 pub fn add_peer(state: &mut State, addr: &str) -> Result<String> {
-    let addr = addr.trim();
-    let parsed: std::net::SocketAddr = addr
-        .parse()
-        .or_else(|_| format!("{addr}:{}", super::peer::PORT).parse())
-        .or_else(|_| {
-            use std::net::ToSocketAddrs;
-            let with_port = if addr.contains(':') {
-                addr.to_owned()
-            } else {
-                format!("{addr}:{}", super::peer::PORT)
-            };
-            with_port
-                .to_socket_addrs()?
-                .next()
-                .context("No such address")
-        })
-        .with_context(|| format!("{addr} isn't an address (use IP:port or a name)"))?;
+    let addr = super::routes::endpoint(addr, super::peer::PORT)
+        .context("Enter a DNS name or IP, with an optional :port")?;
     let sync = state.space.as_mut().context("Set up sync first")?;
-    let addr = parsed.to_string();
     if !sync
         .links
         .iter()
-        .any(|l| matches!(&l.place, Place::Peer { addr: a, .. } if *a == addr))
+        .any(|l| matches!(&l.place, Place::Peer { addr: a, .. } if a.split(',').any(|saved| saved.trim() == addr)))
     {
         sync.links.push(Link {
             place: Place::Peer {
@@ -344,6 +337,20 @@ pub fn add_peer(state: &mut State, addr: &str) -> Result<String> {
     }
     sync.wanted = Some(Want::Now);
     Ok(format!("Added the device at {addr}"))
+}
+
+pub fn peer_dns(state: &mut State, input: &str) -> Result<String> {
+    let name = input.trim().trim_end_matches('.');
+    anyhow::ensure!(name.is_empty() || super::provider_sync::valid_hostname(name),
+        "Enter a DNS name without a port, or leave it blank for automatic discovery");
+    let sync = state.space.as_mut().context("Set up sync first")?;
+    sync.peer_dns = name.to_ascii_lowercase();
+    sync.wanted = Some(Want::Now);
+    Ok("Sync DNS name saved".into())
+}
+
+pub fn local_peer_endpoints(port: u16, override_name: &str) -> String {
+    super::routes::local_endpoints(port, override_name)
 }
 
 /// This computer's name, the default name for the device.
@@ -675,13 +682,20 @@ async fn run_with(state: &mut State, live: &mut Live, why: Want) -> Option<Strin
             s.log(format!("Couldn't listen for your other devices: {e:#}"));
         }
         if let Some(s) = state.space.as_mut() {
-            merge_peers(s);
+            super::routes::refresh_dns().await;
+            merge_peers(s, space, &super::peer::discovered());
         }
     } else {
         super::peer::stop();
     }
     if let Some(s) = state.space.as_mut() {
         prune_peers(s, &members);
+        let addresses = super::peer::port()
+            .filter(|_| peers)
+            .map_or_else(String::new, |p| local_peer_endpoints(p, &s.peer_dns));
+        if let Err(err) = super::routes::publish(space, &addresses) {
+            s.log(format!("Could not publish sync addresses: {err:#}"));
+        }
     }
     if let Some(dir) = space.dir.clone() {
         let arrived = super::peer::take_inbox(&dir);
@@ -785,6 +799,12 @@ async fn run_with(state: &mut State, live: &mut Live, why: Want) -> Option<Strin
     }
     if let Some(s) = state.space.as_mut() {
         s.identity = space.id.clone();
+        if peers {
+            bind_peer_links(s, &ts).await;
+            if merge_peers(s, space, &super::peer::discovered()) {
+                super::peer::WAKE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
     notice
 }
@@ -1076,7 +1096,8 @@ pub fn pair_start(state: &State, short: bool) -> Result<String> {
         })
         .chain(
             super::peer::port()
-                .and_then(super::pair::addresses)
+                .map(|port| local_peer_endpoints(port, &sync.peer_dns))
+                .filter(|list| !list.is_empty())
                 .map(|list| format!("peer:{list}")),
         )
         .collect();
@@ -1087,6 +1108,7 @@ pub fn pair_start(state: &State, short: bool) -> Result<String> {
         relay,
         true,
         short,
+        &sync.peer_dns,
     )?;
     let v = host.view.lock().unwrap().clone();
     if let Some(old) = HOST.lock().unwrap().replace(host) {
@@ -1279,12 +1301,9 @@ pub fn check(state: &State) -> String {
         }
     ));
     out.push(format!(
-        "This device's addresses: {}",
-        super::pair::local_ips()
-            .iter()
-            .map(|ip| ip.to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        "This device's IP and DNS candidates: {}",
+        super::peer::port().map(|port| local_peer_endpoints(port, &sync.peer_dns).replace(',', ", "))
+            .unwrap_or_else(|| "listener not started".into())
     ));
     let members = devices(state);
     out.push(format!("Devices in this space ({}):", members.len()));

@@ -17,6 +17,7 @@ use super::core::{Envelope, MAX_RECORD, b64, hex, hkdf32, sha256, unb64, verify}
 use super::space::Identity;
 use super::transport::{Listing, valid_id};
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -226,6 +227,7 @@ fn udp() -> Result<tokio::net::UdpSocket> {
 
 /// Announce this device and listen for the others.
 async fn beacon() {
+    let mut interfaces = super::pair::local_ips();
     let sock = udp();
     HEARS.store(sock.is_ok(), std::sync::atomic::Ordering::Relaxed);
     if let Err(e) = &sock {
@@ -234,6 +236,7 @@ async fn beacon() {
     let Ok(sock) = sock else {
         // Can't hear announcements (the port is taken by something else): announce only.
         loop {
+            check_interfaces(&mut interfaces);
             if let Ok(s) = tokio::net::UdpSocket::bind("0.0.0.0:0").await {
                 let _ = s.set_broadcast(true);
                 if let Some(msg) = announcement() {
@@ -249,6 +252,7 @@ async fn beacon() {
     let mut next = Instant::now();
     loop {
         if Instant::now() >= next {
+            check_interfaces(&mut interfaces);
             if let Some(msg) = announcement() {
                 let _ = sock
                     .send_to(msg.as_bytes(), ("255.255.255.255", BEACON_PORT))
@@ -274,6 +278,14 @@ async fn beacon() {
             let addr = std::net::SocketAddr::new(from.ip(), port as u16).to_string();
             heard(device, addr);
         }
+    }
+}
+
+fn check_interfaces(previous: &mut Vec<std::net::IpAddr>) {
+    let current = super::pair::local_ips();
+    if current != *previous {
+        *previous = current;
+        WAKE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -410,25 +422,20 @@ pub struct Me {
 /// Connect to another device of the space. `expect` is the device that should answer, when
 /// known; any member is accepted otherwise (an address typed by hand).
 pub async fn connect(me: &Me, addr: &str, expect: Option<&str>) -> Result<Conn> {
-    // A device can have several addresses (home network, Tailscale, and older ones from
-    // before it restarted on another port): try each until the right device answers. An
-    // old address may now belong to another device, or to this one: not an error, just
-    // the wrong place.
-    let own: Vec<String> = if me.port == 0 {
-        vec![]
-    } else {
-        super::pair::local_ips()
-            .into_iter()
-            .map(|ip| std::net::SocketAddr::new(ip, me.port).to_string())
-            .chain([format!("127.0.0.1:{}", me.port)])
-            .collect()
-    };
+    let local = super::pair::local_ips();
+    let routes = super::routes::merge(addr, "");
+    let mut tries = FuturesUnordered::new();
+    for (index, candidate) in routes.split(',').filter(|a| !a.is_empty()).enumerate() {
+        let local = &local;
+        tries.push(async move {
+            // Give the first route a head start without making each stale LAN address
+            // consume a full timeout before a MagicDNS or VPN route can start.
+            tokio::time::sleep(Duration::from_millis(100 * index as u64)).await;
+            (candidate, connect_candidate(me, candidate, expect, local).await)
+        });
+    }
     let mut last = None;
-    for a in addr.split(',').map(str::trim).filter(|a| !a.is_empty()) {
-        if own.iter().any(|o| o == a) {
-            continue;
-        }
-        let r = connect_one(me, a, expect).await;
+    while let Some((a, r)) = tries.next().await {
         note(match &r {
             Ok(c) => format!("→ {a}: connected to {}", short(&c.device)),
             Err(e) if offline(e) => String::new(),
@@ -443,7 +450,42 @@ pub async fn connect(me: &Me, addr: &str, expect: Option<&str>) -> Result<Conn> 
     Err(last.unwrap_or_else(|| anyhow!("OFFLINE")))
 }
 
-async fn connect_one(me: &Me, addr: &str, expect: Option<&str>) -> Result<Conn> {
+async fn connect_candidate(
+    me: &Me,
+    addr: &str,
+    expect: Option<&str>,
+    local: &[std::net::IpAddr],
+) -> Result<Conn> {
+    let resolved = match tokio::time::timeout(CONNECT, tokio::net::lookup_host(addr)).await {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(e)) => {
+            note(format!("→ {addr}: couldn't resolve ({e})"));
+            bail!("OFFLINE")
+        }
+        Err(_) => {
+            note(format!("→ {addr}: DNS lookup timed out"));
+            bail!("OFFLINE")
+        }
+    };
+    let mut tries = FuturesUnordered::new();
+    for socket in resolved.take(8) {
+        if socket.port() == me.port && (socket.ip().is_loopback() || local.contains(&socket.ip())) {
+            continue;
+        }
+        tries.push(connect_one(me, socket, expect));
+    }
+    let mut last = None;
+    while let Some(result) = tries.next().await {
+        match result {
+            Ok(conn) => return Ok(conn),
+            Err(e) if offline(&e) || e.to_string().starts_with("WRONG_DEVICE") => {}
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("OFFLINE")))
+}
+
+async fn connect_one(me: &Me, addr: std::net::SocketAddr, expect: Option<&str>) -> Result<Conn> {
     let ctx = Ctx {
         tag: tag(&me.identity)?,
         identity: me.identity.clone(),
@@ -479,6 +521,7 @@ async fn connect_one(me: &Me, addr: &str, expect: Option<&str>) -> Result<Conn> 
     }
     let theirs = reply["hi"].clone();
     let device = theirs["device"].as_str().unwrap_or("").to_owned();
+    ensure!(device != ctx.identity.device.id, "WRONG_DEVICE: this is the local device");
     ensure!(
         expect.is_none_or(|d| d == device),
         "WRONG_DEVICE: a different device answered at {addr}"
@@ -736,6 +779,10 @@ impl Client {
         }
     }
 
+    pub(super) async fn connected_device(&self) -> Option<String> {
+        self.conn.lock().await.as_ref().map(|conn| conn.device.clone())
+    }
+
     pub async fn list(&self) -> Result<Listing> {
         let r = self.ask(json!({"op": "list"})).await?;
         Ok(Listing {
@@ -827,13 +874,18 @@ mod tests {
             .err()
             .unwrap();
         assert!(offline(&e), "{e}");
-        let stale = format!("127.0.0.1:1,{addr}");
-        assert!(
-            Client::new(me.clone(), &stale, Some(&desk.id.device.id))
-                .list()
-                .await
-                .is_ok()
-        );
+        // A stale route accepts TCP but stalls the handshake. The DNS route must win
+        // without waiting for the stale route's handshake timeout.
+        let stale = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addrs = format!("{},localhost:{}", stale.local_addr().unwrap(), port().unwrap());
+        let through_dns = Client::new(me.clone(), &addrs, Some(&desk.id.device.id));
+        tokio::time::timeout(Duration::from_secs(2), through_dns.list()).await.unwrap().unwrap();
+        assert_eq!(through_dns.connected_device().await.as_deref(), Some(desk.id.device.id.as_str()));
+        if let Ok(name) = std::env::var("SPINDLE_TEST_SYNC_DNS") {
+            let endpoint = format!("{name}:{}", port().unwrap());
+            assert!(Client::new(me.clone(), &endpoint, Some(&desk.id.device.id)).list().await.is_ok(),
+                "the real DNS endpoint must reach the authenticated test peer");
+        }
         // A stranger with another space.
         let other = Space::create("Stranger", None).unwrap();
         let e = Client::new(
