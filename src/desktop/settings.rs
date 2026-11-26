@@ -139,31 +139,34 @@ impl UpdatePanel {
         ui.heading("Updates");
         ui.weak(format!("Spindle · {}", crate::version()));
         let staged = crate::updates::staged_version();
+        let can_restart = self.job.is_none() && !submitting;
+        self.confirm_restart &= staged.is_some() && has_drafts;
         if let Some(version) = &staged {
             ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Version {version} is ready to install"));
-                if ui.add_enabled(self.job.is_none() && !submitting, egui::Button::new("Restart to update"))
-                    .on_disabled_hover_text("Wait for the current download, check, or message submission to finish.")
-                    .clicked()
-                {
-                    self.confirm_restart = has_drafts;
-                    restart = !has_drafts;
-                }
-            });
-            if self.confirm_restart {
-                ui.label("Restarting will clear unsent drafts.");
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add_enabled(self.job.is_none() && !submitting, egui::Button::new("Restart and discard drafts")).clicked() {
+                if self.confirm_restart {
+                    ui.label("Restarting will clear unsent drafts.");
+                    if ui
+                        .add_enabled(can_restart, egui::Button::new("Restart and discard drafts"))
+                        .clicked()
+                    {
                         restart = true;
                         self.confirm_restart = false;
                     }
                     if ui.button("Cancel").clicked() {
                         self.confirm_restart = false;
                     }
-                });
-            }
-        } else {
-            self.confirm_restart = false;
+                } else {
+                    ui.label(format!("Version {version} is ready to install"));
+                    if ui
+                        .add_enabled(can_restart, egui::Button::new("Restart to update"))
+                        .on_disabled_hover_text("Wait for the current download, check, or message submission to finish.")
+                        .clicked()
+                    {
+                        self.confirm_restart = has_drafts;
+                        restart = !has_drafts;
+                    }
+                }
+            });
         }
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(self.job.is_none(), egui::Button::new("Check for updates")).clicked() {
