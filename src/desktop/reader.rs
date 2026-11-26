@@ -604,7 +604,7 @@ impl ReaderPane {
                     self.error = "Document reader stopped".into();
                     self.loading = None;
                 }
-                _ => (),
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
             }
         }
         if let Some(rx) = &self.rendering {
@@ -623,7 +623,7 @@ impl ReaderPane {
                     self.error = "Page renderer stopped".into();
                     self.rendering = None;
                 }
-                _ => (),
+                Err(TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(100)),
             }
         }
     }
@@ -1308,9 +1308,9 @@ pub(crate) fn file_marker(line: &str) -> Option<&str> {
 }
 
 /// Put each "Saved file:" marker in its own paragraph so it can become a card.
-fn isolate_file_markers(text: &str, files: &[String]) -> String {
+fn isolate_file_markers<'a>(text: &'a str, files: &[String]) -> std::borrow::Cow<'a, str> {
     if files.is_empty() {
-        return text.to_owned();
+        return text.into();
     }
     let mut out = String::with_capacity(text.len() + 32);
     for line in text.split_inclusive('\n') {
@@ -1323,7 +1323,7 @@ fn isolate_file_markers(text: &str, files: &[String]) -> String {
             out.push_str(line);
         }
     }
-    out
+    out.into()
 }
 
 /// Render Markdown. Files named in `files` become links where mentioned in code spans or
@@ -1587,7 +1587,7 @@ pub(super) fn markdown_with_files(
                 }
             }
             Event::Text(t) => {
-                paragraph.push_str(&t);
+                if !files.is_empty() { paragraph.push_str(&t); }
                 if let Some((_, label, _)) = &mut link {
                     label.push_str(&t);
                 } else {
@@ -1595,7 +1595,7 @@ pub(super) fn markdown_with_files(
                 }
             }
             Event::Code(t) => {
-                paragraph.push_str(&t);
+                if !files.is_empty() { paragraph.push_str(&t); }
                 if files.iter().any(|f| **f == *t) && link.is_none() {
                     block.split();
                     block.pieces.push(Piece::File(t.to_string()));

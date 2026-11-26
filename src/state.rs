@@ -134,7 +134,7 @@ pub struct ActionRecord {
     pub ok: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: String,
     pub text: String,
@@ -572,7 +572,7 @@ pub struct ThreadInfo {
     pub turns: BTreeMap<usize, Turn>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
     /// A status from Spindle after a run failed, rather than text from the model.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

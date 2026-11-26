@@ -132,6 +132,11 @@ impl Selection {
         self.dragging
     }
 
+    pub(super) fn needs_all_rows(&self, ui: &Ui) -> bool {
+        self.dragging || self.range.is_some_and(|(start, end)| start != end || ui.input(|i|
+            i.modifiers.command && i.key_pressed(egui::Key::A)))
+    }
+
     pub(super) fn touch_copy_visible(&self) -> bool {
         self.touch && !self.dragging && self.range.is_some_and(|(a, b)| a != b)
     }

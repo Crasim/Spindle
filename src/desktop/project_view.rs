@@ -129,14 +129,22 @@ impl ProjectScreen {
 
 impl Desktop {
     /// Apply finished project work. Runs every frame so the sidebar sees the library.
-    pub(super) fn poll_projects(&mut self) {
+    pub(super) fn poll_projects(&mut self, ctx: &egui::Context) {
         let screen = &mut self.projects;
         if !screen.loaded && screen.pending.is_none() {
             screen.loaded = true;
             screen.refresh(self.root.clone());
         }
-        let Some(result) = screen.pending.as_ref().and_then(|r| r.try_recv().ok()) else {
+        let Some(result) = screen.pending.as_ref().map(|r| r.try_recv()) else {
             return;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("Project operation stopped")),
         };
         screen.pending = None;
         let mut start_in = None;
@@ -177,7 +185,7 @@ impl Desktop {
     }
 
     pub(super) fn projects_page(&mut self, ui: &mut egui::Ui) {
-        self.poll_projects();
+        self.poll_projects(ui.ctx());
         if self.projects.preview.is_some() {
             let screen = &mut self.projects;
             if let Some(s) = screen.preview.as_mut() {

@@ -119,7 +119,7 @@ impl SpindleLogo {
 }
 
 /// Egui visuals for the current palette: no outline on selected items, rounded corners.
-fn apply_style(ctx: &egui::Context, light: bool) {
+fn apply_style(ctx: &egui::Context, light: bool, text_size: u8) {
     crate::widgets::set_light(light);
     ctx.set_theme(if light {
         egui::Theme::Light
@@ -142,7 +142,7 @@ fn apply_style(ctx: &egui::Context, light: bool) {
         .insert(egui::TextStyle::Button, egui::FontId::proportional(15.));
     style
         .text_styles
-        .insert(egui::TextStyle::Body, egui::FontId::proportional(16.));
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(f32::from(text_size)));
     style.spacing.item_spacing = egui::vec2(9., 8.);
     style.spacing.button_padding = egui::vec2(12., 7.);
     style.spacing.interact_size.y = 30.;
@@ -337,6 +337,9 @@ pub struct Desktop {
     local_servers: settings::LocalServers,
     browser_path_draft: Option<String>,
     chat_selection: chat_selection::Selection,
+    transcript: TranscriptRows,
+    build_files: Option<(u64, std::time::Instant, Vec<String>)>,
+    reader_files_at: Option<std::time::Instant>,
     /// Text to put on the clipboard on the next frame.
     pending_copy: Option<String>,
     /// The task being worked on and when it started, for the elapsed time.
@@ -464,6 +467,73 @@ impl Desktop {
 
 /// For each message, the first message of the run of tool steps it belongs to: replies that
 /// called a tool and the results sent back. The final answer after a run stays outside it.
+/// Keep measured row heights so a stable transcript only lays out the visible messages.
+#[derive(Default)]
+struct TranscriptRows {
+    chat: Option<u64>,
+    geometry: Option<(f32, f32, f32, bool)>,
+    heights: Vec<Option<f32>>,
+    repeated: Vec<bool>,
+}
+
+impl TranscriptRows {
+    fn observe(&mut self, before: &crate::state::State, after: &crate::state::State) {
+        if before.chat_id != after.chat_id {
+            *self = Self::default();
+            return;
+        }
+        if self.heights.is_empty() { return; }
+        let common = before.history.iter().zip(&after.history).take_while(|(a, b)| a == b).count();
+        if common != before.history.len() || common != after.history.len() {
+            self.repeated.clear();
+        }
+        self.heights.truncate(common);
+        for (index, height) in self.heights.iter_mut().enumerate() {
+            if before.thread.turns.get(&index) != after.thread.turns.get(&index)
+                || before.thread.edited_messages.contains(&index) != after.thread.edited_messages.contains(&index)
+                || (after.history[index].role == "user"
+                    && before.thread.turns.get(&(index + 1)).map(|turn| &turn.pastes)
+                        != after.thread.turns.get(&(index + 1)).map(|turn| &turn.pastes))
+            {
+                *height = None;
+            }
+        }
+    }
+
+    fn begin(&mut self, ui: &egui::Ui, state: &crate::state::State) {
+        if self.chat != Some(state.chat_id) {
+            *self = Self { chat: Some(state.chat_id), ..Self::default() };
+        }
+        let geometry = (ui.available_width(), ui.ctx().pixels_per_point(),
+            egui::TextStyle::Body.resolve(ui.style()).size, state.preferences.nerd_stats);
+        if self.geometry != Some(geometry) {
+            self.geometry = Some(geometry);
+            self.heights.clear();
+        }
+        self.heights.resize(state.history.len(), None);
+        if self.repeated.len() != state.history.len() {
+            let mut seen = std::collections::HashSet::new();
+            self.repeated = state.history.iter().map(|message| {
+                let body = message.content.trim();
+                message.role == "assistant" && body.len() > 60 && !seen.insert(body)
+            }).collect();
+        }
+    }
+
+    fn skip(&self, ui: &mut egui::Ui, index: usize) -> bool {
+        let Some(height) = self.heights[index] else { return false };
+        let top = ui.cursor().top();
+        let clip = ui.clip_rect();
+        // Keep a buffer in both directions so a scroll gesture has rows ready to paint.
+        if top + height < clip.top() - 160. || top > clip.bottom() + 160. {
+            ui.add_space(height);
+            ui.skip_ahead_auto_ids(1);
+            return true;
+        }
+        false
+    }
+}
+
 fn step_groups(state: &crate::state::State) -> Vec<Option<usize>> {
     let step = |i: usize| {
         if state.history[i].role == "user" {
@@ -524,11 +594,9 @@ fn steps_header(
     open: bool,
     working: bool,
 ) -> bool {
-    let notes: Vec<&crate::state::ToolNote> = groups
-        .iter()
+    let notes: Vec<&crate::state::ToolNote> = groups[start..].iter().take_while(|g| **g == Some(start))
         .enumerate()
-        .filter(|(_, g)| **g == Some(start))
-        .filter_map(|(i, _)| state.thread.turns.get(&i).and_then(|t| t.tool.as_ref()))
+        .filter_map(|(i, _)| state.thread.turns.get(&(start + i)).and_then(|t| t.tool.as_ref()))
         .collect();
     let failed = notes
         .iter()
@@ -767,7 +835,7 @@ impl Desktop {
             }
             cc.egui_ctx.set_fonts(fonts);
         }
-        apply_style(&cc.egui_ctx, false);
+        apply_style(&cc.egui_ctx, false, 16);
         let mut view = View::default();
         view.state.preferences.accent = initial_accent;
         Self {
@@ -780,6 +848,9 @@ impl Desktop {
             generating: None,
             tasks: Default::default(),
             reader: Default::default(),
+            transcript: Default::default(),
+            build_files: None,
+            reader_files_at: None,
             images: Default::default(),
             voice: Default::default(),
             sync_form: Default::default(),
@@ -1786,6 +1857,9 @@ impl Desktop {
                         if ui.add_enabled(self.draft.is_empty(),egui::Button::new("Use draft in composer")).clicked(){self.draft=text.to_owned();self.focus=true;}
                     }
                 }
+                self.transcript.begin(ui, state);
+                let full_transcript = self.chat_selection.needs_all_rows(ui);
+                let editing_row = self.message_editors.editing_row(state.chat_id);
                 let mut note=None;
                 let mut undo_at=None;
                 let mut listen:Option<((u64,usize),String)>=None;
@@ -1818,6 +1892,11 @@ impl Desktop {
                         }
                         if !open {continue;}
                     }
+                    let cache_row = groups[index].is_none() && !state.thread.compactions.contains_key(&index)
+                        && !state.thread.plan_notes.contains_key(&index) && !state.thread.tool_results.contains(&index)
+                        && editing_row != Some(index) && index + 1 < state.history.len();
+                    if cache_row && !full_transcript && self.transcript.skip(ui, index) { continue; }
+                    let top = ui.cursor().top();
                     let user=message.role=="user";
                     let turn=state.thread.turns.get(&index);
                     if user && let Some(update)=state.thread.plan_notes.get(&index) {
@@ -1828,6 +1907,7 @@ impl Desktop {
                         ui.push_id(("tool-result",index),|ui| notes::tool_result(ui,&message.content));
                         continue;
                     }
+                    ui.push_id(("history-row", state.chat_id, index), |ui| {
                     ui.add_space(12.);
                     message_row(ui,user,|ui|{
                     let failed=turn.is_some_and(|turn|turn.failed);
@@ -1875,7 +1955,7 @@ impl Desktop {
                     let clicked=ui.push_id((state.chat_id,index),|ui| {
                         if self.message_editors.field(ui, state.chat_id, index, &message.content, (message.role=="user").then(|| state.history.len()-index-1), &self.tx) { None }
                         // A reply word for word the same as an earlier one: one line, not the text again.
-                        else if !user && !failed && message.content.trim().len()>60 && state.history[..index].iter().any(|m|m.role=="assistant" && m.content.trim()==message.content.trim()) {
+                        else if !failed && self.transcript.repeated[index] {
                             ui.label(Text::new("Repeated an earlier reply word for word").size(13.).italics().color(muted()));
                             None
                         }
@@ -1951,6 +2031,8 @@ impl Desktop {
                         }
                     }
                     });
+                    });
+                    self.transcript.heights[index] = cache_row.then(|| ui.cursor().top() - top);
                 }
                 if let Some((slot,top,_))=group_box { close_group_box(ui,slot,top); }
                 if let Some(update)=state.thread.plan_notes.get(&state.history.len()) {
@@ -2017,7 +2099,8 @@ impl Desktop {
                     chat_text.message((self.view.state.chat_id,self.view.state.history.len()+1));
                     message_row(ui,false,|ui|{
                     if self.view.busy {
-                        let partial = self.preview.borrow();
+                        // Release the watch lock before parsing and laying out the Markdown.
+                        let partial = self.preview.borrow().clone();
                         if !partial.is_empty() {
                             ui.label(Text::new(route(t.actual.as_deref().unwrap_or(&t.model)).1).color(accent()));
                             ui.push_id((self.view.state.chat_id,self.view.state.history.len()+1),|ui|reader::markdown_with_files(ui,&crate::artifacts::streaming_text(&t.text,&crate::tools::streaming_view(partial.split("\n<!-- spindle-title:").next().unwrap_or(""))),false,&[],&mut chat_text,&mut |_,_|{}));
@@ -2076,7 +2159,10 @@ impl Desktop {
             return;
         }
         let chat = self.view.state.chat_id;
-        let files = crate::native::outputs(&self.root, chat);
+        if self.build_files.as_ref().is_none_or(|(id, at, _)| *id != chat || at.elapsed() >= Duration::from_secs(2)) {
+            self.build_files = Some((chat, std::time::Instant::now(), crate::native::outputs(&self.root, chat)));
+        }
+        let files = &self.build_files.as_ref().unwrap().2;
         if files.is_empty() {
             return;
         }
@@ -2085,7 +2171,7 @@ impl Desktop {
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().max_height(150.).show(ui, |ui| {
                     let label = if cfg!(windows) { "Export…" } else { "Export to Downloads" };
-                    for name in &files {
+                    for name in files {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(name);
                             if !ui.small_button(label).clicked() {
@@ -2444,7 +2530,6 @@ impl eframe::App for Desktop {
             });
             return;
         }
-        self.background(ctx, frame);
         if !cfg!(target_os = "android")
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q))
         {
@@ -2455,18 +2540,13 @@ impl eframe::App for Desktop {
         {
             self.show_models();
         }
-        let light = match self.view.state.preferences.theme {
-            Theme::Light => true,
-            Theme::Dark => false,
-            Theme::System => ctx.input(|i| i.raw.system_theme) == Some(egui::Theme::Light),
-        };
-        if self.applied_light != Some(light) {
-            apply_style(ctx, light);
-            #[cfg(windows)]
-            caption(&*frame, light);
-            self.applied_light = Some(light);
-        }
         while let Ok(v) = self.rx.try_recv() {
+            self.transcript.observe(&self.view.state, &v.state);
+            if v.job != self.view.job { self.build_files = None; }
+            if v.state.chat_id != self.view.state.chat_id || v.job != self.view.job
+                || v.state.history.len() != self.view.state.history.len() {
+                self.reader_files_at = None;
+            }
             self.observe_submission(&v);
             if self.plan.submitted && v.notice == "Plan revision queued" && v.state.chat_id == self.view.state.chat_id {
                 self.plan.revision_accepted();
@@ -2570,6 +2650,18 @@ impl eframe::App for Desktop {
                 .retain(|id, _| v.state.thread_data(*id).is_some());
             self.view = v;
         }
+        let light = match self.view.state.preferences.theme {
+            Theme::Light => true,
+            Theme::Dark => false,
+            Theme::System => ctx.input(|i| i.raw.system_theme) == Some(egui::Theme::Light),
+        };
+        if self.applied_light != Some(light) {
+            apply_style(ctx, light, self.view.state.preferences.text_size);
+            #[cfg(windows)]
+            caption(&*frame, light);
+            self.applied_light = Some(light);
+        }
+        self.background(ctx, frame);
         let selected = self.view.state.preferences.accent;
         if self.awaiting_submission() && self.tx.is_closed() {
             self.reject_submission();
@@ -2580,8 +2672,13 @@ impl eframe::App for Desktop {
             self.logo = SpindleLogo::new(ctx, selected);
             ctx.send_viewport_cmd(egui::ViewportCommand::Icon(Some(self.logo.window.clone())));
         }
-        ctx.request_repaint_after(Duration::from_millis(120));
-        if self.view.busy && !self.preview.borrow().is_empty() {
+        if cfg!(target_os = "android") {
+            // Android intent and IME callbacks are also polled by the app window.
+            ctx.request_repaint_after(Duration::from_millis(120));
+        } else if self.page == Page::Settings || self.reader.open {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
+        if self.view.state.preferences.nerd_stats && self.view.busy && !self.preview.borrow().is_empty() {
             if let Some(task) =
                 self.view.state.queue.front().filter(|t| {
                     t.origin.unwrap_or(self.view.state.chat_id) == self.view.state.chat_id
@@ -2653,7 +2750,7 @@ impl eframe::App for Desktop {
             ctx.copy_text(text);
         }
         self.zoom(ctx);
-        self.poll_projects();
+        self.poll_projects(ctx);
         self.poll_voice(ctx);
         // Android: the screen Spindle draws in already leaves out the status bar and the
         // gesture bar or keyboard (see raw_input_hook).
@@ -2707,8 +2804,10 @@ impl eframe::App for Desktop {
             self.reader.browser.hide();
         }
         let mut attachment = None;
-        if self.reader.open && !detail {
+        if self.reader.open && !detail
+            && self.reader_files_at.is_none_or(|at| at.elapsed() >= Duration::from_secs(2)) {
             self.reader.chat_files = self.chat_files();
+            self.reader_files_at = Some(std::time::Instant::now());
             let state = &self.view.state;
             self.reader.library_root = state.thread.project.clone().map(|p| {
                 let name = p
@@ -2717,6 +2816,8 @@ impl eframe::App for Desktop {
                     .unwrap_or_else(|| "Project".into());
                 (p, name)
             });
+        } else if !self.reader.open {
+            self.reader_files_at = None;
         }
         if self.reader.preview.active() && (self.page != Page::Chat || detail) {
             self.reader.preview.hide();
@@ -3036,6 +3137,97 @@ fn reveal(path: &std::path::Path) -> std::io::Result<()> {
             .spawn()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    fn fixture(dir: &Path, messages: usize) -> (egui::Context, Desktop) {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_views, rx) = std::sync::mpsc::channel();
+        let (_stream, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.into(), tx, rx, preview, Accent::Blue);
+        for index in 0..messages {
+            let role = if index % 2 == 0 { "user" } else { "assistant" };
+            let body = format!("## Message {index}\n\n{}\n\n- First step\n- Second step\n\n```rust\nfn main() {{}}\n```",
+                "A paragraph with **bold text**, a [link](https://example.com), and `a code span`. ".repeat(8));
+            app.view.state.history.push(crate::ollama::Message::new(role, body));
+        }
+        (ctx, app)
+    }
+
+    fn draw(ctx: &egui::Context, app: &mut Desktop, frame: usize, events: Vec<egui::Event>) -> egui::FullOutput {
+        ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1150., 760.))),
+            time: Some(frame as f64 / 30.),
+            events,
+            ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.conversation(ui));
+        })
+    }
+
+    fn visible_text(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
+        fn find(shape: &egui::Shape, clip: egui::Rect, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    let visible = text.galley.rect.translate(text.pos.to_vec2()).intersect(clip);
+                    visible.is_positive().then(|| visible.center())
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, clip, label)),
+                _ => None,
+            }
+        }
+        output.shapes.iter().find_map(|shape| find(&shape.shape, shape.clip_rect, label))
+    }
+
+    #[test]
+    fn cached_transcript_scrolls_and_selects_offscreen_text() {
+        use egui::{Event, Key, Modifiers, PointerButton, Pos2};
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 80);
+        for frame in 0..4 { draw(&ctx, &mut app, frame, vec![]); }
+        let bottom = draw(&ctx, &mut app, 4, vec![]);
+        assert!(visible_text(&bottom, "Message 79").is_some());
+        assert!(visible_text(&bottom, "Message 0").is_none());
+        assert!(app.transcript.heights[0].is_some());
+        draw(&ctx, &mut app, 5, vec![
+            Event::PointerMoved(Pos2::new(400., 400.)),
+            Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 100_000.), modifiers: Modifiers::NONE },
+        ]);
+        for frame in 6..25 { draw(&ctx, &mut app, frame, vec![]); }
+        let top = draw(&ctx, &mut app, 25, vec![]);
+        let first = visible_text(&top, "Message 0").expect("scroll back to the first cached row");
+        for (frame, pressed) in [(26, true), (27, false)] {
+            draw(&ctx, &mut app, frame, vec![Event::PointerMoved(first), Event::PointerButton {
+                pos: first, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+            }]);
+        }
+        draw(&ctx, &mut app, 28, vec![Event::Key {
+            key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND,
+        }]);
+        let copied = draw(&ctx, &mut app, 29, vec![Event::Copy]);
+        assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
+            egui::OutputCommand::CopyText(text) if text.contains("Message 0") && text.contains("Message 79"))));
+    }
+
+    #[test]
+    #[ignore = "measures transcript frame times on a synthetic workspace"]
+    fn long_transcript_frame_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 500);
+        let mut times = Vec::new();
+        for frame in 0..45 {
+            let start = std::time::Instant::now();
+            draw(&ctx, &mut app, frame, vec![]);
+            if frame >= 5 { times.push(start.elapsed().as_secs_f64() * 1000.); }
+        }
+        times.sort_by(f64::total_cmp);
+        println!("500-message transcript: p50 {:.2} ms, p95 {:.2} ms", times[20], times[37]);
+    }
 }
 
 #[cfg(test)]
@@ -3500,10 +3692,6 @@ impl Desktop {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.notice =
                 "Spindle keeps running in the background. Open it from the tray icon.".into();
-        }
-        if self.tray.is_some() {
-            // Keep hearing the tray while hidden.
-            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
     }
 }

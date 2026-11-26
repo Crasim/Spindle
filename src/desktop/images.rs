@@ -45,7 +45,7 @@ impl ImagesForm {
                     self.status = format!("{e:#}");
                     self.checking = None;
                 }
-                Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint(),
+                Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(100)),
                 Err(mpsc::TryRecvError::Disconnected) => self.checking = None,
             }
         }

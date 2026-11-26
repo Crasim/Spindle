@@ -764,18 +764,23 @@ fn main() -> Result<()> {
     };
     let (engine_out, engine_views) = mpsc::channel::<engine::View>();
     let forward_control = control.clone();
+    let desktop_context = std::sync::Arc::new(std::sync::OnceLock::<eframe::egui::Context>::new());
+    let repaint = desktop_context.clone();
     thread::spawn(move || {
         for view in engine_views {
             if let Some(c) = &forward_control {
                 c.publish(&view);
             }
             if !serving {
-                let _ = output.send(view);
+                if output.send(view).is_err() { break; }
+                if let Some(ctx) = repaint.get() { ctx.request_repaint(); }
             }
         }
+        if let Some(ctx) = repaint.get() { ctx.request_repaint(); }
     });
     let desktop_shutdown = std::sync::Arc::new(desktop::DesktopShutdown::default());
     let shutdown = desktop_shutdown.clone();
+    let ui_runtime = runtime.handle().clone();
     let runner = thread::spawn(move || {
         let result = runtime.block_on(engine.run(input, engine_out, false));
         drop(runtime);
@@ -888,6 +893,17 @@ fn main() -> Result<()> {
             "Spindle",
             options,
             Box::new(move |cc| {
+                let ctx = cc.egui_ctx.clone();
+                let _ = desktop_context.set(ctx.clone());
+                let mut stream = preview.clone();
+                ui_runtime.spawn(async move {
+                    // Wake the UI for new text, coalescing providers that send many small chunks.
+                    while stream.changed().await.is_ok() {
+                        tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+                        drop(stream.borrow_and_update());
+                        ctx.request_repaint();
+                    }
+                });
                 let mut app = desktop::Desktop::new(
                     cc,
                     workspace,

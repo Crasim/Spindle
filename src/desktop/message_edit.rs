@@ -15,6 +15,10 @@ struct Edit {
 }
 
 impl MessageEditors {
+    pub(super) fn editing_row(&self, thread: u64) -> Option<usize> {
+        self.0.get(&thread).map(|edit| edit.index)
+    }
+
     pub fn observe(&mut self, view: &View) {
         self.0.retain(|&thread, e| {
             let Some(message) = view
