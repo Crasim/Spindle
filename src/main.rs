@@ -771,6 +771,10 @@ fn main() -> Result<()> {
         if result.is_ok() {
             shutdown.finish();
         }
+        #[cfg(any(windows, target_os = "linux"))]
+        if let Err(error) = &result {
+            shutdown.cancel_update_restart(error);
+        }
         result
     });
     if service {
@@ -858,6 +862,8 @@ fn main() -> Result<()> {
         Ok(())
     } else {
         let close = tx.clone();
+        let workspace = root.clone();
+        let shutdown = desktop_shutdown.clone();
         let options = eframe::NativeOptions {
             viewport: eframe::egui::ViewportBuilder::default()
                 .with_icon(desktop::spindle_icon(initial_accent))
@@ -873,13 +879,13 @@ fn main() -> Result<()> {
             Box::new(move |cc| {
                 let mut app = desktop::Desktop::new(
                     cc,
-                    root,
+                    workspace,
                     tx,
                     rx,
                     preview,
                     initial_accent,
                 );
-                app.attach_shutdown(cc, desktop_shutdown);
+                app.attach_shutdown(cc, shutdown);
                 Ok(Box::new(app))
             }),
         );
@@ -893,5 +899,10 @@ fn main() -> Result<()> {
         c.close();
     }
     desktop_result?;
-    result?.context("Session engine")
+    result?.context("Session engine")?;
+    #[cfg(any(windows, target_os = "linux"))]
+    if desktop_shutdown.restarting() {
+        updates::restart(&root)?;
+    }
+    Ok(())
 }

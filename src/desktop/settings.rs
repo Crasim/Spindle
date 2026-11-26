@@ -81,6 +81,7 @@ pub(super) struct UpdatePanel {
     update: Option<crate::updates::Update>,
     job: Option<std::sync::mpsc::Receiver<anyhow::Result<UpdateResult>>>,
     status: String,
+    confirm_restart: bool,
 }
 
 #[cfg(any(windows, target_os = "linux"))]
@@ -109,7 +110,8 @@ impl UpdatePanel {
         });
     }
 
-    fn show(&mut self, ui: &mut egui::Ui) {
+    fn show(&mut self, ui: &mut egui::Ui, has_drafts: bool, submitting: bool) -> bool {
+        let mut restart = false;
         if let Some(job) = &self.job {
             match job.try_recv() {
                 Ok(result) => {
@@ -136,8 +138,32 @@ impl UpdatePanel {
         ui.separator();
         ui.heading("Updates");
         ui.weak(format!("Spindle · {}", crate::version()));
-        if let Some(version) = crate::updates::staged_version() {
-            ui.label(format!("{version} is ready. Exit and reopen Spindle to start it."));
+        let staged = crate::updates::staged_version();
+        if let Some(version) = &staged {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Version {version} is ready to install"));
+                if ui.add_enabled(self.job.is_none() && !submitting, egui::Button::new("Restart to update"))
+                    .on_disabled_hover_text("Wait for the current download, check, or message submission to finish.")
+                    .clicked()
+                {
+                    self.confirm_restart = has_drafts;
+                    restart = !has_drafts;
+                }
+            });
+            if self.confirm_restart {
+                ui.label("Restarting will clear unsent drafts.");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(self.job.is_none() && !submitting, egui::Button::new("Restart and discard drafts")).clicked() {
+                        restart = true;
+                        self.confirm_restart = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm_restart = false;
+                    }
+                });
+            }
+        } else {
+            self.confirm_restart = false;
         }
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(self.job.is_none(), egui::Button::new("Check for updates")).clicked() {
@@ -147,7 +173,9 @@ impl UpdatePanel {
                 ui.hyperlink_to("GitHub Releases", crate::updates::RELEASES);
             }
         });
-        if let Some(update) = self.update.clone() {
+        if let Some(update) = self.update.clone()
+            && staged.as_deref() != Some(update.version.to_string().as_str())
+        {
             ui.horizontal_wrapped(|ui| {
                 ui.label(format!("Version {} available", update.version));
                 if ui.add_enabled(self.job.is_none(), egui::Button::new("Download update")).clicked() {
@@ -162,6 +190,7 @@ impl UpdatePanel {
         if !self.status.is_empty() {
             ui.label(&self.status);
         }
+        restart
     }
 }
 
@@ -710,7 +739,23 @@ impl Desktop {
             }
             ui.add_space(14.);
             #[cfg(any(windows, target_os = "linux"))]
-            self.updates.show(ui);
+            {
+                let has_drafts = !self.draft.is_empty()
+                    || self.drafts_by_thread.values().any(|draft| !draft.is_empty())
+                    || self.projects.composers.values().any(|draft| !draft.is_empty())
+                    || !self.paste_drafts.files.is_empty()
+                    || !self.image_drafts.is_empty()
+                    || self.images_by_thread.values().any(|images| !images.is_empty());
+                let submitting = self.awaiting_submission();
+                if self.updates.show(ui, has_drafts, submitting)
+                    && let Err(error) = self.shutdown.request_update_restart(&self.tx)
+                {
+                    self.updates.status = format!("Could not restart. {error:#}");
+                }
+                if let Some(error) = self.shutdown.restart_error.get() {
+                    ui.label(format!("Could not save the workspace for restart. {error}"));
+                }
+            }
             #[cfg(not(any(windows, target_os = "linux")))]
             ui.label(
                 Text::new(format!("Spindle   ·   {}", crate::version()))

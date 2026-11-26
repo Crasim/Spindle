@@ -263,19 +263,40 @@ fn verify(path: &Path, record: &Install) -> Result<()> {
     Ok(())
 }
 
+fn verified_staged_executable(root: &Path) -> Result<Option<PathBuf>> {
+    let Some((version, record)) = staged(root)? else {
+        return Ok(None);
+    };
+    let path = binary(root, &version);
+    verify(&path, &record)?;
+    Ok(Some(path))
+}
+
+pub fn verify_restart() -> Result<()> {
+    verified_staged_executable(&directory())?
+        .context("No verified update is ready. Check for updates and download it again.")?;
+    Ok(())
+}
+
 /// Leave the running executable in place. A normal launch hands over to the verified version.
 pub fn launch_staged() -> Result<bool> {
-    let root = directory();
-    let Some((version, record)) = staged(&root)? else {
+    let Some(path) = verified_staged_executable(&directory())? else {
         return Ok(false);
     };
-    let path = binary(&root, &version);
-    verify(&path, &record)?;
     if std::env::current_exe()?.canonicalize()? == path.canonicalize()? {
         return Ok(false);
     }
     std::process::Command::new(path).spawn()?;
     Ok(true)
+}
+
+/// Reenter the normal startup path only after the workspace lock is released.
+pub fn restart(workspace: &Path) -> Result<()> {
+    std::process::Command::new(std::env::current_exe()?)
+        .current_dir(workspace)
+        .spawn()
+        .context("Could not reopen Spindle after saving the workspace")?;
+    Ok(())
 }
 
 #[cfg(test)]

@@ -44,10 +44,38 @@ pub fn spindle_icon(accent: Accent) -> egui::IconData {
 #[derive(Default)]
 pub(crate) struct DesktopShutdown {
     finished: AtomicBool,
+    #[cfg(any(windows, target_os = "linux"))]
+    restarting: AtomicBool,
+    #[cfg(any(windows, target_os = "linux"))]
+    restart_error: OnceLock<String>,
     wake_window: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl DesktopShutdown {
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn restarting(&self) -> bool {
+        self.restarting.load(Ordering::Acquire)
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    fn request_update_restart(&self, tx: &UnboundedSender<String>) -> anyhow::Result<()> {
+        crate::updates::verify_restart()?;
+        self.restarting.store(true, Ordering::Release);
+        if tx.send("/exit".into()).is_err() {
+            self.restarting.store(false, Ordering::Release);
+            anyhow::bail!("The workspace engine has already stopped");
+        }
+        Ok(())
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    pub(crate) fn cancel_update_restart(&self, error: &anyhow::Error) {
+        if self.restarting() {
+            let _ = self.restart_error.set(format!("{error:#}"));
+            self.restarting.store(false, Ordering::Release);
+        }
+    }
+
     pub(crate) fn finish(&self) {
         self.finished.store(true, Ordering::Release);
         if let Some(wake) = self.wake_window.get() {
@@ -2395,6 +2423,16 @@ impl eframe::App for Desktop {
         if self.shutdown.finished.load(Ordering::Acquire) {
             self.tray = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        #[cfg(any(windows, target_os = "linux"))]
+        if self.shutdown.restarting() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Saving the workspace and restarting Spindle…");
+                });
+            });
             return;
         }
         self.background(ctx, frame);
