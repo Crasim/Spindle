@@ -474,6 +474,20 @@ impl BrowserPane {
 }
 
 impl BrowserTab {
+    fn reading_pointer(ui: &mut egui::Ui) {
+        let id = egui::Id::new("spindle-browser-pointer");
+        let cached = ui.ctx().data(|data| data.get_temp::<egui::TextureHandle>(id));
+        let texture = cached.unwrap_or_else(|| {
+            let image = image::load_from_memory(crate::browser::POINTER_PNG).expect("bundled browser pointer").to_rgba8();
+            let size = [image.width() as usize, image.height() as usize];
+            let pixels = egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw());
+            let texture = ui.ctx().load_texture("Spindle browser pointer", pixels, egui::TextureOptions::LINEAR);
+            ui.ctx().data_mut(|data| data.insert_temp(id, texture.clone()));
+            texture
+        });
+        ui.image((texture.id(), egui::vec2(34.65, 44.)));
+    }
+
     fn label(&self) -> String {
         if matches!(self.source, Some(BrowserSource::Linked { .. })) {
             return "Browser Link".into();
@@ -601,7 +615,7 @@ impl BrowserTab {
                 }
                 BrowserActivity::Opening => {
                     ui.horizontal_wrapped(|ui| {
-                        ui.spinner();
+                        Self::reading_pointer(ui);
                         ui.label("Spindle is opening this page…");
                     });
                 }
@@ -670,7 +684,7 @@ impl BrowserTab {
         #[cfg(windows)]
         if let Some(read) = &self.pending_read {
             let stop = ui.horizontal_wrapped(|ui| {
-                ui.spinner();
+                if read.marked.is_none() { Self::reading_pointer(ui); }
                 ui.label("Waiting for the requested page…");
                 read.proxy.is_some() && ui.button("Stop reading").clicked()
             }).inner;

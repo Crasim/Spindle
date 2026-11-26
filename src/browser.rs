@@ -12,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
+pub(crate) const POINTER_PNG: &[u8] = include_bytes!("../browser-extension/cursor.png");
 const SETTINGS: &str = "Settings → Sandbox → Model browser";
 
 pub(crate) fn public_page(address: &str) -> Result<reqwest::Url> {
@@ -60,7 +61,7 @@ impl std::error::Error for PageAccess {}
 #[cfg(windows)]
 pub(crate) fn panel_cursor_script() -> String {
     let css = include_str!("../browser-extension/activity.css");
-    let pointer = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../browser-extension/cursor.png"));
+    let pointer = base64::engine::general_purpose::STANDARD.encode(POINTER_PNG);
     let css = serde_json::to_string(&format!("{css}\n:host {{ --spindle-pointer: url(data:image/png;base64,{pointer}); }}")).unwrap();
     format!(r#"if (window === top && !document.querySelector('spindle-browser-activity')) {{
             const host = document.createElement('spindle-browser-activity');
