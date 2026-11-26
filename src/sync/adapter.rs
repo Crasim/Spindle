@@ -116,6 +116,9 @@ pub struct Status {
     /// could be reached: not an error, they catch up when they're back.
     #[serde(default)]
     pub waiting: Vec<String>,
+    /// Addresses advertised during the most recent local sync round.
+    #[serde(skip)]
+    pub local_endpoints: String,
 }
 
 /// Another branch of a chat, for the switcher.

@@ -141,7 +141,7 @@ impl Desktop {
     pub(super) fn sync_settings(&mut self, ui: &mut egui::Ui) {
         let mut send: Vec<String> = vec![];
         let mut pick_projects_folder = false;
-        let state = self.view.state.clone();
+        let state = &self.view.state;
         let f = &mut self.sync_form;
         if f.name.is_empty() {
             f.name = crate::sync::live::hostname();
@@ -422,11 +422,11 @@ impl Desktop {
             }
         });
         ui.heading("Devices");
-        let devices = crate::sync::live::devices(&state);
+        let devices = &self.view.sync_devices;
         if devices.iter().any(|(_, _, _, removed)| *removed) {
             ui.checkbox(&mut f.show_removed, "Show removed devices");
         }
-        for (id, name, me, removed) in devices {
+        for (id, name, me, removed) in devices.iter().cloned() {
             if removed && !f.show_removed { continue; }
             let os = if me { std::env::consts::OS } else { sync.remote.platforms.get(&id).map_or("", String::as_str) };
             let rules = sync.device_rules.get(&id).cloned().unwrap_or_default();
@@ -529,8 +529,7 @@ impl Desktop {
         }
         // Adding a device.
         #[cfg(target_os = "android")]
-        let alone = crate::sync::live::devices(&state).into_iter()
-            .filter(|(_, _, _, removed)| !removed).count() <= 1;
+        let alone = devices.iter().filter(|(_, _, _, removed)| !removed).count() <= 1;
         card(
             ui,
             "Add a device",
@@ -619,7 +618,7 @@ impl Desktop {
         );
         // Where projects from other devices go.
         card(ui, "Projects from other devices", |ui| {
-            if let Some(dir) = self.projects_folder_field(ui) {
+            if let Some(dir) = Self::projects_folder_field(state, &mut self.sync_form, ui) {
                 send.push(format!("/sync projects-folder {dir}"));
             }
         });
@@ -641,9 +640,7 @@ impl Desktop {
                             format!("Folder {}", path.display())
                         }
                         crate::sync::adapter::Place::Hosted { url } => format!("Server {url}"),
-                        crate::sync::adapter::Place::Peer { device, addr } => {
-                            crate::sync::live::peer_label(&state, device.as_deref(), addr)
-                        }
+                        crate::sync::adapter::Place::Peer { addr, .. } => format!("Device at {addr}"),
                     });
                     if ui.small_button("Remove").clicked() {
                         send.push(format!("/sync unlink {}", i + 1));
@@ -666,7 +663,7 @@ impl Desktop {
                 }
             });
             if let Some(p) = crate::sync::peer::port() {
-                let addresses = crate::sync::live::local_peer_endpoints(p, &sync.peer_dns);
+                let addresses = &sync.status.local_endpoints;
                 ui.weak(format!("This device listens on port {p}"));
                 if !addresses.is_empty() {
                     ui.add(egui::Label::new(egui::RichText::new(addresses.replace(',', ", ")).weak()).wrap());
@@ -786,7 +783,7 @@ impl Desktop {
                 s.on_open,
                 "on-open",
                 "Sync when a chat opens",
-                "Fetch its latest turns first, so you see the other device's before adding yours.",
+                "Show the saved chat and then check for updates from your other devices.",
             );
             row(
                 ui,
@@ -895,7 +892,7 @@ impl Desktop {
                 }
             });
         }
-        if pick_projects_folder && let Some(dir) = self.pick_projects_folder() {
+        if pick_projects_folder && let Some(dir) = Self::pick_projects_folder(state, &mut self.sync_form) {
             send.push(format!("/sync projects-folder {dir}"));
         }
         for c in send {
@@ -905,10 +902,8 @@ impl Desktop {
 
     /// The sync control in the chat header: status at a glance, click to sync now.
     /// Projects waiting on this device for a folder to go in: their names.
-    fn waiting_projects(&self) -> Vec<String> {
-        self.view
-            .state
-            .space
+    fn waiting_projects(state: &crate::state::State) -> Vec<String> {
+        state.space
             .as_ref()
             .map(|s| {
                 s.remote_projects
@@ -920,9 +915,9 @@ impl Desktop {
     }
 
     /// The projects-folder field with its button; the folder chosen, when the button is used.
-    fn projects_folder_field(&mut self, ui: &mut egui::Ui) -> Option<String> {
-        let saved = self.view.state.preferences.projects_dir.clone();
-        let waiting = self.waiting_projects();
+    fn projects_folder_field(state: &crate::state::State, form: &mut SyncForm, ui: &mut egui::Ui) -> Option<String> {
+        let saved = &state.preferences.projects_dir;
+        let waiting = Self::waiting_projects(state);
         ui.weak(if saved.is_empty() {
             "Choose where projects from your other devices are kept here. Each gets a folder with its name, notes and chats. Project files stay on the original device."
         } else {
@@ -941,24 +936,21 @@ impl Desktop {
         // (phones and Linux).
         ui.horizontal_wrapped(|ui| {
             if ui.button("Choose folder…").clicked()
-                && let Some(dir) = self.pick_projects_folder()
+                && let Some(dir) = Self::pick_projects_folder(state, form)
             {
                 chosen = Some(dir);
             }
             ui.weak("or type a folder:");
         });
         ui.horizontal_wrapped(|ui| {
-            let field = self
-                .sync_form
-                .projects_dir
-                .get_or_insert_with(|| suggestion.clone());
+            let field = form.projects_dir.get_or_insert_with(|| suggestion.clone());
             ui.add(
                 egui::TextEdit::singleline(field)
                     .id_salt("sync_view-field-16")
                     .hint_text("Full path of a folder")
                     .desired_width(ui.available_width().max(230.).min(380.)),
             );
-            let ready = !field.trim().is_empty() && field.trim() != saved;
+            let ready = !field.trim().is_empty() && field.trim() != saved.as_str();
             if ui
                 .add_enabled(
                     ready,
@@ -979,15 +971,15 @@ impl Desktop {
             ));
         }
         if chosen.is_some() {
-            self.sync_form.projects_dir = None;
+            form.projects_dir = None;
         }
         chosen
     }
 
     /// Choose the projects folder: Windows' picker (the folder, at once), or open Spindle's
     /// folder browser (phones and Linux), which sends its choice when made.
-    fn pick_projects_folder(&mut self) -> Option<String> {
-        let saved = self.view.state.preferences.projects_dir.clone();
+    fn pick_projects_folder(state: &crate::state::State, _form: &mut SyncForm) -> Option<String> {
+        let saved = state.preferences.projects_dir.clone();
         let start = std::path::PathBuf::from(if saved.trim().is_empty() {
             crate::sync::live::suggested_projects_folder()
         } else {
@@ -1008,7 +1000,7 @@ impl Desktop {
         }
         #[cfg(not(windows))]
         {
-            self.sync_form.browse = Some(start);
+            _form.browse = Some(start);
             None
         }
     }
@@ -1110,14 +1102,14 @@ impl Desktop {
             && self.sync_form.browse.is_none()
             && !self.sync_form.projects_later
             && self.view.state.preferences.projects_dir.trim().is_empty()
-            && !self.waiting_projects().is_empty()
+            && !Self::waiting_projects(&self.view.state).is_empty()
     }
 
     pub(super) fn projects_folder_panel(&mut self, ui: &mut egui::Ui) {
         let mut open = true;
         let mut chosen = None;
         super::detail_panel(ui, "Where should projects go?", "Close", &mut open, |ui| {
-            chosen = self.projects_folder_field(ui);
+            chosen = Self::projects_folder_field(&self.view.state, &mut self.sync_form, ui);
             if ui.button("Later").clicked() {
                 self.sync_form.projects_later = true;
             }
@@ -1134,10 +1126,9 @@ impl Desktop {
     /// longer explanation, and whether a round is running.
     fn sync_summary(&self) -> Option<(String, Color, String, bool)> {
         let sync = self.view.state.space.as_ref()?;
-        let others = crate::sync::live::devices(&self.view.state)
-            .into_iter()
+        let others = self.view.sync_devices.iter()
             .filter(|(_, _, me, removed)| !me && !removed)
-            .map(|(_, name, ..)| name)
+            .map(|(_, name, ..)| name.as_str())
             .collect::<Vec<_>>();
         let with = if others.is_empty() {
             String::new()

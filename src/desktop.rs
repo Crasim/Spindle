@@ -502,7 +502,9 @@ struct TranscriptRows {
     chat: Option<u64>,
     geometry: Option<(f32, f32, f32, bool)>,
     heights: Vec<Option<f32>>,
+    estimates: Vec<f32>,
     repeated: Vec<bool>,
+    groups: Vec<Option<usize>>,
 }
 
 impl TranscriptRows {
@@ -515,8 +517,15 @@ impl TranscriptRows {
         let common = before.history.iter().zip(&after.history).take_while(|(a, b)| a == b).count();
         if common != before.history.len() || common != after.history.len() {
             self.repeated.clear();
+            self.groups.clear();
+        }
+        if before.thread.tool_results != after.thread.tool_results
+            || before.thread.turns.iter().filter(|(_, turn)| turn.tool.is_some()).map(|(index, _)| index)
+                .ne(after.thread.turns.iter().filter(|(_, turn)| turn.tool.is_some()).map(|(index, _)| index)) {
+            self.groups.clear();
         }
         self.heights.truncate(common);
+        self.estimates.truncate(common);
         for (index, height) in self.heights.iter_mut().enumerate() {
             if before.thread.turns.get(&index) != after.thread.turns.get(&index)
                 || before.thread.edited_messages.contains(&index) != after.thread.edited_messages.contains(&index)
@@ -538,6 +547,7 @@ impl TranscriptRows {
         if self.geometry != Some(geometry) {
             self.geometry = Some(geometry);
             self.heights.clear();
+            self.estimates.clear();
         }
         self.heights.resize(state.history.len(), None);
         if self.repeated.len() != state.history.len() {
@@ -547,10 +557,22 @@ impl TranscriptRows {
                 message.role == "assistant" && body.len() > 60 && !seen.insert(body)
             }).collect();
         }
+        if self.groups.len() != state.history.len() {
+            self.groups = step_groups(state);
+        }
+        // Give offscreen messages enough space to scroll to before their Markdown is laid out.
+        let (width, _, font, _) = geometry;
+        for (index, message) in state.history.iter().enumerate().skip(self.estimates.len()) {
+            let width = if message.role == "user" { width * 0.85 } else { width };
+            let columns = ((width - 28.) / (font * 0.54)).max(8.) as usize;
+            let lines = if self.repeated[index] { 1 } else {
+                message.content.lines().map(|line| 1 + line.len() / columns).sum::<usize>().max(1)
+            };
+            self.estimates.push(48. + lines as f32 * (font + 4.));
+        }
     }
 
-    fn skip(&self, ui: &mut egui::Ui, index: usize) -> bool {
-        let Some(height) = self.heights[index] else { return false };
+    fn skip(ui: &mut egui::Ui, height: f32) -> bool {
         let top = ui.cursor().top();
         let clip = ui.clip_rect();
         // Keep a buffer in both directions so a scroll gesture has rows ready to paint.
@@ -1895,8 +1917,7 @@ impl Desktop {
                 let mut undo_at=None;
                 let mut listen:Option<((u64,usize),String)>=None;
                 // Runs of tool calls and their results fold into one line, closed by default.
-                let groups=step_groups(state);
-                let open_steps=self.open_steps.clone();
+                let groups=&self.transcript.groups;
                 let mut toggle_steps=None;
                 // The box drawn behind the current group of steps: its shape slot, top and start.
                 let mut group_box: Option<(egui::layers::ShapeIdx,f32,usize)>=None;
@@ -1908,8 +1929,11 @@ impl Desktop {
                     }
                     if let Some(n)=state.thread.compactions.get(&index) { compaction_divider(ui,*n); }
                     if let Some(start)=groups[index] {
-                        let open=open_steps.contains(&(state.chat_id,start));
+                        let open=self.open_steps.contains(&(state.chat_id,start));
                         if start==index {
+                            if !open && !full_transcript && index + 1 < state.history.len()
+                                && TranscriptRows::skip(ui, self.transcript.heights[index].unwrap_or(46.)) { continue; }
+                            let top=ui.cursor().top();
                             let live=self.view.busy || self.view.job.is_some() || state.queue.front().is_some_and(|t|t.origin.unwrap_or(state.chat_id)==state.chat_id);
                             let working=live && groups.last().copied().flatten()==Some(start);
                             ui.add_space(12.);
@@ -1918,15 +1942,20 @@ impl Desktop {
                             ui.add_space(6.);
                             ui.horizontal(|ui| {
                                 ui.add_space(10.);
-                                if steps_header(ui,state,&groups,start,open,working) {toggle_steps=Some((state.chat_id,start));}
+                                if steps_header(ui,state,groups,start,open,working) {toggle_steps=Some((state.chat_id,start));}
                             });
+                            if !open {
+                                close_group_box(ui,slot,group_box.take().unwrap().1);
+                                self.transcript.heights[index]=Some(ui.cursor().top()-top);
+                            }
                         }
                         if !open {continue;}
                     }
                     let cache_row = groups[index].is_none() && !state.thread.compactions.contains_key(&index)
                         && !state.thread.plan_notes.contains_key(&index) && !state.thread.tool_results.contains(&index)
                         && editing_row != Some(index) && index + 1 < state.history.len();
-                    if cache_row && !full_transcript && self.transcript.skip(ui, index) { continue; }
+                    if cache_row && !full_transcript && TranscriptRows::skip(ui,
+                        self.transcript.heights[index].unwrap_or(self.transcript.estimates[index])) { continue; }
                     let top = ui.cursor().top();
                     let user=message.role=="user";
                     let turn=state.thread.turns.get(&index);
@@ -3298,8 +3327,12 @@ mod transcript_tests {
     }
 
     fn draw(ctx: &egui::Context, app: &mut Desktop, frame: usize, events: Vec<egui::Event>) -> egui::FullOutput {
+        draw_at_width(ctx, app, frame, events, 1150.)
+    }
+
+    fn draw_at_width(ctx: &egui::Context, app: &mut Desktop, frame: usize, events: Vec<egui::Event>, width: f32) -> egui::FullOutput {
         ctx.run(egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1150., 760.))),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 760.))),
             time: Some(frame as f64 / 30.),
             events,
             ..Default::default()
@@ -3331,7 +3364,7 @@ mod transcript_tests {
         let bottom = draw(&ctx, &mut app, 4, vec![]);
         assert!(visible_text(&bottom, "Message 79").is_some());
         assert!(visible_text(&bottom, "Message 0").is_none());
-        assert!(app.transcript.heights[0].is_some());
+        assert!(app.transcript.heights[40].is_none());
         draw(&ctx, &mut app, 5, vec![
             Event::PointerMoved(Pos2::new(400., 400.)),
             Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., 100_000.), modifiers: Modifiers::NONE },
@@ -3353,6 +3386,31 @@ mod transcript_tests {
     }
 
     #[test]
+    fn long_chats_open_without_laying_out_the_whole_transcript_at_phone_width() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 500);
+        for frame in 0..4 { draw_at_width(&ctx, &mut app, frame, vec![], 360.); }
+        let first = draw_at_width(&ctx, &mut app, 4, vec![], 360.);
+        assert!(visible_text(&first, "Message 499").is_some());
+        assert!(app.transcript.heights.iter().flatten().count() < 40);
+
+        let chat = app.view.state.chat_id;
+        let history = std::mem::take(&mut app.view.state.history);
+        app.view.state.chat_id += 1;
+        app.view.state.history.push(crate::ollama::Message::new("assistant", "Another chat"));
+        let switched = draw_at_width(&ctx, &mut app, 5, vec![], 360.);
+        assert!(visible_text(&switched, "Another chat").is_some());
+        assert!(visible_text(&switched, "Message 499").is_none());
+
+        app.view.state.chat_id = chat;
+        app.view.state.history = history;
+        for frame in 6..10 { draw_at_width(&ctx, &mut app, frame, vec![], 360.); }
+        let returned = draw_at_width(&ctx, &mut app, 10, vec![], 360.);
+        assert!(visible_text(&returned, "Message 499").is_some());
+        assert!(app.transcript.heights.iter().flatten().count() < 40);
+    }
+
+    #[test]
     #[ignore = "measures transcript frame times on a synthetic workspace"]
     fn long_transcript_frame_times() {
         let dir = tempfile::tempdir().unwrap();
@@ -3360,8 +3418,10 @@ mod transcript_tests {
         let mut times = Vec::new();
         for frame in 0..45 {
             let start = std::time::Instant::now();
-            draw(&ctx, &mut app, frame, vec![]);
-            if frame >= 5 { times.push(start.elapsed().as_secs_f64() * 1000.); }
+            draw_at_width(&ctx, &mut app, frame, vec![], 420.);
+            let ms = start.elapsed().as_secs_f64() * 1000.;
+            if frame == 0 { println!("500-message transcript, first frame: {ms:.2} ms"); }
+            if frame >= 5 { times.push(ms); }
         }
         times.sort_by(f64::total_cmp);
         println!("500-message transcript: p50 {:.2} ms, p95 {:.2} ms", times[20], times[37]);

@@ -27,6 +27,7 @@ pub struct View {
     pub think_levels: std::collections::HashMap<String, crate::ollama::ThinkInfo>,
     pub context: Option<u64>,
     pub state: State,
+    pub sync_devices: Vec<(String, String, bool, bool)>,
     pub models: Vec<String>,
     pub busy: bool,
     pub notice: String,
@@ -7429,24 +7430,29 @@ impl Engine {
         result.map(|_| ())
     }
 
-    async fn model_window(&self, model: &str) -> Option<u64> {
-        let (scope, tag) = route(model);
-        if matches!(scope, "ollama-cloud" | "ollama") {
-            let reported = self.api.limits(model).await.context;
-            return if scope == "ollama" {
-                Some(reported.unwrap_or(16_384).min(16_384))
-            } else {
-                reported
-            };
+    fn model_window(&self, model: &str) -> impl std::future::Future<Output = Option<u64>> + use<> {
+        let api = self.api.clone();
+        let model = model.to_owned();
+        let tuning = self.state.tuning.get(&model).and_then(|t| t.context);
+        let provider = self.state.providers.iter().find(|p| p.id == route(&model).0).cloned();
+        async move {
+            let (scope, tag) = route(&model);
+            if matches!(scope, "ollama-cloud" | "ollama") {
+                let reported = api.limits(&model).await.context;
+                return if scope == "ollama" {
+                    Some(reported.unwrap_or(16_384).min(16_384))
+                } else {
+                    reported
+                };
+            }
+            if let Some(n) = tuning {
+                return Some(n);
+            }
+            let provider = provider.as_ref()?;
+            crate::providers::context_window(&api.0, &model, Some(provider))
+                .await
+                .or(provider.catalog_window(tag))
         }
-        // A window the user set for a server that doesn't report one (or reports it wrong).
-        if let Some(n) = self.state.tuning.get(model).and_then(|t| t.context) {
-            return Some(n);
-        }
-        let provider = self.state.providers.iter().find(|p| p.id == scope)?;
-        crate::providers::context_window(&self.api.0, model, Some(provider))
-            .await
-            .or(provider.catalog_window(tag))
     }
 
     pub async fn run(
@@ -7497,6 +7503,7 @@ impl Engine {
         }
         let mut window_for = String::new();
         let mut current_window = None;
+        let mut window_fetch: Option<JoinHandle<Option<u64>>> = None;
         let mut usage_fetch = None;
         let mut credit_fetch: Option<JoinHandle<Vec<(String, f64)>>> = None;
         let mut announce_usage = false;
@@ -7513,6 +7520,9 @@ impl Engine {
         let mut next_usage = tokio::time::Instant::now();
         let mut next_inbox = tokio::time::Instant::now();
         let mut next_sync = std::time::Instant::now();
+        let mut sync_after_open = tokio::time::Instant::now();
+        let mut sync_devices = Vec::new();
+        let mut next_sync_devices = next_sync;
         #[cfg(target_os = "android")]
         let mut android = crate::android_background::subscribe();
         #[cfg(target_os = "android")]
@@ -7546,7 +7556,9 @@ impl Engine {
             let time = automation::now();
             if window_for != self.state.model {
                 window_for = self.state.model.clone();
-                current_window = self.model_window(&window_for).await;
+                if let Some(previous) = window_fetch.take() { previous.abort(); }
+                current_window = None;
+                window_fetch = Some(tokio::spawn(self.model_window(&window_for)));
             }
             if self
                 .state
@@ -7595,7 +7607,7 @@ impl Engine {
             }
             let previous_task = self.state.queue.front().map(|q| q.id);
             let syncing = self.state.sync.as_ref().is_some_and(|p| p.enabled);
-            if may_work && syncing && (std::time::Instant::now() >= next_sync || active.is_none()) {
+            if may_work && syncing && std::time::Instant::now() >= next_sync {
                 #[cfg(target_os = "android")]
                 cpu.set(true);
                 self.state.sync_status = match crate::sync::refresh(&self.root, &mut self.state) {
@@ -7613,8 +7625,14 @@ impl Engine {
             if may_work && !background {
                 crate::sync::live::notice_changes(&mut self.state, active.is_some());
             }
+            // Display the saved chat immediately and coalesce sync requests while browsing chats.
+            let defer_open_sync = self.state.space.as_ref().is_some_and(|s| {
+                s.wanted == Some(crate::sync::adapter::Want::Open)
+                    && tokio::time::Instant::now() < sync_after_open
+            });
             if may_work && !background
                 && self.jobs.running.is_none()
+                && !defer_open_sync
                 && let Some(why) = crate::sync::live::due(&self.state)
                 && (active.is_none() || why != crate::sync::adapter::Want::Now)
             {
@@ -7635,6 +7653,7 @@ impl Engine {
                 }
                 self.sync_catalog();
                 self.default_model();
+                next_sync_devices = std::time::Instant::now();
             }
             if previous_task != self.state.queue.front().map(|q| q.id) {
                 if let Some(handle) = active.take() {
@@ -7766,7 +7785,7 @@ impl Engine {
                                         .iter()
                                         .find(|p| p.id == route(&model).0)
                                         .cloned();
-                                    let known_window = if window_for == model {
+                                    let known_window = if window_for == model && window_fetch.is_none() {
                                         current_window
                                     } else {
                                         self.model_window(&model).await
@@ -7867,6 +7886,10 @@ impl Engine {
                 !speech.tts_model.is_empty(),
                 !speech.stt_model.is_empty(),
             );
+            if std::time::Instant::now() >= next_sync_devices {
+                sync_devices = crate::sync::live::devices(&self.state);
+                next_sync_devices = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            }
             if output
                 .send(View {
                     reasoning: self.reasoning_models(),
@@ -7884,6 +7907,7 @@ impl Engine {
                     speech: self.models_with("speech", |_, _| false, |_| false),
                     context: current_window,
                     state: self.state.clone(),
+                    sync_devices: sync_devices.clone(),
                     models: self.models.clone(),
                     busy: active.is_some(),
                     notice: notice.clone(),
@@ -7936,6 +7960,10 @@ impl Engine {
                 }
                 _=tokio::time::sleep_until(next_inbox),if may_work && !background=>{}
                 _=tokio::time::sleep_until(next_usage),if may_work && !background && usage_fetch.is_none()=>{}
+                result=async{window_fetch.as_mut().unwrap().await},if window_fetch.is_some()=>{
+                    window_fetch=None;
+                    if let Ok(window) = result { current_window = current_window.or(window); }
+                }
                 snapshot=async{usage_fetch.as_mut().unwrap().await},if usage_fetch.is_some()=>{
                     usage_fetch=None;
                     if let Ok(snapshot)=snapshot {
@@ -7944,6 +7972,7 @@ impl Engine {
                     }
                 }
                 _=tokio::time::sleep_until(next_sync.into()),if may_work && syncing=>{}
+                _=tokio::time::sleep_until(sync_after_open),if may_work && !background && defer_open_sync=>{}
                 _=tokio::time::sleep(automation::next_tick(&self.state,time)),if may_work && active.is_none() && !background=>{}
                 line = input.recv() => {
                     let Some(input) = line else {break};
@@ -8017,6 +8046,15 @@ impl Engine {
                         }
                         let previous_task=self.state.queue.front().map(|q|q.id);
                         let message = self.command(line,active.is_some())?;
+                        if cmd.eq_ignore_ascii_case("/open") {
+                            sync_after_open = tokio::time::Instant::now() + std::time::Duration::from_millis(350);
+                        }
+                        if cmd.eq_ignore_ascii_case("/sync") {
+                            next_sync_devices = std::time::Instant::now();
+                        }
+                        if matches!(cmd, "/sync-unlock" | "/sync-toggle") {
+                            next_sync = std::time::Instant::now();
+                        }
                         if matches!(cmd, "/ollama-key" | "/ollama-connect") {
                             self.refresh_ollama().await?;
                         }
@@ -8122,6 +8160,9 @@ impl Engine {
         self.jobs.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         self.close_browser_link();
         if let Some(handle) = connecting {
+            handle.abort();
+        }
+        if let Some(handle) = window_fetch {
             handle.abort();
         }
         if self.state.sync.as_ref().is_some_and(|p| p.enabled) {

@@ -112,8 +112,13 @@ fn fingerprint(state: &State) -> u64 {
         t.section.hash(h);
         t.project.hash(h);
     };
+    // The active chat is stored separately. Hash it in ID order so viewing a chat
+    // does not look like an edit and start another background sync.
+    for (id, c) in state.chats.range(..state.chat_id) {
+        chat(&mut h, *id, &c.thread, &c.history);
+    }
     chat(&mut h, state.chat_id, &state.thread, &state.history);
-    for (id, c) in &state.chats {
+    for (id, c) in state.chats.range(state.chat_id..) {
         chat(&mut h, *id, &c.thread, &c.history);
     }
     serde_json::to_string(&state.preferences)
@@ -174,6 +179,21 @@ pub fn notice_changes(state: &mut State, busy: bool) {
 /// After a round: what it brought in isn't a change of ours to send back.
 fn changes_seen(state: &State) {
     CHANGES.lock().unwrap().0 = fingerprint(state);
+}
+
+#[cfg(test)]
+#[test]
+fn viewing_existing_chats_is_not_a_sync_edit() {
+    let mut state = State::default();
+    let first = state.chat_id;
+    state.history.push(crate::ollama::Message::new("user", "First chat"));
+    state.switch_chat(None).unwrap();
+    state.history.push(crate::ollama::Message::new("user", "Second chat"));
+    let before = fingerprint(&state);
+    state.switch_chat(Some(first)).unwrap();
+    assert_eq!(fingerprint(&state), before);
+    state.history.push(crate::ollama::Message::new("user", "New message"));
+    assert_ne!(fingerprint(&state), before);
 }
 
 pub fn want(state: &mut State, why: Want) {
@@ -696,6 +716,7 @@ async fn run_with(state: &mut State, live: &mut Live, why: Want) -> Option<Strin
         if let Err(err) = super::routes::publish(space, &addresses) {
             s.log(format!("Could not publish sync addresses: {err:#}"));
         }
+        s.status.local_endpoints = addresses;
     }
     if let Some(dir) = space.dir.clone() {
         let arrived = super::peer::take_inbox(&dir);
