@@ -1,4 +1,4 @@
-//! Published GitHub releases for this desktop build.
+//! Published GitHub releases and verified, staged updates.
 use anyhow::{Context, Result, ensure};
 use ring::digest::{Context as Hash, SHA256};
 use semver::Version;
@@ -10,10 +10,16 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(target_os = "android"))]
 const REPOSITORY: &str = env!("SPINDLE_RELEASE_REPO");
-pub const RELEASES: &str = concat!("https://github.com/", env!("SPINDLE_RELEASE_REPO"), "/releases");
-const API: &str = concat!("https://api.github.com/repos/", env!("SPINDLE_RELEASE_REPO"), "/releases?per_page=50");
+// This APK uses the public release channel even when built from a source archive.
+#[cfg(target_os = "android")]
+const REPOSITORY: &str = "Crasim/Spindle";
 const MAX_BINARY: u64 = 128 * 1024 * 1024;
+
+pub fn releases_url() -> String {
+    format!("https://github.com/{REPOSITORY}/releases")
+}
 
 #[derive(Deserialize)]
 struct Release {
@@ -55,6 +61,9 @@ fn newer(version: &Version, installed: &Version) -> bool {
 }
 
 fn asset_name() -> String {
+    if cfg!(target_os = "android") {
+        return "Spindle.apk".into();
+    }
     let extension = if cfg!(windows) { ".exe" } else { "" };
     format!(
         "spindle-{}-{}{extension}",
@@ -71,6 +80,7 @@ fn valid_digest(digest: &str) -> bool {
 }
 
 fn select(releases: Vec<Release>, installed: &Version, filename: &str) -> Option<Update> {
+    let releases_url = releases_url();
     releases
         .into_iter()
         .filter_map(|release| {
@@ -82,7 +92,7 @@ fn select(releases: Vec<Release>, installed: &Version, filename: &str) -> Option
             {
                 return None;
             }
-            let url = format!("{RELEASES}/download/{}/{filename}", release.tag_name);
+            let url = format!("{releases_url}/download/{}/{filename}", release.tag_name);
             let asset = release.assets.into_iter().find(|asset| {
                 asset.name == filename
                     && asset.browser_download_url == url
@@ -99,7 +109,7 @@ fn select(releases: Vec<Release>, installed: &Version, filename: &str) -> Option
                     size: asset.size,
                 },
                 version,
-                notes_url: format!("{RELEASES}/tag/{}", release.tag_name),
+                notes_url: format!("{releases_url}/tag/{}", release.tag_name),
                 url,
             })
         })
@@ -134,7 +144,7 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
 pub async fn check() -> Result<Option<Update>> {
     ensure!(!REPOSITORY.is_empty(), "This build has no GitHub release repository configured");
     let mut response = client(Duration::from_secs(15))?
-        .get(API)
+        .get(format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=50"))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?
@@ -160,8 +170,10 @@ fn directory() -> PathBuf {
     crate::runtime::data_dir().join("updates")
 }
 
-fn binary(root: &Path, version: &Version) -> PathBuf {
-    root.join(version.to_string()).join(if cfg!(windows) {
+fn update_file(root: &Path, version: &Version) -> PathBuf {
+    root.join(version.to_string()).join(if cfg!(target_os = "android") {
+        "Spindle.apk"
+    } else if cfg!(windows) {
         "spindle.exe"
     } else {
         "spindle"
@@ -169,8 +181,11 @@ fn binary(root: &Path, version: &Version) -> PathBuf {
 }
 
 pub async fn download(update: &Update) -> Result<()> {
-    let root = directory();
-    let path = binary(&root, &update.version);
+    download_to(update, &directory()).await
+}
+
+async fn download_to(update: &Update, root: &Path) -> Result<()> {
+    let path = update_file(root, &update.version);
     let folder = path.parent().context("Missing update folder")?;
     fs::create_dir_all(folder)?;
     let mut temporary = tempfile::NamedTempFile::new_in(folder)?;
@@ -195,7 +210,7 @@ pub async fn download(update: &Update) -> Result<()> {
             && crate::sync::core::hex(hash.finish().as_ref()) == update.record.digest,
         "GitHub update did not match its published SHA-256 digest"
     );
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::PermissionsExt;
         temporary
@@ -204,7 +219,7 @@ pub async fn download(update: &Update) -> Result<()> {
     }
     temporary.as_file().sync_all()?;
     temporary.persist(path)?;
-    let mut pending = tempfile::NamedTempFile::new_in(&root)?;
+    let mut pending = tempfile::NamedTempFile::new_in(root)?;
     serde_json::to_writer(&mut pending, &update.record)?;
     pending.as_file().sync_all()?;
     pending.persist(root.join("ready.json"))?;
@@ -242,7 +257,7 @@ fn verify(path: &Path, record: &Install) -> Result<()> {
     let file = fs::File::open(path)?;
     ensure!(
         file.metadata()?.is_file(),
-        "The staged update is missing its executable"
+        "The staged update is missing its download"
     );
     let mut input = file.take(record.size + 1);
     let mut hash = Hash::new(&SHA256);
@@ -263,24 +278,33 @@ fn verify(path: &Path, record: &Install) -> Result<()> {
     Ok(())
 }
 
-fn verified_staged_executable(root: &Path) -> Result<Option<PathBuf>> {
+fn verified_staged_update(root: &Path) -> Result<Option<(Version, PathBuf)>> {
     let Some((version, record)) = staged(root)? else {
         return Ok(None);
     };
-    let path = binary(root, &version);
+    let path = update_file(root, &version);
     verify(&path, &record)?;
-    Ok(Some(path))
+    Ok(Some((version, path)))
 }
 
+#[cfg(target_os = "android")]
+pub fn open_apk() -> Result<()> {
+    let (version, _) = verified_staged_update(&directory())?
+        .context("No verified APK is ready. Check for updates and download it again.")?;
+    crate::android::open_update_apk(&version.to_string())
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 pub fn verify_restart() -> Result<()> {
-    verified_staged_executable(&directory())?
+    verified_staged_update(&directory())?
         .context("No verified update is ready. Check for updates and download it again.")?;
     Ok(())
 }
 
 /// Leave the running executable in place. A normal launch hands over to the verified version.
+#[cfg(any(windows, target_os = "linux"))]
 pub fn launch_staged() -> Result<bool> {
-    let Some(path) = verified_staged_executable(&directory())? else {
+    let Some((_, path)) = verified_staged_update(&directory())? else {
         return Ok(false);
     };
     if std::env::current_exe()?.canonicalize()? == path.canonicalize()? {
@@ -291,6 +315,7 @@ pub fn launch_staged() -> Result<bool> {
 }
 
 /// Reenter the normal startup path only after the workspace lock is released.
+#[cfg(any(windows, target_os = "linux"))]
 pub fn restart(workspace: &Path) -> Result<()> {
     std::process::Command::new(std::env::current_exe()?)
         .current_dir(workspace)
@@ -314,7 +339,7 @@ mod tests {
                 name: filename.into(),
                 size: 2048,
                 digest,
-                browser_download_url: format!("{RELEASES}/download/{tag}/{filename}"),
+                browser_download_url: format!("{}/download/{tag}/{filename}", releases_url()),
             }],
         };
         let releases = [
@@ -351,5 +376,29 @@ mod tests {
         verify(file.path(), &record).unwrap();
         fs::write(file.path(), b"bad!").unwrap();
         assert!(verify(file.path(), &record).is_err());
+    }
+
+    #[test]
+    fn selects_only_published_android_apks() {
+        let installed = Version::parse("0.3.0-beta.15").unwrap();
+        let fixture = |tag: &str, filename: &str, origin: &str| Release {
+            draft: false,
+            prerelease: true,
+            tag_name: tag.into(),
+            assets: vec![Asset {
+                name: filename.into(),
+                size: 2048,
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+                browser_download_url: format!("{origin}/download/{tag}/{filename}"),
+            }],
+        };
+        let origin = releases_url();
+        let releases = vec![
+            fixture("v0.3.0-beta.16", "Spindle.apk", &origin),
+            fixture("v0.3.0-beta.17", "spindle-windows-x86_64.exe", &origin),
+            fixture("v0.3.0-beta.18", "Spindle.apk", "https://example.com"),
+        ];
+        let update = select(releases, &installed, "Spindle.apk").unwrap();
+        assert_eq!(update.version.to_string(), "0.3.0-beta.16");
     }
 }

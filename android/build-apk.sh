@@ -57,7 +57,7 @@ PY
     "$OUT"/compiled/*.flat
 cp target/aarch64-linux-android/release/libspindle.so "$OUT/lib/arm64-v8a/"
 javac --release 8 -classpath "$PLATFORM:$ECJ:$D8:$APKSIG" -d "$OUT/classes" \
-    java/org/spindleapp/spindle/SpindleActivity.java java/org/spindleapp/spindle/builder/*.java \
+    java/org/spindleapp/spindle/*.java java/org/spindleapp/spindle/builder/*.java \
     builder/src/org/spindleapp/spindle/builder/JavaDex.java
 jar cf "$OUT/classes.jar" -C "$OUT/classes" .
 "$BUILDER_BT/d8" --release --min-api 26 --lib "$PLATFORM" --output "$OUT" \

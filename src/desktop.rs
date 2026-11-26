@@ -339,7 +339,7 @@ pub struct Desktop {
     sandbox_tab: bool,
     integration_tab: Option<settings::IntegrationTab>,
     browser_setup: settings::BrowserSetup,
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     updates: settings::UpdatePanel,
     connector_setup: settings::ConnectorSetup,
     local_servers: settings::LocalServers,
@@ -908,7 +908,7 @@ impl Desktop {
             sandbox_tab: false,
             integration_tab: None,
             browser_setup: Default::default(),
-            #[cfg(any(windows, target_os = "linux"))]
+            #[cfg(any(windows, target_os = "linux", target_os = "android"))]
             updates: Default::default(),
             connector_setup: Default::default(),
             local_servers: Default::default(),

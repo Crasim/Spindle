@@ -18,6 +18,8 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Regional web results, requested only when the user chooses device location. -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <!-- Open an explicitly requested update in Android's package installer. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- The projects folder in Documents: Android 9 and older need this; newer ones let an
          app make its own folders there. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
@@ -34,6 +36,10 @@
         android:requestLegacyExternalStorage="true">
         <service android:name=".builder.ApkBuildService" android:exported="false"
             android:isolatedProcess="true" />
+        <provider android:name=".UpdateApkProvider" android:authorities="org.spindleapp.spindle.updates"
+            android:exported="false">
+            <grant-uri-permission android:pathPrefix="/release/" />
+        </provider>
         <activity
             android:name=".SpindleActivity"
             android:exported="true"

@@ -76,35 +76,60 @@ pub(super) struct BrowserSetup {
     page_request: Option<u64>,
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 #[derive(Default)]
 pub(super) struct UpdatePanel {
     update: Option<crate::updates::Update>,
     job: Option<std::sync::mpsc::Receiver<anyhow::Result<UpdateResult>>>,
     status: String,
+    #[cfg(any(windows, target_os = "linux"))]
     confirm_restart: bool,
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
+enum UpdateWork {
+    Check,
+    Download(crate::updates::Update),
+    #[cfg(target_os = "android")]
+    OpenApk,
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 enum UpdateResult {
     Checked(Option<crate::updates::Update>),
     Downloaded,
+    #[cfg(target_os = "android")]
+    OpenedApk,
 }
 
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 impl UpdatePanel {
-    fn run(&mut self, update: Option<crate::updates::Update>) {
-        self.status = if update.is_some() { "Downloading and verifying…".into() } else { "Checking GitHub Releases…".into() };
+    fn run(&mut self, work: UpdateWork) {
+        self.status = match &work {
+            UpdateWork::Check => "Checking GitHub Releases…",
+            UpdateWork::Download(_) => "Downloading and verifying…",
+            #[cfg(target_os = "android")]
+            UpdateWork::OpenApk => "Verifying the APK…",
+        }
+        .into();
         let (send, receive) = std::sync::mpsc::channel();
         self.job = Some(receive);
         std::thread::spawn(move || {
             let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from)
                 .and_then(|runtime| runtime.block_on(async {
-                    if let Some(update) = update {
-                        crate::updates::download(&update).await?;
-                        Ok(UpdateResult::Downloaded)
-                    } else {
-                        Ok(UpdateResult::Checked(crate::updates::check().await?))
+                    match work {
+                        UpdateWork::Check => {
+                            Ok(UpdateResult::Checked(crate::updates::check().await?))
+                        }
+                        UpdateWork::Download(update) => {
+                            crate::updates::download(&update).await?;
+                            Ok(UpdateResult::Downloaded)
+                        }
+                        #[cfg(target_os = "android")]
+                        UpdateWork::OpenApk => {
+                            crate::updates::open_apk()?;
+                            Ok(UpdateResult::OpenedApk)
+                        }
                     }
                 }));
             let _ = send.send(result);
@@ -112,7 +137,13 @@ impl UpdatePanel {
     }
 
     fn show(&mut self, ui: &mut egui::Ui, has_drafts: bool, submitting: bool) -> bool {
+        #[cfg(any(windows, target_os = "linux"))]
         let mut restart = false;
+        #[cfg(target_os = "android")]
+        let restart = {
+            let _ = (has_drafts, submitting);
+            false
+        };
         if let Some(job) = &self.job {
             match job.try_recv() {
                 Ok(result) => {
@@ -126,7 +157,11 @@ impl UpdatePanel {
                             self.status.clear();
                             self.update = None;
                         }
-                        Err(error) => self.status = format!("Update check or download failed. {error:#}"),
+                        #[cfg(target_os = "android")]
+                        Ok(UpdateResult::OpenedApk) => {
+                            self.status = "Continue in the Android installer.".into();
+                        }
+                        Err(error) => self.status = format!("Update failed. {error:#}"),
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(Duration::from_millis(150)),
@@ -140,9 +175,10 @@ impl UpdatePanel {
         ui.heading("Updates");
         ui.weak(format!("Spindle · {}", crate::version()));
         let staged = crate::updates::staged_version();
-        let can_restart = self.job.is_none() && !submitting;
-        self.confirm_restart &= staged.is_some() && has_drafts;
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(version) = &staged {
+            let can_restart = self.job.is_none() && !submitting;
+            self.confirm_restart &= has_drafts;
             ui.horizontal_wrapped(|ui| {
                 if self.confirm_restart {
                     ui.label("Restarting will clear unsent drafts.");
@@ -169,24 +205,38 @@ impl UpdatePanel {
                 }
             });
         }
+        #[cfg(target_os = "android")]
+        if let Some(version) = &staged {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(format!("Version {version} downloaded"));
+                if ui
+                    .add_enabled(self.job.is_none(), egui::Button::new("Open APK"))
+                    .clicked()
+                {
+                    self.run(UpdateWork::OpenApk);
+                }
+            });
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(self.job.is_none(), egui::Button::new("Check for updates")).clicked() {
-                self.run(None);
+                self.run(UpdateWork::Check);
             }
             if crate::updates::releases_configured() {
-                ui.hyperlink_to("GitHub Releases", crate::updates::RELEASES);
+                ui.hyperlink_to("GitHub Releases", crate::updates::releases_url());
             }
         });
-        if let Some(update) = self.update.clone()
-            && staged.as_deref() != Some(update.version.to_string().as_str())
-        {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(format!("Version {} available", update.version));
-                if ui.add_enabled(self.job.is_none(), egui::Button::new("Download update")).clicked() {
-                    self.run(Some(update.clone()));
-                }
-                ui.hyperlink_to("Release notes", update.notes_url);
-            });
+        if let Some(update) = self.update.clone() {
+            let downloaded = staged.as_deref() == Some(update.version.to_string().as_str());
+            if cfg!(target_os = "android") || !downloaded {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Version {} available", update.version));
+                    let label = if downloaded { "Download again" } else { "Download update" };
+                    if ui.add_enabled(self.job.is_none(), egui::Button::new(label)).clicked() {
+                        self.run(UpdateWork::Download(update.clone()));
+                    }
+                    ui.hyperlink_to("Release notes", update.notes_url);
+                });
+            }
         }
         if self.job.is_some() {
             ui.spinner();
@@ -822,7 +872,9 @@ impl Desktop {
                     ui.label(format!("Could not save the workspace for restart. {error}"));
                 }
             }
-            #[cfg(not(any(windows, target_os = "linux")))]
+            #[cfg(target_os = "android")]
+            { self.updates.show(ui, false, false); }
+            #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
             ui.label(
                 Text::new(format!("Spindle   ·   {}", crate::version()))
                     .color(muted())

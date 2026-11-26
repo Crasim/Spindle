@@ -39,6 +39,8 @@ Click the model control beside the message box or press **Ctrl+K**. Search by mo
 
 **Settings → Preferences** controls the accent color (Red, Orange, Yellow, Green, Blue, Indigo, Violet or Magenta), conversation text size, the send shortcut, context compaction and the council roster. The native Windows caption follows the charcoal application theme.
 
+On Android, go to **Settings → Preferences → Updates** and select **Check for updates**. If a newer release is available, choose **Download update**, then **Open APK** to continue in Android’s installer. Android may ask you to allow installs from Spindle the first time.
+
 The sidebar, welcome screen and window icons follow the workspace accent. The Windows executable uses the default blue ribbon. [View all eight icons](../assets/accents/palette.png)
 
 ### Choosing which models appear

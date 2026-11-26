@@ -229,6 +229,47 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
         return org.spindleapp.spindle.builder.ApkBuilder.build(this, request);
     }
 
+    public String openUpdateApk(String version) {
+        try {
+            java.io.File apk = UpdateApkProvider.file(this, version);
+            android.content.pm.PackageManager packages = getPackageManager();
+            android.content.pm.PackageInfo update = packages.getPackageArchiveInfo(apk.getPath(), 0);
+            if (update == null || !getPackageName().equals(update.packageName)) {
+                return "This download is not a Spindle APK.";
+            }
+            android.content.pm.PackageInfo installed = packages.getPackageInfo(getPackageName(), 0);
+            if (apkVersion(update) <= apkVersion(installed)) {
+                return "This APK build is already installed or older than your current build.";
+            }
+        } catch (IOException | android.content.pm.PackageManager.NameNotFoundException error) {
+            return "Android could not inspect the downloaded APK.";
+        }
+        java.util.concurrent.FutureTask<String> open = new java.util.concurrent.FutureTask<>(() -> {
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW)
+                    .setDataAndType(UpdateApkProvider.uri(this, version), UpdateApkProvider.MIME)
+                    .addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            try {
+                startActivity(intent);
+                return "";
+            } catch (android.content.ActivityNotFoundException error) {
+                return "Android’s package installer is unavailable.";
+            } catch (SecurityException error) {
+                return "Android blocked the installer. Allow installs from Spindle in Android Settings and try again.";
+            }
+        });
+        runOnUiThread(open);
+        try {
+            return open.get(5, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (Exception error) {
+            open.cancel(false);
+            return "Android could not open the package installer.";
+        }
+    }
+
+    private static long apkVersion(android.content.pm.PackageInfo info) {
+        return android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
+    }
+
     public String downloadApk(String name, byte[] bytes) throws Exception {
         if (!name.matches("[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}[.](apk|exe|elf)")) {
             throw new IllegalArgumentException("Invalid executable download name");

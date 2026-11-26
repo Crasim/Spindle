@@ -9,7 +9,7 @@ mod browser_link;
 #[cfg(any(windows, target_os = "linux"))]
 mod browser_channel;
 mod browser_native;
-#[cfg(any(windows, target_os = "linux"))]
+#[cfg(any(windows, target_os = "linux", target_os = "android"))]
 mod updates;
 mod local_servers;
 #[cfg(any(windows, target_os = "linux", test))]
@@ -268,6 +268,19 @@ mod android {
             let result = jni::objects::JString::from(result);
             Ok(env.get_string(&result)?.into())
         }).context("Android could not save the APK to Downloads")
+    }
+
+    pub fn open_update_apk(version: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let error: String = java(|env, activity| {
+            let version = env.new_string(version)?;
+            let result = env.call_method(activity, "openUpdateApk",
+                "(Ljava/lang/String;)Ljava/lang/String;", &[(&version).into()])?.l()?;
+            let result = jni::objects::JString::from(result);
+            Ok(env.get_string(&result)?.into())
+        }).context("Android could not open the APK")?;
+        anyhow::ensure!(error.is_empty(), "{error}");
+        Ok(())
     }
 
     pub fn protect_provider_credential(input: &[u8], encrypt: bool) -> anyhow::Result<Vec<u8>> {
