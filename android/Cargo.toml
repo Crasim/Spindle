@@ -1,0 +1,61 @@
+# The Android app: the same source as the desktop (../src), built as a library that
+# Android's NativeActivity loads. Build with android/build-apk.sh.
+[package]
+name = "spindle-android"
+version = "0.3.0-beta.10"
+edition = "2024"
+rust-version = "1.89"
+
+[lib]
+name = "spindle"
+path = "../src/main.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+ring = "0.17"
+jsonwebtoken = {version="9",default-features=false}
+webbrowser = "1"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "android-native-activity"] }
+reqwest = { version = "0.12", default-features = false, features = ["json","rustls-tls","multipart"] }
+image = {version="0.25",default-features=false,features=["png","jpeg"]}
+calamine = "0.31"
+csv = "1.3"
+zip = {version="4.6",default-features=false,features=["deflate"]}
+roxmltree = "0.20"
+html2text = "0.15"
+pulldown-cmark = {version="0.13",default-features=false}
+chrono = { version="0.4", features=["clock"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "fs"] }
+cpal = "0.15"
+rodio = { version = "0.20", default-features = false, features = ["wav", "symphonia-mp3"] }
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+socket2 = { version = "0.6", features = ["all"] }
+if-addrs = "0.13"
+spake2 = "0.4"
+qrcode = { version = "0.14", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
+libc = "0.2"
+jni = "0.21"
+# Scanning the pairing QR code with the camera (src/scan.rs).
+ndk-sys = { version = "0.6", features = ["media", "nativewindow"] }
+rqrr = "0.11"
+# The audio library (cpal → oboe) is C++: link the C++ runtime the APK ships (libc++_shared.so).
+oboe = { version = "0.6", features = ["shared-stdcxx"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+
+# egui_glow with full-precision shaders: phone GPUs run `mediump` at half precision, too
+# coarse to address the font atlas, so letters pick up slivers of their neighbours.
+[patch.crates-io]
+egui_glow = { path = "vendor/egui_glow" }

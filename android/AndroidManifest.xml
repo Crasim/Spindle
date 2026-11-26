@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.spindleapp.spindle"
+    android:versionCode="3"
+    android:versionName="0.3.0-beta.10">
+
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
+
+    <!-- Model servers, sync servers and your other devices -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <!-- Hearing your other devices' announcements on Wi-Fi -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <!-- Speaking to Spindle (asked for the first time you use the microphone) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Scanning the pairing QR code (asked the first time you scan) -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- The projects folder in Documents: Android 9 and older need this; newer ones let an
+         app make its own folders there. -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:glEsVersion="0x00030000" android:required="true" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
+        android:hasCode="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.Material.NoActionBar"
+        android:extractNativeLibs="true"
+        android:requestLegacyExternalStorage="true">
+        <service android:name=".builder.ApkBuildService" android:exported="false"
+            android:isolatedProcess="true" />
+        <activity
+            android:name=".SpindleActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:windowSoftInputMode="adjustResize"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|uiMode|density|smallestScreenSize|navigation">
+            <meta-data android:name="android.app.lib_name" android:value="spindle" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Scanning the pairing QR code with the camera opens Spindle and joins. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="spindle" android:host="pair" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

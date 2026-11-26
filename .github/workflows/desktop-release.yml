@@ -1,0 +1,72 @@
+name: Build desktop releases
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: windows-2022
+            binary: spindle.exe
+            asset: spindle-windows-x86_64.exe
+          - runner: ubuntu-22.04
+            binary: spindle
+            asset: spindle-linux-x86_64
+          - runner: ubuntu-22.04-arm
+            binary: spindle
+            asset: spindle-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libgl1-mesa-dev libx11-dev libxkbcommon-dev
+      - name: Verify the tag and build
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          BINARY: ${{ matrix.binary }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          test "$RELEASE_TAG" = "v$version"
+          rustup toolchain install stable --profile minimal
+          cargo +stable build --release --locked
+          mkdir -p dist
+          cp "target/release/$BINARY" "dist/$ASSET"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish the desktop assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          args=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --repo "$REPOSITORY" --verify-tag --generate-notes "${args[@]}" dist/*

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Spindle Browser Link</title>
+  <link rel="stylesheet" href="popup.css">
+  <script src="popup.js" defer></script>
+</head>
+<body>
+  <h1>Spindle Browser Link</h1>
+  <p>Ask Spindle about a website or your active tab. Your chat will ask for access.</p>
+  <button id="disconnect" hidden>Disconnect</button>
+  <button id="request" hidden>Request access to this domain</button>
+  <button id="block" hidden>Block this domain</button>
+  <p id="status" role="status"></p>
+  <section id="access" hidden>
+    <label for="mode">Website access</label>
+    <select id="mode">
+      <option value="allow_all">Allow all</option>
+      <option value="allowlist">Allowlist</option>
+      <option value="blocklist">Blocklist</option>
+      <option value="block_all">Block all</option>
+    </select>
+    <button id="save-mode" type="button">Save</button>
+  </section>
+  <section id="allowlist" hidden>
+    <h2 id="rule-heading">Allowed URLs</h2>
+    <ul id="rules"></ul>
+  </section>
+</body>
+</html>

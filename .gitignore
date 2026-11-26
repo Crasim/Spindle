@@ -1,0 +1,17 @@
+/target/
+traces/
+evals/
+/.codex-attachments/
+/artifacts/
+/HANDOFF.md
+__pycache__/
+*.pyc
+*.apk
+*.idsig
+*.keystore
+*.jks
+*.p12
+*.pfx
+.env
+.env.*
+/android/vendor.tgz

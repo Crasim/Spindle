@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'; base-uri 'none'; form-action 'none'">
+<title>Spindle · Project threads</title>
+<style>
+:root{color-scheme:dark;font:16px/1.5 system-ui,sans-serif;background:#191b1a;color:#eee8df}*{box-sizing:border-box}body{max-width:740px;margin:auto;padding:24px 18px 64px}header{border-bottom:1px solid #444843;margin-bottom:24px}h1{font:normal 2.3rem Georgia,serif;margin:8px 0 16px}h2{font-size:1.15rem}button,input,select,textarea{font:inherit;border:1px solid #555951;background:#282b28;color:inherit;border-radius:8px;padding:9px 12px;max-width:100%}label,select,textarea{display:block;margin:12px 0}textarea,select{width:100%}button{cursor:pointer;margin:4px 4px 4px 0}button.primary{background:#e2ad85;color:#231d17;border:0;font-weight:650}small,#status{color:#d9b69a}article{border-bottom:1px solid #3b403a;padding:10px 0}article p,#pending{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer}input[type=file]{width:100%}label input{display:block}#status{min-height:1.5em}
+</style></head><body>
+<header><small>Spindle</small><h1>Project threads</h1></header>
+<section id="login"><p>Open the project’s <strong>.spindle</strong> folder. On a phone with a file picker, select <strong>sync-v1.json</strong> and the thread files together.</p>
+<button id="folder" hidden>Choose folder</button>
+<label>Project files<input type="file" id="files" multiple></label>
+<label>Project passphrase<input type="password" id="password" autocomplete="off"></label>
+<button id="unlock" class="primary">Unlock threads</button></section>
+<p id="status" role="status"></p>
+<main id="main" hidden><label>Thread<select id="threads"></select></label><button id="refresh">Refresh files</button><button id="lock">Lock</button>
+<div id="messages"></div><p id="pending"></p>
+<label>Draft for desktop<textarea id="draft" rows="3" maxlength="8000"></textarea></label>
+<button id="save" class="primary">Save encrypted draft</button></main>
+<script>
+"use strict";
+const el=id=>document.getElementById(id);
+const enc=new TextEncoder(),dec=new TextDecoder();
+const check="Spindle project sync v1";
+let directory=null,aes=null,signing=null,records=new Map(),selected="";
+const status=text=>{el("status").textContent=text;};
+const hex=bytes=>Array.from(new Uint8Array(bytes),b=>b.toString(16).padStart(2,"0")).join("");
+const safely=fn=>async()=>{try{await fn();}catch(e){status(e.name==="OperationError"?"Incorrect passphrase or damaged project file.":e.message);}};
+async function files(){
+ if(!directory)return Array.from(el("files").files);
+ const result=[];
+ for await(const entry of directory.values()){
+   if(entry.kind==="file"&&(entry.name==="sync-v1.json"||/^thread-[0-9a-f]{64}\.spindle$/.test(entry.name)))result.push(await entry.getFile());
+ }
+ return result;
+}
+async function decrypt(bytes,context){
+ const options={name:"AES-GCM",iv:bytes.slice(0,12),additionalData:enc.encode(context)};
+ return new Uint8Array(await crypto.subtle.decrypt(options,aes,bytes.slice(12)));
+}
+async function unlock(){
+ if(!window.crypto?.subtle)throw Error("Open this companion from a secure HTTPS origin or a browser that supports local-file Web Crypto.");
+ const list=await files(),header=list.find(f=>f.name==="sync-v1.json");
+ if(!header||header.size>4096)throw Error("Select the project header and encrypted thread files.");
+ const config=JSON.parse(await header.text());
+ if(config.version!==1||config.salt?.length!==16)throw Error("Unsupported project header.");
+ const pass=await crypto.subtle.importKey("raw",enc.encode(el("password").value),"PBKDF2",false,["deriveBits"]);
+ const raw=await crypto.subtle.deriveBits({name:"PBKDF2",salt:new Uint8Array(config.salt),iterations:600000,hash:"SHA-256"},pass,256);
+ aes=await crypto.subtle.importKey("raw",raw,"AES-GCM",false,["encrypt","decrypt"]);
+ const master=await crypto.subtle.importKey("raw",raw,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+ const domain=await crypto.subtle.sign("HMAC",master,enc.encode("Spindle revision identifiers v1"));
+ signing=await crypto.subtle.importKey("raw",domain,{name:"HMAC",hash:"SHA-256"},false,["sign"]);
+ new Uint8Array(raw).fill(0);
+ if(dec.decode(await decrypt(new Uint8Array(config.check),check))!==check)throw Error("Incorrect passphrase.");
+ await load(list);
+ el("password").value="";el("login").hidden=true;el("main").hidden=false;
+}
+async function load(list){
+ const next=new Map(),parents=new Set();
+ for(const file of list){
+   const id=/^thread-([0-9a-f]{64})\.spindle$/.exec(file.name)?.[1];
+   if(!id)continue;
+   if(file.size>16*1024*1024)throw Error("Thread revision exceeds 16 MiB.");
+   const bytes=await decrypt(new Uint8Array(await file.arrayBuffer()),id);
+   if(hex(await crypto.subtle.sign("HMAC",signing,bytes))!==id)throw Error("Invalid revision.");
+   const r=JSON.parse(dec.decode(bytes));next.set(id,r);parents.add(r.parent);
+ }
+ records=next;
+ const picker=el("threads");picker.replaceChildren(new Option("New thread",""));
+ for(const [id,r] of records)if(!parents.has(id)&&!r.deleted)picker.add(new Option(r.conversation.thread.title||r.conversation.history[0]?.content.slice(0,65)||"Draft",id));
+ if(!selected||![...picker.options].some(x=>x.value===selected))selected=picker.options[1]?.value||"";
+ picker.value=selected;display();status("Project unlocked.");
+}
+function display(){
+ selected=el("threads").value;
+ const r=records.get(selected),messages=el("messages");messages.replaceChildren();
+ for(const m of r?.conversation.history||[]){
+   const row=document.createElement("article"),author=document.createElement("strong"),body=document.createElement("p");
+   author.textContent=m.role==="user"?"You":"Assistant";body.textContent=m.content;row.append(author,body);messages.append(row);
+ }
+ el("pending").textContent=r?.pending||"";
+}
+async function save(){
+ const text=el("draft").value.trim();if(!text)throw Error("Enter a draft first.");
+ const base=records.get(selected);
+ const conversation=base?.conversation||{thread:{title:text.slice(0,65),model:"",turns:{}},history:[],goal:"",plan:null};
+ const record={parent:selected||null,conversation,pending:"Draft · "+text,provider_base:base?.provider_base||null};
+ if(!selected)record.origin=crypto.randomUUID();
+ const bytes=enc.encode(JSON.stringify(record)),id=hex(await crypto.subtle.sign("HMAC",signing,bytes));
+ const iv=crypto.getRandomValues(new Uint8Array(12));
+ const body=new Uint8Array(await crypto.subtle.encrypt({name:"AES-GCM",iv,additionalData:enc.encode(id)},aes,bytes));
+ const blob=new Blob([iv,body]),filename="thread-"+id+".spindle";
+ if(directory){
+   const file=await directory.getFileHandle(filename,{create:true});const out=await file.createWritable();await out.write(blob);await out.close();
+ }else{
+   const link=document.createElement("a");link.href=URL.createObjectURL(blob);link.download=filename;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),60000);
+ }
+ records.set(id,record);const picker=el("threads");picker.add(new Option(conversation.thread.title||"Draft",id));picker.value=id;display();el("draft").value="";
+ status(directory?"Encrypted draft saved to the project.":"Save the downloaded revision to the project's .spindle folder to sync it.");
+}
+el("folder").hidden=!window.showDirectoryPicker;
+el("folder").onclick=safely(async()=>{directory=await showDirectoryPicker({mode:"readwrite"});status("Selected "+directory.name);});
+el("files").onchange=()=>{directory=null;};
+el("unlock").onclick=safely(unlock);el("threads").onchange=display;el("save").onclick=safely(save);
+el("refresh").onclick=safely(async()=>{
+ if(directory){await load(await files());return;}
+ el("files").onchange=safely(async()=>{await load(await files());});el("files").click();
+});
+el("lock").onclick=()=>location.reload();
+</script></body></html>
+

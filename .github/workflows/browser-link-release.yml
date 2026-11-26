@@ -1,0 +1,32 @@
+name: Publish Browser Link
+
+on:
+  push:
+    tags:
+      - "browser-link-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Package and publish the extension
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          version=$(jq -er .version browser-extension/manifest.json)
+          test "$RELEASE_TAG" = "browser-link-v$version"
+          mkdir -p dist
+          git archive --format=zip --output=dist/spindle-browser-link.zip HEAD:browser-extension
+          gh release create "$RELEASE_TAG" --repo "$REPOSITORY" --verify-tag --latest=false \
+            --title "Spindle Browser Link $version" \
+            --notes "Spindle downloads this package when you set up Browser Link for your regular Edge or Chrome profile. See the included README for the browser's one-time setup." \
+            dist/spindle-browser-link.zip

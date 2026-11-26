@@ -1,0 +1,12 @@
+:root { color-scheme: light dark; font: 14px/1.45 system-ui, sans-serif; }
+body { width: 280px; padding: 12px; margin: 0; }
+h1 { font-size: 17px; margin: 0; }
+form { display: grid; gap: 8px; }
+form[hidden], button[hidden] { display: none; }
+input, button { font: inherit; padding: 7px 9px; border: 1px solid GrayText; border-radius: 6px; }
+button { cursor: pointer; }
+p { margin: 9px 0; }
+#status { overflow-wrap: anywhere; }
+h2 { font-size: 14px; }
+ul { list-style: none; margin: 0; padding: 0; }
+li { display: flex; align-items: center; justify-content: space-between; gap: 6px; overflow-wrap: anywhere; margin-top: 6px; }
