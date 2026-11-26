@@ -4,11 +4,13 @@ Requires the websocket-client package and a release test build of Spindle.
 Uses local Ollama by default. For Maya, set SPINDLE_BROWSER_MODEL_ENDPOINT
 to its API base URL and pass @maya/inkling-2-mini for MODEL.
 Set SPINDLE_BROWSER_FIXTURE_COWORK to test Cowork instead of Chat.
+Set SPINDLE_BROWSER_FIXTURE_GUIDED=launch to test opening a grouped tab from scratch.
 """
 import contextlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+import re
 import secrets
 import shutil
 from pathlib import Path
@@ -160,7 +162,7 @@ def connected_profile(exe, profile, extension_folder, env):
 def run_browser(exe, binary, folder, extension_folder, env, url, model):
     with contextlib.ExitStack() as profiles:
         cdp, extension = profiles.enter_context(connected_profile(exe, folder / "profile", extension_folder, env))
-        guided = model and os.environ.get("SPINDLE_BROWSER_FIXTURE_GUIDED")
+        guided = os.environ.get("SPINDLE_BROWSER_FIXTURE_GUIDED")
         existing = None
         owner = cdp
         if guided == "profiles":
@@ -183,11 +185,15 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
         if model:
             test = "chat_model_reads_browser_and_returns_product_links"
             env.update(SPINDLE_BROWSER_MODEL=model, SPINDLE_BROWSER_FIXTURE_PROOF=PROOF)
-        tester = subprocess.Popen([binary, "--ignored", f"browser_link::tests::{test}", "--nocapture"], env=env)
+        test_log = folder / "spindle-test.log"
+        with test_log.open("wb") as log:
+            tester = subprocess.Popen([binary, "--ignored", f"browser_link::tests::{test}", "--nocapture"],
+                                      env=env, stdout=log, stderr=subprocess.STDOUT)
         try:
             deadline = time.monotonic() + (155 if model else 65)
             requested = False
             escaped = False
+            checked_cursor = False
             text = "Waiting for the native browser connection"
             while tester.poll() is None and time.monotonic() < deadline:
                 if popup:
@@ -196,8 +202,41 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                     if text.startswith(("Could not connect", "Open an HTTP", "Cannot access")):
                         raise RuntimeError(text)
                     if text.startswith("Blocked") and not requested:
+                        if guided == "launch":
+                            grouped = cdp.call("Runtime.evaluate", {
+                                "expression": "Promise.all([chrome.tabs.query({url:" + json.dumps(url) +
+                                              "}),chrome.tabGroups.query({title:'Spindle'})]).then(([tabs,groups]) => "
+                                              "tabs.length===1 && groups.some(group => group.id===tabs[0].groupId))",
+                                "awaitPromise": True,
+                            }, popup)
+                            assert grouped["result"]["value"], "The newly opened tab was not grouped before the first read"
+                            page_target = next(p["targetId"] for p in cdp.call("Target.getTargets")["targetInfos"] if p["url"] == url)
+                            page = cdp.call("Target.attachToTarget", {"targetId": page_target, "flatten": True})["sessionId"]
                         cdp.call("Runtime.evaluate", {"expression": "document.querySelector('#request').click()"}, popup)
                         requested = True
+                    if not checked_cursor and (folder / "ready-for-cursor").exists():
+                        wait_for(lambda: cdp.call("Runtime.evaluate", {
+                            "expression": "Boolean(document.querySelector('spindle-browser-activity:not([data-working])'))",
+                        }, page)["result"].get("value"), seconds=4)
+                        tree = cdp.call("DOM.getDocument", {"depth": -1, "pierce": True}, page)["root"]
+                        def activity_node(node):
+                            if node.get("nodeName") == "SPINDLE-BROWSER-ACTIVITY":
+                                return node
+                            return next((found for child in node.get("children", []) if (found := activity_node(child))), None)
+                        overlay = activity_node(tree)
+                        cursor = next(child for child in overlay["shadowRoots"][0]["children"] if child["nodeName"] == "SPAN")
+                        attributes = cursor["attributes"]
+                        assert "hidden" not in attributes, "Cursor disappeared before the tab was released"
+                        expected = cdp.call("Runtime.evaluate", {
+                            "expression": "(() => {const r = document.querySelector('#apply').getBoundingClientRect(); "
+                                          "return [r.left+r.width/2,r.top+r.height/2];})()",
+                            "returnByValue": True,
+                        }, page)["result"]["value"]
+                        transform = attributes[attributes.index("style") + 1]
+                        coords = re.search(r"translate\(([\d.]+)px, ([\d.]+)px\)", transform)
+                        assert coords and all(abs(float(got) - want) < 0.2 for got, want in zip(coords.groups(), expected)), (expected, transform)
+                        (folder / "cursor-verified").touch()
+                        checked_cursor = True
                     if not escaped and (folder / "ready-for-escape").exists():
                         active = cdp.call("Runtime.evaluate", {
                             "expression": "Boolean(document.querySelector('spindle-browser-activity[data-working]'))",
@@ -213,9 +252,16 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                         escaped = True
                 time.sleep(.25)
             if tester.poll() != 0:
-                raise RuntimeError("Browser Link status: " + text)
+                raise RuntimeError(f"Browser Link status: {text}\n{test_log.read_text(encoding='utf-8', errors='replace')}")
             if model:
+                pages = owner.call("Target.getTargets")["targetInfos"]
+                cart = next(p["targetId"] for p in pages if p["type"] == "page" and p["url"] == url)
+                cart_page = owner.call("Target.attachToTarget", {"targetId": cart, "flatten": True})["sessionId"]
+                wait_for(lambda: owner.call("Runtime.evaluate", {
+                    "expression": "!document.querySelector('spindle-browser-activity')",
+                }, cart_page)["result"].get("value"), seconds=5)
                 print("Verified an approved Spindle model read of the current cart and its product links.", flush=True)
+                print("Verified Browser Link released access and cleared its overlay after the reply.", flush=True)
                 if guided:
                     if owner is not cdp:
                         assert all(p["url"] != url for p in cdp.call("Target.getTargets")["targetInfos"])
@@ -233,7 +279,7 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                     "awaitPromise": True,
                 }, popup)
                 assert revoked["result"]["value"], revoked
-                print("Verified access, cart contents, edit, Spindle tab group, activity indicator and Escape revocation in", Path(exe).name, flush=True)
+                print("Verified access, cart contents, edit, Spindle tab group, persistent cursor placement and Escape revocation in", Path(exe).name, flush=True)
         finally:
             if tester.poll() is None:
                 tester.terminate()

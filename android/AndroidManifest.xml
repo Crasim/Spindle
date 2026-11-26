@@ -16,6 +16,8 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Scanning the pairing QR code (asked the first time you scan) -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Regional web results, requested only when the user chooses device location. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <!-- The projects folder in Documents: Android 9 and older need this; newer ones let an
          app make its own folders there. -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />

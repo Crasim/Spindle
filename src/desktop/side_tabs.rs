@@ -48,6 +48,9 @@ pub(super) struct ChatFile {
 pub(super) enum Pick {
     PlanSteps(Vec<crate::plan::Step>),
     RevisePlan { change: String, replace_goal: bool },
+    DisconnectBrowser(u64),
+    #[cfg(windows)]
+    ShareBrowserPage { id: u64, snapshot: String },
     /// Open a chat file: from disk if it's there, or else its snapshot.
     ChatFile {
         name: String,
@@ -262,10 +265,26 @@ impl Library {
     }
 }
 
-/// A web browser beside the chat. On Windows it's a WebView2 page; elsewhere Spindle opens
-/// pages in the system browser.
-#[derive(Default)]
 pub(super) struct BrowserPane {
+    tabs: Vec<BrowserTab>,
+    selected: usize,
+}
+
+impl Default for BrowserPane {
+    fn default() -> Self {
+        Self { tabs: vec![BrowserTab::default()], selected: 0 }
+    }
+}
+
+#[derive(PartialEq)]
+enum BrowserSource {
+    Public { chat: u64, address: String },
+    Linked { chat: u64 },
+}
+
+#[derive(Default)]
+struct BrowserTab {
+    source: Option<BrowserSource>,
     address: String,
     error: String,
     model_page: Option<(String, String)>,
@@ -278,6 +297,17 @@ pub(super) struct BrowserPane {
     bounds: Option<wry::Rect>,
     #[cfg(windows)]
     current: std::sync::Arc<std::sync::Mutex<String>>,
+    #[cfg(windows)]
+    pending_read: Option<PendingRead>,
+}
+
+#[cfg(windows)]
+struct PendingRead {
+    id: u64,
+    address: String,
+    started: std::time::Instant,
+    result: Option<std::sync::mpsc::Receiver<String>>,
+    loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Turn what the user typed into a URL: add https:// to a bare host, and search for anything
@@ -315,12 +345,137 @@ pub(super) fn to_url(typed: &str) -> String {
 }
 
 impl BrowserPane {
-    pub fn present(&mut self, page: crate::execution::BrowserPanel) {
+    /// Opening and linking may select a tab. Finishing a background load only updates it.
+    pub fn present(&mut self, page: crate::execution::BrowserPanel, foreground: bool) -> bool {
+        use crate::execution::BrowserActivity;
+        let starting = matches!(page.activity, BrowserActivity::Opening | BrowserActivity::Linked);
+        let source = if matches!(page.activity, BrowserActivity::Linked) {
+            BrowserSource::Linked { chat: page.chat }
+        } else {
+            BrowserSource::Public { chat: page.chat, address: page.address.clone() }
+        };
+        let index = match self.tabs.iter().position(|tab| tab.source.as_ref() == Some(&source)) {
+            Some(index) => index,
+            None if starting => {
+                if let Some(index) = self.tabs.iter().position(|tab| tab.source.is_none() && tab.address.is_empty()) {
+                    self.tabs[index].source = Some(source);
+                    index
+                } else {
+                    self.tabs.push(BrowserTab { source: Some(source), ..Default::default() });
+                    self.tabs.len() - 1
+                }
+            }
+            None => return false,
+        };
+        self.tabs[index].present(page);
+        if foreground && starting {
+            self.select(index);
+        }
+        foreground && starting
+    }
+
+    pub fn disconnected(&mut self, chat: u64) {
+        for tab in &mut self.tabs {
+            if tab.source == Some(BrowserSource::Linked { chat }) {
+                tab.activity = Some(crate::execution::BrowserActivity::Unavailable("Browser Link disconnected.".into()));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn reveal_public(&mut self, chat: u64, address: String) {
+        use crate::execution::{BrowserActivity, BrowserPanel};
+        let source = BrowserSource::Public { chat, address: address.clone() };
+        if let Some(index) = self.tabs.iter().position(|tab| tab.source.as_ref() == Some(&source)) {
+            self.select(index);
+        } else {
+            self.present(BrowserPanel { chat, address: address.clone(), activity: BrowserActivity::Opening }, true);
+            self.present(BrowserPanel { chat, address,
+                activity: BrowserActivity::Unavailable("The isolated browser could not read this page.".into()) }, true);
+        }
+    }
+
+    pub fn hide(&mut self) {
+        self.tabs[self.selected].hide();
+    }
+
+    fn select(&mut self, index: usize) {
+        if index != self.selected {
+            self.hide();
+            self.selected = index;
+        }
+    }
+
+    fn close(&mut self, index: usize) {
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.tabs.push(BrowserTab::default());
+        }
+        self.selected = (self.selected - usize::from(index < self.selected)).min(self.tabs.len() - 1);
+    }
+
+    pub fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame,
+        chat: u64, fallbacks: &[(u64, String)], ready: bool) -> Option<Pick> {
+        let mut select = None;
+        let mut close = None;
+        let new_tab = ui.horizontal(|ui| {
+            let new_tab = ui.small_button("+").on_hover_text("New browser tab").clicked();
+            egui::ScrollArea::horizontal().id_salt("browser-tabs").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, tab) in self.tabs.iter().enumerate() {
+                        let shown = tab.label();
+                        let label: String = shown.chars().take(32).collect();
+                        let label = if label.len() < shown.len() { format!("{label}…") } else { label };
+                        if ui.selectable_label(index == self.selected, label).on_hover_text(&tab.address).clicked() {
+                            select = Some(index);
+                        }
+                        if ui.small_button("×").on_hover_text("Close browser tab").clicked() {
+                            close = Some(index);
+                        }
+                    }
+                });
+            });
+            new_tab
+        }).inner;
+        if let Some(index) = close {
+            self.close(index);
+        } else if new_tab {
+            self.tabs.push(BrowserTab::default());
+            self.select(self.tabs.len() - 1);
+        } else if let Some(index) = select {
+            self.select(index);
+        }
+        ui.add_space(4.);
+        let tab = &mut self.tabs[self.selected];
+        let retry = if let Some(BrowserSource::Public { chat: owner, address }) = &tab.source
+            && *owner == chat {
+            fallbacks.iter().find(|(_, url)| url == address)
+        } else { None };
+        ui.push_id(self.selected, |ui| tab.show(ui, frame, retry, ready)).inner
+    }
+}
+
+impl BrowserTab {
+    fn label(&self) -> String {
+        if matches!(self.source, Some(BrowserSource::Linked { .. })) {
+            return "Browser Link".into();
+        }
+        if let Ok(url) = reqwest::Url::parse(&self.address)
+            && let Some(host) = url.host_str()
+        {
+            return format!("{host}{}", url.path().trim_end_matches('/'));
+        }
+        if self.address.is_empty() { "New tab".into() } else { self.address.clone() }
+    }
+
+    fn present(&mut self, page: crate::execution::BrowserPanel) {
         use crate::execution::BrowserActivity;
         self.address = page.address;
         self.error.clear();
         self.model_page = None;
         self.activity = None;
+        #[cfg(windows)]
+        { self.pending_read = None; }
         match page.activity {
             BrowserActivity::Loaded(text) => self.model_page = Some((self.address.clone(), text)),
             activity => {
@@ -330,13 +485,7 @@ impl BrowserPane {
         }
     }
 
-    pub fn disconnected(&mut self) {
-        if matches!(self.activity, Some(crate::execution::BrowserActivity::Linked)) {
-            self.activity = Some(crate::execution::BrowserActivity::Unavailable("Browser Link disconnected.".into()));
-        }
-    }
-
-    pub fn hide(&mut self) {
+    fn hide(&mut self) {
         #[cfg(windows)]
         if self.visible
             && let Some(web) = &self.web
@@ -345,10 +494,17 @@ impl BrowserPane {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+    fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame,
+        retry: Option<&(u64, String)>, ready: bool) -> Option<Pick> {
+        #[cfg(not(windows))]
+        let _ = (retry, ready);
         #[cfg(windows)]
-        let automatic = self.model_page.take();
+        if let Some(pick) = self.poll_shared_page(ui, retry.map(|(id, _)| *id), ready) {
+            return Some(pick);
+        }
         let mut go = None;
+        #[cfg(windows)]
+        let mut share_here = false;
         let mut typing = false;
         ui.horizontal(|ui| {
             #[cfg(windows)]
@@ -376,6 +532,10 @@ impl BrowserPane {
         });
         if go.is_some() {
             self.activity = None;
+            self.source = None;
+            self.model_page = None;
+            #[cfg(windows)]
+            { self.pending_read = None; }
         } else if let Some(activity) = &self.activity {
             use crate::execution::BrowserActivity;
             ui.add_space(8.);
@@ -387,18 +547,44 @@ impl BrowserPane {
                     });
                 }
                 BrowserActivity::Unavailable(reason) => {
-                    ui.label(reason);
+                    #[cfg(windows)]
+                    if let Some((_, address)) = retry {
+                        ui.label("Open the page in this panel and share its visible text and links with this chat.");
+                        share_here = ui.add_enabled(ready, egui::Button::new("Open and share here")).clicked();
+                        if share_here { go = Some(address.clone()); }
+                    }
+                    if go.is_none() {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add(egui::Label::new(reason).wrap().selectable(true));
+                        });
+                    }
                 }
                 BrowserActivity::Linked => {
                     ui.strong("Browser Link");
                     ui.label("Spindle is using the tab in your regular browser. Press Esc in that tab to revoke access.");
+                    if ui.button("Disconnect").clicked()
+                        && let Some(BrowserSource::Linked { chat }) = self.source
+                    {
+                        return Some(Pick::DisconnectBrowser(chat));
+                    }
                 }
                 BrowserActivity::Loaded(_) => {}
             }
-            return;
+            if go.is_none() { return None; }
         }
         #[cfg(windows)]
-        let automatic = automatic.filter(|_| go.is_none());
+        if share_here && let Some((id, address)) = retry {
+            self.hide();
+            self.web = None;
+            self.visible = false;
+            self.current = Default::default();
+            self.activity = None;
+            self.pending_read = Some(PendingRead { id: *id, address: address.clone(),
+                started: std::time::Instant::now(), result: None, loaded: Default::default() });
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        }
+        #[cfg(windows)]
+        let automatic = self.model_page.take().filter(|_| go.is_none());
         #[cfg(windows)]
         let from_model = automatic.is_some();
         #[cfg(windows)]
@@ -418,6 +604,10 @@ impl BrowserPane {
         let _ = typing;
         if !self.error.is_empty() {
             ui.colored_label(accent(), &self.error);
+        }
+        #[cfg(windows)]
+        if self.pending_read.is_some() {
+            ui.horizontal(|ui| { ui.spinner(); ui.label("Opening and reading the page for this chat…"); });
         }
         #[cfg(windows)]
         {
@@ -455,14 +645,21 @@ impl BrowserPane {
             } else if let Some(url) = go {
                 let current = self.current.clone();
                 let ctx = ui.ctx().clone();
+                let loaded = self.pending_read.as_ref().map(|request| request.loaded.clone());
                 // A browser for the user, not the model: ordinary web pages, no access to
                 // Spindle or the workspace, and no downloads.
                 let web = wry::WebViewBuilder::new()
                     .with_url(&url)
+                    .with_incognito(share_here)
                     .with_focused(!from_model)
                     .with_devtools(true)
                     .with_bounds(bounds)
                     .with_download_started_handler(|_, _| false)
+                    .with_on_page_load_handler(move |event, _| {
+                        if let Some(loaded) = &loaded {
+                            loaded.store(matches!(event, wry::PageLoadEvent::Finished), std::sync::atomic::Ordering::Relaxed);
+                        }
+                    })
                     .with_navigation_handler(move |url| {
                         let ok = url.starts_with("http://")
                             || url.starts_with("https://")
@@ -510,12 +707,59 @@ impl BrowserPane {
                 ui.weak("The Windows build can display interactive pages here. Use Go to open a page in your browser.");
             }
         }
+        None
+    }
+
+    #[cfg(windows)]
+    fn poll_shared_page(&mut self, ui: &mut egui::Ui, retry: Option<u64>, ready: bool) -> Option<Pick> {
+        let mut pending = self.pending_read.take()?;
+        if retry != Some(pending.id) { return None; }
+        let result = if pending.started.elapsed().as_secs() >= 25 {
+            Some(Err(anyhow::anyhow!("The page did not finish loading in time.")))
+        } else if !ready {
+            None
+        } else if let Some(receiver) = &pending.result {
+            match receiver.try_recv() {
+                Ok(snapshot) if snapshot != "null" && snapshot.len() <= 300_000 => {
+                    Some(serde_json::from_str::<crate::browser::VisiblePage>(&snapshot)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|page| page.read(&pending.address))
+                        .map(|_| snapshot))
+                }
+                Ok(_) | Err(std::sync::mpsc::TryRecvError::Disconnected) => { pending.result = None; None }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            }
+        } else if pending.loaded.load(std::sync::atomic::Ordering::Relaxed) && let Some(web) = &self.web {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let ctx = ui.ctx().clone();
+            match web.evaluate_script_with_callback(crate::browser::VISIBLE_PAGE_SCRIPT, move |snapshot| {
+                let _ = sender.send(snapshot);
+                ctx.request_repaint();
+            }) {
+                Ok(()) => { pending.result = Some(receiver); None }
+                Err(error) => Some(Err(error.into())),
+            }
+        } else { None };
+        match result {
+            Some(Ok(snapshot)) => Some(Pick::ShareBrowserPage { id: pending.id, snapshot }),
+            Some(Err(error)) => {
+                self.hide();
+                self.activity = Some(crate::execution::BrowserActivity::Unavailable(format!("Could not share this page. {error}")));
+                None
+            }
+            None => {
+                self.pending_read = Some(pending);
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                None
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::to_url;
+    use super::{BrowserPane, to_url};
+    use crate::execution::{BrowserActivity, BrowserPanel};
 
     #[test]
     fn addresses_become_urls() {
@@ -530,5 +774,23 @@ mod tests {
             to_url("rust egui panels"),
             "https://duckduckgo.com/?q=rust+egui+panels"
         );
+    }
+
+    #[test]
+    fn browser_results_update_their_own_tab_without_changing_selection() {
+        let mut pane = BrowserPane::default();
+        let page = |address: &str, activity| BrowserPanel { chat: 7, address: address.into(), activity };
+        let first = "https://example.com/one";
+        let second = "https://example.com/two";
+        assert!(pane.present(page(first, BrowserActivity::Opening), true));
+        assert!(pane.present(page(second, BrowserActivity::Opening), true));
+        assert!(!pane.present(page(first, BrowserActivity::Loaded("First page".into())), true));
+        assert_eq!(pane.tabs.len(), 2);
+        assert_eq!(pane.selected, 1);
+        assert_eq!(pane.tabs[0].model_page, Some((first.into(), "First page".into())));
+        pane.close(1);
+        assert!(!pane.present(page(second, BrowserActivity::Loaded("Second page".into())), true));
+        assert_eq!(pane.tabs.len(), 1);
+        assert_eq!(pane.tabs[pane.selected].address, first);
     }
 }

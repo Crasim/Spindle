@@ -91,7 +91,9 @@ pub struct Jobs {
     pub browser_client: Option<crate::browser_native::BrowserClient>,
     pub browser_site_request: Option<String>,
     pub browser_panel: Option<BrowserPanel>,
-    pub browser_retry: Option<BrowserRetry>,
+    pub browser_retries: Vec<BrowserRetry>,
+    pub web_region_ui: bool,
+    pub web_region_fallback: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -715,9 +717,11 @@ impl Engine {
         match done {
             JobDone::Catalog{pending:p,result}=>{
                 if self.jobs.cancel.load(Ordering::Relaxed) {
-                    if let Call::WebOpen { url, start: 0, .. } = &p.call.call {
+                    if let Call::WebOpen { url, start: 0, .. } = &p.call.call
+                        && let Ok(address) = crate::browser::public_page(url)
+                    {
                         self.jobs.browser_panel = Some(BrowserPanel { chat: p.chat,
-                            address: url.clone(), activity: BrowserActivity::Unavailable("Browsing stopped".into()) });
+                            address: address.to_string(), activity: BrowserActivity::Unavailable("Browsing stopped".into()) });
                     }
                     crate::engine::record_outcome(&mut self.state,p.id,"Stopped by user",false);
                     crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),"Stopped by user");
@@ -725,23 +729,28 @@ impl Engine {
                 }
                 let ok = result.is_ok();
                 let restricted = result.as_ref().err()
-                    .is_some_and(|error| error.is::<crate::browser::PageAccess>());
+                    .and_then(|error| error.downcast_ref::<crate::browser::PageAccess>())
+                    .is_some_and(crate::browser::PageAccess::offers_regular_browser);
                 let mut text = result.unwrap_or_else(|e|format!("Tool failed: {e:#}"));
-                if let Call::WebOpen { url, start: 0, .. } = &p.call.call {
+                if let Call::WebOpen { url, start: 0, .. } = &p.call.call
+                    && let Ok(address) = crate::browser::public_page(url)
+                {
                     self.jobs.browser_panel = Some(BrowserPanel {
-                        chat: p.chat, address: url.clone(),
+                        chat: p.chat, address: address.to_string(),
                         activity: if ok { BrowserActivity::Loaded(text.clone()) }
                             else { BrowserActivity::Unavailable(text.clone()) },
                     });
-                    if restricted && let Some(index) = crate::engine::latest_user_turn(&self.state, p.chat)
-                        && self.jobs.browser_retry.as_ref().is_none_or(|old| (old.chat, old.message) != (p.chat, index))
-                    {
-                        self.jobs.browser_retry = Some(BrowserRetry { chat: p.chat, message: index,
-                            id: p.id, address: url.clone(), model: p.model.clone(), read_only: p.chat_read_only });
-                        text.push_str("\nSpindle offers Use regular browser in this chat. It will request permission for the tab and continue this task. Use that option if this site is needed; do not ask the user to paste page content.");
-                    } else if ok && self.jobs.browser_retry.as_ref()
-                        .is_some_and(|retry| retry.chat == p.chat && retry.address == *url) {
-                        self.jobs.browser_retry = None;
+                    let message = crate::engine::latest_user_turn(&self.state, p.chat);
+                    self.jobs.browser_retries.retain(|old| old.chat != p.chat
+                        || (Some(old.message) == message && old.address != address.as_str()));
+                    if restricted && let Some(index) = message {
+                        self.jobs.browser_retries.push(BrowserRetry { chat: p.chat, message: index,
+                            id: p.id, address: address.to_string(), model: p.model.clone(), read_only: p.chat_read_only });
+                        if cfg!(windows) {
+                            text.push_str("\nThe user can choose Open and share here in the built-in Browser tab to continue with its interactive page. If this site is needed, point to that action. Do not ask for pasted content.");
+                        } else {
+                            text.push_str("\nSpindle offers Use regular browser in this chat. It will request tab access and continue the task. Do not ask for pasted content.");
+                        }
                     }
                 }
                 crate::engine::record_outcome(&mut self.state,p.id,&text,ok);

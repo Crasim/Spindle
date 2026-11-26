@@ -960,12 +960,15 @@ mod tests {
     #[ignore = "requires a browser fixture with Browser Link installed"]
     async fn browser_fixture_round_trip() {
         let url = std::env::var("SPINDLE_BROWSER_FIXTURE_URL").expect("fixture URL");
-        let link = Link::start(0, Policy::default()).unwrap();
+        let mut link = Link::start(0, Policy::default()).unwrap();
+        if std::env::var_os("SPINDLE_BROWSER_FIXTURE_GUIDED").is_some() {
+            link.destination = Some(reqwest::Url::parse(&url).unwrap());
+        }
         tokio::time::timeout(Duration::from_secs(20), async {
             while link.can_pair() {
                 if let Some(client) = crate::browser_native::clients()
                     .into_iter()
-                    .find(|item| item.ready && item.has_tab)
+                    .find(|item| item.can_connect(link.destination.as_ref()))
                 {
                     crate::browser_native::offer(&client, &link).unwrap();
                 }
@@ -1053,6 +1056,13 @@ mod tests {
                 .unwrap()
                 .contains("Hello Spindle demo")
         );
+        let fixture = std::path::PathBuf::from(std::env::var_os("SPINDLE_BROWSER_FIXTURE_ROOT").unwrap());
+        std::fs::write(fixture.join("ready-for-cursor"), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !fixture.join("cursor-verified").is_file() {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }).await.expect("The cursor stays over the clicked control");
         link.rules(Policy {
             mode: Mode::BlockAll,
             rules: vec![],
@@ -1080,7 +1090,6 @@ mod tests {
             snapshot(link.perform(Action::READ).await.unwrap())["title"],
             "Spindle browser fixture"
         );
-        let fixture = std::path::PathBuf::from(std::env::var_os("SPINDLE_BROWSER_FIXTURE_ROOT").unwrap());
         std::fs::write(fixture.join("ready-for-escape"), b"").unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
             while !link.ended() {
@@ -1270,6 +1279,7 @@ mod tests {
                     "The model run failed: {}",
                     answer.content
                 );
+                ensure!(view.browser_pairing.is_none(), "Browser Link stayed connected after the final answer");
                 let read = view
                     .state
                     .actions

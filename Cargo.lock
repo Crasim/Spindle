@@ -2786,7 +2786,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "spindle"
-version = "0.3.0-beta.14"
+version = "0.3.0-beta.15"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2828,6 +2828,7 @@ dependencies = [
  "winresource",
  "wry",
  "x25519-dalek",
+ "zbus",
  "zip",
 ]
 

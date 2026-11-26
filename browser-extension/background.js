@@ -17,12 +17,12 @@ async function isRevoked(tabId) {
 }
 
 async function groupTab(tab) {
-  if (tab.pinned || tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) return;
+  if (tab.pinned || tab.groupId >= 0) return;
   const [group] = await chrome.tabGroups.query({windowId: tab.windowId, title: "Spindle"});
   if (group) {
     await chrome.tabs.group({tabIds: tab.id, groupId: group.id});
   } else {
-    const groupId = await chrome.tabs.group({tabIds: tab.id});
+    const groupId = await chrome.tabs.group({tabIds: tab.id, createProperties: {windowId: tab.windowId}});
     await chrome.tabGroups.update(groupId, {title: "Spindle", color: "green"});
   }
 }
@@ -54,7 +54,16 @@ async function requestedTab(address) {
     throw Error("This address cannot be opened by Browser Link.");
   }
   const existing = await findPage(page);
-  const tab = existing || await chrome.tabs.create({url: page.href, active: true});
+  const tab = existing || await chrome.tabs.create({active: true});
+  if (!existing) {
+    try {
+      await groupTab(tab);
+      await chrome.tabs.update(tab.id, {url: page.href});
+    } catch (error) {
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      throw Error(`Browser Link could not open a tab in the Spindle group. ${error.message}`);
+    }
+  }
   // A newly created tab starts at about:blank. Bind only after the requested
   // document commits, and don't read an account sign-in or redirect by accident.
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -175,15 +184,20 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
     current.requested = true;
   }
   if (message.kind === "remove-rule" && current?.ready && current.rules.includes(message.rule)) {
-    if (current.mode === "allowlist" && current.rule === message.rule) current.rule = null;
+    if (current.mode === "allowlist" && current.rule === message.rule) {
+      current.rule = null;
+      clearActivity(current);
+    }
     sendPacket({ remove_rule: message.rule });
   }
   if (message.kind === "block-site" && current?.ready && current.mode === "blocklist") {
     current.rule = null;
+    clearActivity(current);
     sendPacket({ block_site: true });
   }
   if (message.kind === "set-mode" && current?.ready && message.mode !== current.mode) {
     current.rule = null;
+    clearActivity(current);
     sendPacket({ mode: message.mode });
   }
   respond(status());
@@ -195,8 +209,12 @@ chrome.tabs.onRemoved.addListener(tabId => {
   if (current?.tabId === tabId) stop();
 });
 
-chrome.tabs.onUpdated.addListener((tabId, change) => {
-  if (current?.tabId !== tabId || !change.url) return;
+chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
+  if (current?.tabId !== tabId) return;
+  if (change.status === "complete" && current.engaged && allowed(tab.url, current.rule)) {
+    markActivity(current);
+  }
+  if (!change.url) return;
   if (!sameOrigin(change.url, current.origin)) {
     stop();
   } else if (current.ready) {
@@ -271,13 +289,28 @@ function sendPacket(packet) {
   nativePort?.postMessage({ packet });
 }
 
+function runInTab(session, operation) {
+  return chrome.scripting.executeScript({
+    target: {tabId: session.tabId},
+    func: operate,
+    args: [operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce]
+  });
+}
+
+function markActivity(session) {
+  runInTab(session, {action: "mark"}).catch(() => {});
+}
+
 async function receivePacket(session, message) {
   if (Array.isArray(message.rules)) {
     session.rule = message.rule;
     session.rules = message.rules;
     session.mode = message.mode;
     session.ready = true;
-    if (session.rule) session.requested = false;
+    if (session.rule) {
+      session.requested = false;
+      if (session.engaged) markActivity(session);
+    }
     else clearActivity(session);
     chrome.action.setBadgeText({ tabId: session.tabId, text: session.rule ? "ON" : "OFF" }).catch(() => {});
     chrome.runtime.sendMessage({ kind: "update", status: status() }).catch(() => {});
@@ -293,20 +326,20 @@ async function receivePacket(session, message) {
         (session.mode === "blocklist" && session.rules.some(rule => allowed(tab.url, rule)))) {
       throw Error("This URL is blocked in Spindle.");
     }
-    const [response] = await chrome.scripting.executeScript({
-      target: { tabId: session.tabId },
-      func: operate,
-      args: [message.operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce]
-    });
+    // A tab the user already grouped stays with their other tabs.
+    await groupTab(tab).catch(() => {});
+    if (current !== session) return;
+    if (!allowed(tab.url, session.rule)) throw Error("This URL is blocked in Spindle.");
+    session.engaged = true;
+    const [response] = await runInTab(session, message.operation);
     reply = response?.result || { error: "The tab did not return a result." };
-    if (reply.result && current === session) await groupTab(tab).catch(() => {});
   } catch {
     reply = { error: "The browser could not access this page. If your browser restricts the extension on this site, open its extension menu and allow Browser Link on this site, then retry here." };
   }
   if (current === session) sendPacket({ id: message.id, ...reply });
 }
 
-function operate(operation, rule, blocked, sessionNonce) {
+async function operate(operation, rule, blocked, sessionNonce) {
   const site = new URL(rule);
   const prefix = site.pathname.replace(/\/+$/, "");
   const matches = (url, site, prefix) => url.origin === site.origin && !url.username && !url.password &&
@@ -341,8 +374,10 @@ function operate(operation, rule, blocked, sessionNonce) {
       div { position: absolute; right: 16px; top: 16px; background: #10251b; color: #f0fff5;
         border: 1px solid #70efa7; border-radius: 10px; padding: 9px 13px;
         max-width: calc(100% - 60px); font: 600 13px/1.4 system-ui; box-shadow: 0 4px 18px #0009; }
-      span { position: absolute; width: 29px; height: 33px; color: #10251b;
-        filter: drop-shadow(0 2px 4px #000d) drop-shadow(0 0 8px #70efa7); }
+      span { position: absolute; top: 0; left: 0; width: 29px; height: 33px; color: #10251b;
+        filter: drop-shadow(0 2px 4px #000d) drop-shadow(0 0 8px #70efa7);
+        transform: translate(16px, 64px); transition: transform 140ms ease-out; }
+      @media (prefers-reduced-motion: reduce) { span { transition: none; } }
       span::before { content: ""; position: absolute; inset: 0; background: #70efa7;
         clip-path: polygon(0 0, 100% 61%, 62% 67%, 77% 96%, 60% 100%, 43% 73%, 9% 93%); }
       span::after { content: "S"; position: absolute; top: 8px; left: 6px;
@@ -350,8 +385,9 @@ function operate(operation, rule, blocked, sessionNonce) {
     `;
     const badge = document.createElement("div");
     badge.setAttribute("role", "status");
+    badge.textContent = "Spindle has access to this tab · Esc to revoke access";
     const cursor = document.createElement("span");
-    cursor.hidden = true;
+    cursor.setAttribute("aria-hidden", "true");
     shadow.append(style, badge, cursor);
     document.documentElement.append(host);
     let timer;
@@ -373,13 +409,11 @@ function operate(operation, rule, blocked, sessionNonce) {
       },
       show(element, action) {
         const bounds = element?.getBoundingClientRect();
-        const offset = action === "read" ? 22 : (bounds?.width || 0) / 2;
-        const x = Math.max(12, Math.min(innerWidth - 42, (bounds?.left || 0) + offset));
-        const y = Math.max(70, Math.min(innerHeight - 42,
-          (bounds?.top || 0) + (action === "read" ? 28 : (bounds?.height || 0) / 2)));
-        cursor.style.left = `${x}px`;
-        cursor.style.top = `${y}px`;
-        cursor.hidden = false;
+        if (bounds && (action !== "read" || !cursor.style.transform)) {
+          const x = Math.max(0, Math.min(innerWidth - 1, bounds.left + (action === "read" ? 22 : bounds.width / 2)));
+          const y = Math.max(0, Math.min(innerHeight - 1, bounds.top + (action === "read" ? 28 : bounds.height / 2)));
+          cursor.style.transform = `translate(${x}px, ${y}px)`;
+        }
         host.setAttribute("data-working", "");
         badge.textContent = action === "read" ? "Spindle is reading this tab · Esc to revoke access" :
           "Spindle is using this tab · Esc to revoke access";
@@ -387,11 +421,11 @@ function operate(operation, rule, blocked, sessionNonce) {
         timer = setTimeout(() => {
           host.removeAttribute("data-working");
           badge.textContent = "Spindle has access to this tab · Esc to revoke access";
-          cursor.hidden = true;
         }, 2600);
       }
     };
   }
+  if (operation.action === "mark") return;
   const visible = element => Boolean(element.getClientRects().length) &&
     getComputedStyle(element).visibility === "visible" && !element.closest("[hidden],[inert]");
   const field = element => element instanceof HTMLTextAreaElement ||
@@ -454,15 +488,21 @@ function operate(operation, rule, blocked, sessionNonce) {
     return { result: snapshot };
   }
   const target = cache.get(operation.target);
-  if (!target || target.page !== location.href || target.action !== operation.action ||
-      !target.element.isConnected || !visible(target.element) || target.element.matches(":disabled") ||
-      privateField(target.element) || target.name !== label(target.element) ||
-      target.href !== href(target.element)?.href) {
+  const stillMatches = () => target && target.page === location.href && target.action === operation.action &&
+    target.element.isConnected && visible(target.element) && !target.element.matches(":disabled") &&
+    !privateField(target.element) && target.name === label(target.element) && target.href === href(target.element)?.href;
+  if (!stillMatches()) {
     return { error: "The control changed. Read the tab again." };
   }
   cache.clear();
   const element = target.element;
+  element.scrollIntoView({block: "nearest", inline: "nearest", behavior: "instant"});
   activity.show(element, operation.action);
+  await new Promise(resolve => setTimeout(resolve, 150));
+  if (activity.revoked || globalThis.spindleTabActivity !== activity || !allowedPath(location)) {
+    return { error: "Spindle no longer has access to this tab." };
+  }
+  if (!stillMatches()) return { error: "The control changed. Read the tab again." };
   if (operation.action === "fill") {
     if (!field(element) || element.readOnly || typeof operation.text !== "string" || operation.text.length > 4000) {
       return { error: "This field cannot be filled." };

@@ -714,6 +714,47 @@ impl Desktop {
             changed |= ui.checkbox(&mut prefs.over_18, "I’m over 18").changed();
             ui.weak("When unchecked, Spindle asks models to respond in a way suitable for minors. Models may ignore this guidance. Parental supervision is still needed.");
             ui.add_space(14.);
+            ui.heading("Web region");
+            ui.weak("Set a different country for shopping and regional searches, for example when using a VPN. This override stays on this device.");
+            if !prefs.web_country.is_empty() {
+                ui.label(format!("Using {} as your manual country override", prefs.web_country));
+            }
+            let mut country = self.web_country_draft.take().unwrap_or_else(|| prefs.web_country.clone());
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut country).hint_text("US, CA, MX…")
+                    .desired_width(90.).char_limit(2));
+                let code = crate::browser::country_code(&country);
+                if ui.add_enabled(code.as_ref().is_some_and(|code| code != &prefs.web_country),
+                    egui::Button::new("Save country override")).clicked() && let Some(code) = code {
+                    country = code.clone();
+                    prefs.web_country = code;
+                    changed = true;
+                }
+                if !prefs.web_country.is_empty() && ui.button("Clear override").clicked() {
+                    country.clear();
+                    prefs.web_country.clear();
+                    changed = true;
+                }
+            });
+            self.web_country_draft = (country != prefs.web_country).then_some(country);
+            if crate::location::SUPPORTED {
+                match prefs.use_os_location {
+                    Some(true) => {
+                        if ui.button("Turn off device location access").clicked() {
+                            prefs.use_os_location = Some(false);
+                            changed = true;
+                        }
+                    }
+                    Some(false) => {
+                        if ui.button("Ask again next time").clicked() {
+                            prefs.use_os_location = None;
+                            changed = true;
+                        }
+                    }
+                    None => { ui.weak("Spindle asks in chat when a web request needs a country."); }
+                }
+            }
+            ui.add_space(14.);
             ui.heading("Context compaction");
             ui.weak("Summarize older exchanges before the next request when the estimated prompt reaches this threshold.");
             changed |= compaction_controls(ui, &mut prefs.compaction);
@@ -1100,17 +1141,91 @@ impl Desktop {
     }
 
     pub(super) fn browser_access_card(&mut self, ui: &mut egui::Ui) -> bool {
+        use crate::location::WebRegionPrompt::{Ask, ChooseCountry, Locate};
+        if let Some((id, stage)) = self.view.web_region_prompt {
+            ui.group(|ui| {
+                ui.set_width(ui.available_width());
+                if stage == Locate {
+                    if self.web_location_probe.as_ref().is_none_or(|probe| probe.id != id) {
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        crate::location::request(id, sender);
+                        self.web_location_probe = Some(super::WebLocationProbe {
+                            id, started: std::time::Instant::now(), result: Some(receiver),
+                        });
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label("Waiting for your device’s location service…");
+                    });
+                    let use_manual = ui.button("Choose a country instead").clicked();
+                    let probe = self.web_location_probe.as_mut().unwrap();
+                    if let Some(receiver) = &probe.result {
+                        let country = if use_manual || probe.started.elapsed().as_secs() >= 35 {
+                            Some(None)
+                        } else {
+                            match receiver.try_recv() {
+                                Ok(country) => Some(country),
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(None),
+                                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            }
+                        };
+                        if let Some(country) = country {
+                            probe.result = None;
+                            self.send(format!("/web-region {id} located {}", country.unwrap_or_default()));
+                        } else {
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+                        }
+                    }
+                } else if stage == ChooseCountry {
+                    ui.strong("Which country should Spindle use?");
+                    ui.label("Use a country for this and future regional searches on this device, or continue without one.");
+                    let mut draft = self.web_country_draft.take().unwrap_or_default();
+                    let mut choice = None;
+                    ui.horizontal_wrapped(|ui| {
+                        self.android_ime.field(ui, ("web-region", id), &mut draft, Default::default(), |edit| {
+                            edit.hint_text("US, CA, MX…").desired_width(90.).char_limit(2)
+                        });
+                        let country = crate::browser::country_code(&draft);
+                        if ui.add_enabled(country.is_some(), egui::Button::new("Use this country")).clicked()
+                            && let Some(country) = country {
+                            choice = Some(format!("country {country}"));
+                        }
+                        if ui.button("Continue without").clicked() { choice = Some("skip".into()); }
+                    });
+                    if let Some(choice) = choice {
+                        self.send(format!("/web-region {id} {choice}"));
+                    } else if !draft.is_empty() {
+                        self.web_country_draft = Some(draft);
+                    }
+                } else if stage == Ask {
+                    ui.strong("Use device location for web results?");
+                    ui.label("Spindle uses your device’s location service and shares only the country code with the selected model provider for regional searches and shopping.");
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Allow").clicked() { self.send(format!("/web-region {id} allow")); }
+                        if ui.button("Don’t allow").clicked() { self.send(format!("/web-region {id} deny")); }
+                    });
+                }
+            });
+            return true;
+        }
+        self.web_location_probe = None;
         let chat = self.view.state.chat_id;
         let pairing = self.view.browser_pairing.filter(|(owner, _)| *owner == chat);
         let selected = pairing.and(self.view.browser_tab_origin.clone());
         let read = self.view.state.browser_reads.get(&chat).cloned();
         let requested = selected.is_some() && self.view.browser_site_request == selected;
         if read.is_none() && !requested {
-            if let Some((id, address)) = self.view.browser_fallback.clone()
+            if let Some((id, address)) = self.view.browser_fallbacks.last().cloned()
                 && let Ok(page) = crate::browser::public_page(&address) {
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.strong(format!("Spindle couldn’t read {}", page.host_str().unwrap_or("this site")));
+                    #[cfg(windows)]
+                    if !self.view.state.preferences.block_web && ui.button("Show in Spindle’s browser").clicked() {
+                        self.reader.browser.reveal_public(chat, address.clone());
+                        self.reader.open = true;
+                        self.reader.tab = super::side_tabs::Tab::Browser;
+                    }
                     if let Some(reason) = crate::engine::browser_access_blocker(&self.view.state) {
                         ui.label(reason);
                     } else {

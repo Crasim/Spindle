@@ -4,6 +4,7 @@ mod artifacts;
 mod android_apk;
 mod automation;
 mod browser;
+mod location;
 mod browser_link;
 #[cfg(any(windows, target_os = "linux"))]
 mod browser_channel;
@@ -213,6 +214,13 @@ mod android {
             let _ = env.exception_clear();
         }
         r
+    }
+
+    pub fn request_web_location(id: u64) -> bool {
+        java(|env, activity| {
+            env.call_method(activity, "requestWebLocation", "(J)V", &[jni::objects::JValue::Long(id as i64)])?;
+            Ok(())
+        }).is_ok()
     }
 
     pub fn copy_text(text: &str) {
@@ -748,7 +756,7 @@ fn main() -> Result<()> {
         models: vec![],
         store: Some(store),
         api,
-        jobs: Default::default(),
+        jobs: execution::Jobs { web_region_ui: args.is_empty(), ..Default::default() },
     };
     let (tx, input) = channel::unbounded_channel();
     let (output, rx) = mpsc::channel();

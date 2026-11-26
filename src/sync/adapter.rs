@@ -464,10 +464,12 @@ fn fingerprint(v: &Value) -> String {
 }
 
 /// Preference fields that stay with one device.
-const LOCAL_PREFS: [&str; 14] = [
+const LOCAL_PREFS: [&str; 16] = [
     "browser_path",
     "browser_mode",
     "disabled_browsers",
+    "web_country",
+    "use_os_location",
     "sidebar_width",
     "zoom",
     "compact_sidebar",
@@ -1775,6 +1777,10 @@ mod tests {
         let mut b = device_state(&sb);
         a.preferences.enter_sends = false;
         a.preferences.zoom = 150;
+        a.preferences.web_country = "US".into();
+        b.preferences.web_country = "CA".into();
+        a.preferences.use_os_location = Some(true);
+        b.preferences.use_os_location = Some(false);
         a.preferences.browser_mode = crate::browser_link::Mode::AllowAll;
         a.preferences.browser_allowlist.push("https://docs.example.com".into());
         a.preferences.browser_blocklist.push("https://bank.example.com".into());
@@ -1794,6 +1800,8 @@ mod tests {
         round(&mut b, &mut sb, &ts, false).await.unwrap();
         assert!(!b.preferences.enter_sends);
         assert_eq!(b.preferences.zoom, 100, "zoom stays per device");
+        assert_eq!(b.preferences.web_country, "CA", "country consent stays per device");
+        assert_eq!(b.preferences.use_os_location, Some(false), "OS permission stays per device");
         assert_eq!(b.preferences.browser_mode, crate::browser_link::Mode::Allowlist);
         assert_eq!(b.preferences.browser_allowlist, ["https://docs.example.com"]);
         assert_eq!(b.preferences.browser_blocklist, ["https://bank.example.com"]);

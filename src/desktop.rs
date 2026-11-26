@@ -268,6 +268,12 @@ fn export_skill(path: &std::path::Path, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+struct WebLocationProbe {
+    id: u64,
+    started: std::time::Instant,
+    result: Option<std::sync::mpsc::Receiver<Option<String>>>,
+}
+
 pub struct Desktop {
     /// On a phone-sized screen: the sidebar is shown full screen, as a drawer.
     drawer: bool,
@@ -338,6 +344,8 @@ pub struct Desktop {
     connector_setup: settings::ConnectorSetup,
     local_servers: settings::LocalServers,
     browser_path_draft: Option<String>,
+    web_country_draft: Option<String>,
+    web_location_probe: Option<WebLocationProbe>,
     chat_selection: chat_selection::Selection,
     transcript: TranscriptRows,
     build_files: Option<(u64, std::time::Instant, Vec<String>)>,
@@ -905,6 +913,8 @@ impl Desktop {
             connector_setup: Default::default(),
             local_servers: Default::default(),
             browser_path_draft: None,
+            web_country_draft: None,
+            web_location_probe: None,
             pending_copy: None,
             work_started: None,
             open_steps: Default::default(),
@@ -2546,14 +2556,17 @@ impl eframe::App for Desktop {
                 self.reader_files_at = None;
             }
             self.observe_submission(&v);
-            if self.page == Page::Chat && let Some(page) = v.browser_panel.clone()
-                && page.chat == v.state.chat_id {
-                self.reader.open = true;
-                self.reader.tab = side_tabs::Tab::Browser;
-                self.reader.browser.present(page);
+            if let Some((chat, _)) = self.view.browser_pairing
+                && v.browser_pairing.map(|pair| pair.0) != Some(chat)
+            {
+                self.reader.browser.disconnected(chat);
             }
-            if v.browser_pairing.is_none() && self.view.browser_pairing.is_some() {
-                self.reader.browser.disconnected();
+            if let Some(page) = v.browser_panel.clone() {
+                let foreground = self.page == Page::Chat && page.chat == v.state.chat_id;
+                if self.reader.browser.present(page, foreground) {
+                    self.reader.open = true;
+                    self.reader.tab = side_tabs::Tab::Browser;
+                }
             }
             if self.plan.submitted && v.notice == "Plan revision queued" && v.state.chat_id == self.view.state.chat_id {
                 self.plan.revision_accepted();
@@ -2834,9 +2847,17 @@ impl eframe::App for Desktop {
             self.reader.browser.hide();
         } else if !detail {
             let plan = (self.page == Page::Chat).then_some((&mut self.plan, &self.view.state.thread, self.view.state.goal.as_str(), &mut self.android_ime));
-            self.reader.show(ctx, frame, &self.root, &mut attachment, plan, &self.view.state.preferences.browser_path);
+            let browser_chat = (self.view.state.chat_id, self.view.browser_fallbacks.as_slice(),
+                !self.view.busy && self.view.job.is_none() && !self.view.state.preferences.block_web);
+            self.reader.show(ctx, frame, &self.root, &mut attachment, plan,
+                &self.view.state.preferences.browser_path, browser_chat);
         }
         match self.reader.picked.take() {
+            Some(side_tabs::Pick::DisconnectBrowser(chat)) => self.send(format!("/browser-link stop {chat}")),
+            #[cfg(windows)]
+            Some(side_tabs::Pick::ShareBrowserPage { id, snapshot }) => {
+                let _ = self.tx.send(format!("/browser-preview-read [{id},{snapshot}]"));
+            }
             Some(side_tabs::Pick::PlanSteps(steps)) => self.set_steps(steps),
             Some(side_tabs::Pick::RevisePlan { change, replace_goal }) => {
                 let command = if replace_goal { "/goal replace" } else { "/plan revise" };

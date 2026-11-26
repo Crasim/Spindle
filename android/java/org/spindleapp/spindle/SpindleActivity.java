@@ -34,6 +34,75 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     private PopupWindow htmlPreviewWindow;
     private String htmlPreviewUrl;
 
+    private static final int WEB_LOCATION_PERMISSION = 561;
+    private long pendingWebLocation;
+    private static native void nativeWebLocation(long id, double latitude, double longitude, double accuracy);
+
+    public void requestWebLocation(long id) {
+        runOnUiThread(() -> {
+            if (checkSelfPermission(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                    == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                readWebLocation(id);
+            } else {
+                pendingWebLocation = id;
+                requestPermissions(new String[] {android.Manifest.permission.ACCESS_COARSE_LOCATION}, WEB_LOCATION_PERMISSION);
+            }
+        });
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int request, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(request, permissions, results);
+        if (request != WEB_LOCATION_PERMISSION || pendingWebLocation == 0) return;
+        long id = pendingWebLocation;
+        pendingWebLocation = 0;
+        if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            readWebLocation(id);
+        } else {
+            nativeWebLocation(id, Double.NaN, Double.NaN, Double.NaN);
+        }
+    }
+
+    private void readWebLocation(long id) {
+        android.location.LocationManager manager = getSystemService(android.location.LocationManager.class);
+        if (manager == null) {
+            nativeWebLocation(id, Double.NaN, Double.NaN, Double.NaN);
+            return;
+        }
+        java.util.List<String> providers = manager.getProviders(true);
+        String provider = providers.contains("fused") ? "fused" :
+            providers.contains(android.location.LocationManager.NETWORK_PROVIDER) ? android.location.LocationManager.NETWORK_PROVIDER :
+            providers.contains(android.location.LocationManager.GPS_PROVIDER) ? android.location.LocationManager.GPS_PROVIDER : null;
+        if (provider == null) {
+            nativeWebLocation(id, Double.NaN, Double.NaN, Double.NaN);
+            return;
+        }
+        final boolean[] finished = {false};
+        android.os.Handler timer = new android.os.Handler(getMainLooper());
+        android.location.LocationListener listener = new android.location.LocationListener() {
+            @Override public void onLocationChanged(android.location.Location position) {
+                if (finished[0]) return;
+                finished[0] = true;
+                manager.removeUpdates(this);
+                nativeWebLocation(id, position.getLatitude(), position.getLongitude(), position.getAccuracy());
+            }
+            @Override public void onProviderEnabled(String name) { }
+            @Override public void onProviderDisabled(String name) { }
+            @Override public void onStatusChanged(String name, int status, Bundle extras) { }
+        };
+        try {
+            manager.requestLocationUpdates(provider, 0L, 0f, listener, getMainLooper());
+            timer.postDelayed(() -> {
+                if (finished[0]) return;
+                finished[0] = true;
+                manager.removeUpdates(listener);
+                nativeWebLocation(id, Double.NaN, Double.NaN, Double.NaN);
+            }, 12000L);
+        } catch (SecurityException | IllegalArgumentException e) {
+            nativeWebLocation(id, Double.NaN, Double.NaN, Double.NaN);
+        }
+    }
+
     public void showHtmlPreview(String url, String scope, int x, int y, int width, int height) {
         runOnUiThread(() -> {
             if (htmlPreview == null || !url.equals(htmlPreviewUrl)) {

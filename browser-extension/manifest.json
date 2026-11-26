@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Spindle Browser Link",
   "description": "Connect the active browser tab to Spindle using your website and model permissions.",
-  "version": "0.5.6",
+  "version": "0.5.7",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsIQ0d1WRC3BBISW82gDMkhUWdSNzuNR7Tk1SAo2I3rBUDXQNVb8+ohiEbvXTL2mzVnNWJ/QQ5qjWk9mauOcFc9gF3oXf+nOKQhehLYSjTir1V2Ue5zP6mCpS5a+RwNT0dbgiyICmPRD/9g+MJUmTn/CAzl+7h/sTZRQ5qgLahNUG2KlQjUpY36dlsuYgj5It9erIUkeLwWiJug9PVrA5BraG8FX+TRCEkLJk69VhLbXXtlD17q2dVYUUCKYR/pnEuGyUMq7P5f1jn9gcJK9gupK5Byqg6+23Vd8Q/zUIziQE/lKCb2Gj4SC/DvznBrg7P+buRHok1rFsfOpZf0rO5QIDAQAB",
   "minimum_chrome_version": "116",
   "permissions": ["nativeMessaging", "scripting", "tabs", "tabGroups", "storage"],

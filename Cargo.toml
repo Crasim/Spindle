@@ -1,6 +1,6 @@
 [package]
 name = "spindle"
-version = "0.3.0-beta.14"
+version = "0.3.0-beta.15"
 edition = "2024"
 rust-version = "1.89"
 
@@ -46,7 +46,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 wry = { version = "0.54", default-features = false, features = ["protocol"] }
-windows = { version="0.58", features=["Data_Pdf","Storage_Streams","Foundation","Foundation_Collections","Security_Cryptography_DataProtection"] }
+windows = { version="0.58", features=["Data_Pdf","Devices_Geolocation","Storage_Streams","Foundation","Foundation_Collections","Security_Cryptography_DataProtection","Win32_System_WinRT"] }
 raw-window-handle = "0.6"
 windows-sys = {version="0.59", features=["Win32_UI_WindowsAndMessaging","Win32_UI_Shell","Win32_System_Com","Win32_System_Console","Win32_Graphics_Dwm","Win32_Foundation","Win32_Security","Win32_Security_Isolation","Win32_Security_Authorization","Win32_Storage_FileSystem","Win32_System_JobObjects","Win32_System_Pipes","Win32_System_Registry","Win32_System_Threading"]}
 rfd = { version = "0.15", default-features = false }
@@ -58,3 +58,4 @@ winresource = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }

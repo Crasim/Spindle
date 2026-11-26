@@ -647,6 +647,7 @@ impl ReaderPane {
         attach: &mut Option<String>,
         plan: Option<(&mut notes::PlanPane, &crate::state::ThreadInfo, &str, &mut android_ime::ComposerIme)>,
         browser_path: &str,
+        browser_chat: (u64, &[(u64, String)], bool),
     ) {
         if !self.open {
             self.preview.hide();
@@ -822,7 +823,8 @@ impl ReaderPane {
                         return;
                     }
                     side_tabs::Tab::Browser => {
-                        self.browser.show(ui, frame);
+                        let (chat, fallbacks, ready) = browser_chat;
+                        self.picked = self.browser.show(ui, frame, chat, fallbacks, ready);
                         return;
                     }
                 }

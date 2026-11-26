@@ -24,15 +24,31 @@ pub(crate) fn public_page(address: &str) -> Result<reqwest::Url> {
     }
 }
 
+pub(crate) fn country_code(value: &str) -> Option<String> {
+    let mut value = value.trim().to_ascii_uppercase();
+    if value == "UK" { value = "GB".into(); }
+    (value.len() == 2 && value.bytes().all(|byte| byte.is_ascii_uppercase())
+        && !matches!(value.as_str(), "XX" | "ZZ")).then_some(value)
+}
+
 #[derive(Debug)]
 pub(crate) enum PageAccess {
     Http(u16),
     Challenge,
 }
 
+impl PageAccess {
+    pub(crate) fn offers_regular_browser(&self) -> bool {
+        matches!(self, Self::Http(401 | 403 | 429) | Self::Challenge)
+    }
+}
+
 impl std::fmt::Display for PageAccess {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Http(401) => f.write_str("The site requires authentication (HTTP 401) in the built-in browser’s isolated session"),
+            Self::Http(403) => f.write_str("The site refused the built-in browser’s request (HTTP 403)"),
+            Self::Http(429) => f.write_str("The site rate-limited the built-in browser (HTTP 429)"),
             Self::Http(status) => write!(f, "The site returned HTTP {status}"),
             Self::Challenge => f.write_str("The site showed a verification page instead of the requested content"),
         }
@@ -40,6 +56,54 @@ impl std::fmt::Display for PageAccess {
 }
 
 impl std::error::Error for PageAccess {}
+
+#[cfg(windows)]
+pub(crate) const VISIBLE_PAGE_SCRIPT: &str = r#"(() => {
+    if (document.readyState !== 'complete') return null;
+    const page = document.querySelector('main, [role=main], article') || document.body;
+    const links = [];
+    for (const link of page?.querySelectorAll('a[href]') || []) {
+        const label = (link.innerText || link.getAttribute('aria-label') || '').trim().slice(0,180);
+        if (!label || !link.getClientRects().length || !/^https?:/.test(link.href)) continue;
+        links.push([label, link.href.slice(0,2048)]);
+        if (links.length === 100) break;
+    }
+    return {address: location.href, status: performance.getEntriesByType('navigation')[0]?.responseStatus ?? 0,
+        title: document.title.slice(0,300), text: (page?.innerText || '').slice(0,18000), links};
+})()"#;
+
+#[cfg(windows)]
+#[derive(serde::Deserialize)]
+pub(crate) struct VisiblePage {
+    address: String,
+    status: u16,
+    title: String,
+    text: String,
+    links: Vec<(String, String)>,
+}
+
+#[cfg(windows)]
+impl VisiblePage {
+    pub fn read(self, expected: &str) -> Result<String> {
+        let mut address = public_page(&self.address)?;
+        let mut expected = public_page(expected)?;
+        address.set_fragment(None);
+        expected.set_fragment(None);
+        ensure!(address == expected, "The browser left the approved page. Nothing was shared.");
+        if self.status >= 400 { return Err(PageAccess::Http(self.status).into()); }
+        if verification_page(&self.title, &self.text) { return Err(PageAccess::Challenge.into()); }
+        ensure!(!self.text.trim().is_empty(), "The page has no readable text");
+        let body: String = self.text.chars().take(14000).collect();
+        let mut result = format!("Public page: {address}\n{}\n\n{body}\n\nVisible links:\n", self.title.chars().take(300).collect::<String>());
+        for (label, link) in self.links.into_iter().take(100) {
+            if let Ok(link) = public_page(&link) {
+                let label: String = label.chars().take(180).collect();
+                result.push_str(&format!("- {label} · {link}\n"));
+            }
+        }
+        Ok(result)
+    }
+}
 
 pub(crate) fn verification_page(title: &str, body: &str) -> bool {
     let title = title.trim().to_ascii_lowercase();
@@ -982,11 +1046,8 @@ fn open_public_tab(
                     Ok(response) => {
                         if main {
                             status = Some(response.status);
-                            if !diagnostics && matches!(response.status, 401 | 403 | 429) {
+                            if !diagnostics && response.status >= 400 {
                                 return Err(PageAccess::Http(response.status).into());
-                            }
-                            if response.status >= 400 && !diagnostics {
-                                bail!("The site returned HTTP {}", response.status);
                             }
                         }
                         bytes_left -= response.bytes.len();
@@ -1000,7 +1061,7 @@ fn open_public_tab(
                             "body": base64::engine::general_purpose::STANDARD.encode(response.bytes),
                         }))?;
                     }
-                    Err(error) if main => return Err(error),
+                    Err(error) if main => return Err(error.context("The built-in browser could not load the main document")),
                     Err(_) => {
                         ws.send(
                             "Fetch.failRequest",
@@ -1046,9 +1107,7 @@ fn open_public_tab(
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    if verification_page(page["title"].as_str().unwrap_or_default(), &body) {
-        return Err(PageAccess::Challenge.into());
-    }
+    let challenge = verification_page(page["title"].as_str().unwrap_or_default(), &body);
     let (visible, more) = {
         let mut chars = body.chars().skip(start);
         let content: String = chars.by_ref().take(6000).collect();
@@ -1084,8 +1143,11 @@ fn open_public_tab(
         );
         add_diagnostics(&mut output, "Network requests", &traffic, 16);
     }
-    if let Some(status @ (401 | 403 | 429)) = status {
-        return Err(anyhow::Error::new(PageAccess::Http(status)).context(output));
+    let problem = status.filter(|status| *status >= 400).map(PageAccess::Http)
+        .or_else(|| challenge.then_some(PageAccess::Challenge));
+    if let Some(problem) = problem {
+        let error = anyhow::Error::new(problem);
+        return Err(if diagnostics { error.context(output) } else { error });
     }
     if let Some(links) = page["links"].as_array() {
         let mut seen = std::collections::HashSet::new();

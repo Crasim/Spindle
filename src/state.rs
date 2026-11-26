@@ -164,6 +164,9 @@ pub struct State {
     pub unread: std::collections::BTreeSet<u64>,
     #[serde(skip)]
     pub viewed_chat: Option<u64>,
+    /// A short-lived country result from the OS location provider. It is never saved or synced.
+    #[serde(skip)]
+    pub located_web_country: Option<(String, std::time::Instant)>,
     #[serde(default)]
     pub received_threads: std::collections::BTreeSet<String>,
     #[serde(default)]
@@ -370,6 +373,12 @@ pub struct Preferences {
     /// Block network access for the model browser while allowing local page tests.
     #[serde(default)]
     pub block_web: bool,
+    /// Country explicitly shared with models for regional web tasks on this device.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub web_country: String,
+    /// Whether the user allows Spindle to use this device's OS location service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_os_location: Option<bool>,
     /// This device's preferred Chromium executable. Empty uses browser discovery.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub browser_path: String,
@@ -472,6 +481,8 @@ impl Default for Preferences {
             project_memory: true,
             auto_apply: true,
             block_web: false,
+            web_country: String::new(),
+            use_os_location: None,
             browser_path: String::new(),
             browser_allowlist: vec![],
             browser_blocklist: vec![],
