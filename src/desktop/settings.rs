@@ -646,6 +646,8 @@ impl Desktop {
                 });
             ui.add_space(14.);
             ui.heading("Appearance");
+            changed |= ui.checkbox(&mut prefs.nerd_stats, "Show nerd stats").changed();
+            ui.weak("Show context usage, generation speed, and output token counts in chats.");
             ui.horizontal(|ui| {
                 for (theme, label, tip) in [
                     (
@@ -691,6 +693,23 @@ impl Desktop {
                     }
                 }
             });
+            ui.add_space(14.);
+            if cfg!(any(windows, target_os = "linux")) {
+                ui.heading("Startup and background");
+                let mut login = prefs.start_on_sign_in.unwrap_or(prefs.background);
+                if ui.checkbox(&mut prefs.background, "Keep Spindle running in the tray").changed() {
+                    prefs.start_on_sign_in = Some(login);
+                    changed = true;
+                }
+                ui.weak("Closing the window keeps sync and schedules running.");
+                if ui.checkbox(&mut login, "Start Spindle when I sign in").changed() {
+                    self.send(if login { "/service install" } else { "/service uninstall" });
+                }
+                ui.add_space(14.);
+            }
+            ui.heading("Model guidance");
+            changed |= ui.checkbox(&mut prefs.over_18, "I’m over 18").changed();
+            ui.weak("When unchecked, Spindle asks models to respond in a way suitable for minors. This is self-reported guidance. Models may ignore it.");
             ui.add_space(14.);
             ui.heading("Context compaction");
             ui.weak("Summarize older exchanges before the next request when the estimated prompt reaches this threshold.");
@@ -847,6 +866,18 @@ impl Desktop {
                 if let Some(address) = save {
                     self.set_ollama(true, address);
                 }
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("API key");
+                    self.android_ime.field(ui, "local-ollama-key", &mut self.ollama_key,
+                        super::android_ime::Field { password: true, ..Default::default() },
+                        |field| field.hint_text("Optional").desired_width(170.));
+                    let save = ui.add_enabled(!self.ollama_key.trim().is_empty(), egui::Button::new("Save key")).clicked();
+                    let clear = ui.button("Clear key").clicked();
+                    if save || clear {
+                        let key = std::mem::take(&mut self.ollama_key);
+                        self.send(format!("/ollama-key {}", serde_json::json!([saved, if clear { "" } else { key.trim() }])));
+                    }
+                });
             }
             let Some(p) = profile else { continue };
             #[cfg(any(windows, target_os = "android"))]
@@ -1149,9 +1180,6 @@ impl Desktop {
                     match result {
                         Ok(folder) => {
                             ui.ctx().copy_text(folder.display().to_string());
-                            if let Err(error) = reveal(&folder) {
-                                setup.status = format!("Could not open the file manager. The folder path is shown below. {error}");
-                            }
                             if let Err(error) = setup.browser.open_install_guide(&folder) {
                                 setup.status = format!("The extension is ready. Could not open the install guide. {error:#}");
                             }
@@ -1208,7 +1236,7 @@ impl Desktop {
                 ui.monospace(folder.display().to_string());
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Show extension folder").clicked() {
-                        setup.status = reveal(folder).err().map_or_else(String::new, |error| error.to_string());
+                        setup.status = reveal_folder(folder).err().map_or_else(String::new, |error| error.to_string());
                     }
                     if ui.button("Copy folder path").clicked() {
                         ui.ctx().copy_text(folder.display().to_string());
@@ -1558,12 +1586,17 @@ impl Desktop {
             } else {
                 ui.weak("Leave it empty for this computer.");
             }
+            ui.label("API key (optional)");
+            self.android_ime.field(ui, "ollama-provider-key", &mut self.connection.key,
+                super::android_ime::Field { password: true, ..Default::default() },
+                |field| field.desired_width(width).hint_text("Leave blank for local access"));
             if ui
                 .add_enabled(!self.view.connecting, egui::Button::new("Add Ollama"))
                 .clicked()
             {
                 let address = self.connection.base.trim().to_owned();
-                self.set_ollama(true, address);
+                let key = std::mem::take(&mut self.connection.key);
+                self.send(format!("/ollama-connect {}", serde_json::json!([address, key.trim()])));
                 self.provider_setup = ProviderSetup::Connections;
             }
             return;

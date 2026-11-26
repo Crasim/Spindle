@@ -1,3 +1,4 @@
+param([switch]$BuildIfMissing)
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path -Parent $PSScriptRoot
 $data = if ($env:SPINDLE_DATA_DIR) { $env:SPINDLE_DATA_DIR } else { Join-Path $env:LOCALAPPDATA 'Spindle' }
@@ -56,9 +57,21 @@ $build = @('target\release\spindle.exe', 'target\staged\release\spindle.exe', 't
     ForEach-Object { Get-Item -LiteralPath (Join-Path $workspace $_) -ErrorAction SilentlyContinue } |
     Sort-Object LastWriteTimeUtc -Descending |
     Select-Object -First 1
+if (!$build -and $BuildIfMissing) {
+    $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+    Push-Location -LiteralPath $workspace
+    try {
+        & $cargo build --release --locked
+        if ($LASTEXITCODE -ne 0) { throw 'Could not build Spindle. Open Start Spindle.cmd for build output.' }
+        $build = Get-Item -LiteralPath (Join-Path $workspace 'target\release\spindle.exe')
+    } finally {
+        Pop-Location
+    }
+}
 if (!$build) { throw 'No Spindle release build was found.' }
 
 $startupError = Join-Path $workspace ("target\spindle-startup-{0}.log" -f $PID)
+$env:SPINDLE_GUI_LAUNCH = '1'
 $process = Start-Process -FilePath $build.FullName -WorkingDirectory $workspace -WindowStyle Hidden `
     -RedirectStandardError $startupError -PassThru
 if ($process.WaitForExit(3000) -and $process.ExitCode -ne 0) {

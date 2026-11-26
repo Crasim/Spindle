@@ -141,6 +141,10 @@ pub struct SyncState {
     pub switches: Switches,
     #[serde(default)]
     pub links: Vec<Link>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub device_rules: BTreeMap<String, DeviceRules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admitted_records: Option<BTreeSet<String>>,
     /// Local chat ID → synced chat ID.
     #[serde(default)]
     pub chats: BTreeMap<u64, String>,
@@ -193,6 +197,35 @@ pub struct SyncState {
     pub wanted: Option<Want>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeviceRules {
+    pub paused: bool,
+    pub blocked: BTreeSet<String>,
+    pub blocked_projects: BTreeSet<String>,
+}
+
+impl DeviceRules {
+    fn allows(&self, kind: Kind, body: &super::core::Body, project: Option<&str>, aliases: &BTreeMap<String, String>) -> bool {
+        let category = match kind {
+            Kind::Project => "projects",
+            Kind::Chat => "conversations",
+            Kind::Settings if project.is_some() || body.id.starts_with("project-alias:") => "projects",
+            Kind::Settings => "settings",
+            Kind::Skill => "skills",
+            Kind::Memory => "memories",
+            Kind::Provider | Kind::Secret => "providers",
+            Kind::Schedule => "settings",
+            Kind::Devices | Kind::Keys => return true,
+        };
+        let other = (kind == Kind::Settings && body.id.starts_with("project-alias:"))
+            .then(|| body.value["target"].as_str()).flatten();
+        !self.paused && !self.blocked.contains(category)
+            && [project, other].into_iter().flatten().all(|id|
+                !self.blocked_projects.contains(project_sync::resolved(aliases, id)))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Want {
     Now,
@@ -221,6 +254,10 @@ pub struct DetachedSpace {
     imported_providers: BTreeMap<String, (String, String)>,
     #[serde(default)]
     imported_ollama: Option<(String, String)>,
+    #[serde(default)]
+    device_rules: BTreeMap<String, DeviceRules>,
+    #[serde(default)]
+    admitted_records: Option<BTreeSet<String>>,
 }
 
 pub fn disconnect(state: &mut State) {
@@ -247,6 +284,8 @@ pub fn disconnect(state: &mut State) {
                 provider_host: sync.provider_host,
                 imported_providers: sync.imported_providers,
                 imported_ollama: sync.imported_ollama,
+                device_rules: sync.device_rules,
+                admitted_records: sync.admitted_records,
             },
         );
     }
@@ -268,6 +307,8 @@ pub fn reconnect(state: &mut State, identity: Identity) -> SyncState {
         sync.provider_host = previous.provider_host;
         sync.imported_providers = previous.imported_providers;
         sync.imported_ollama = previous.imported_ollama;
+        sync.device_rules = previous.device_rules;
+        sync.admitted_records = previous.admitted_records;
     }
     sync
 }
@@ -280,6 +321,8 @@ impl SyncState {
             identity,
             switches: Switches::default(),
             links: vec![],
+            device_rules: Default::default(),
+            admitted_records: None,
             chats: BTreeMap::new(),
             projects: BTreeMap::new(),
             remote_projects: BTreeMap::new(),
@@ -306,6 +349,84 @@ impl SyncState {
         if self.activity.len() > 100 {
             self.activity.remove(0);
         }
+    }
+
+    pub(crate) fn set_device_rule(&mut self, device: &str, key: &str, on: bool, baseline: BTreeSet<String>) -> Result<()> {
+        let mut rules = self.device_rules.get(device).cloned().unwrap_or_default();
+        if key == "sync" {
+            rules.paused = !on;
+        } else {
+            let (items, label) = if let Some(id) = key.strip_prefix("project:") {
+                anyhow::ensure!(crate::projects::valid_sync_id(id), "Use a valid project ID");
+                (&mut rules.blocked_projects, project_sync::resolved(&self.project_aliases, id))
+            } else {
+                anyhow::ensure!(matches!(key, "projects" | "conversations" | "settings" | "skills" | "memories" | "providers"), "Unknown sync category");
+                (&mut rules.blocked, key)
+            };
+            if on { items.remove(label); } else { items.insert(label.to_owned()); }
+        }
+        if rules == DeviceRules::default() {
+            self.device_rules.remove(device);
+        } else {
+            self.admitted_records.get_or_insert(baseline);
+            self.device_rules.insert(device.to_owned(), rules);
+        }
+        self.wanted = Some(Want::Now);
+        Ok(())
+    }
+
+    pub(crate) fn source_paused(&self, device: &str) -> bool {
+        self.device_rules.get(device).is_some_and(|r| r.paused)
+    }
+
+    fn incoming(&mut self, space: &Space) -> Option<Space> {
+        if self.device_rules.is_empty() {
+            self.admitted_records = None;
+            return None;
+        }
+        let admitted = self.admitted_records.get_or_insert_with(BTreeSet::new);
+        let mut projects = BTreeMap::new();
+        // A chat or memory tombstone has no value. Look up its project from its previous records.
+        for (id, envelope) in &space.store.records {
+            if matches!(envelope.kind, Kind::Chat | Kind::Memory)
+                && let Some(body) = space.store.bodies.get(id)
+                && !body.deleted
+                && projects.get(&envelope.item).is_none_or(|(clock, _)| *clock < &envelope.clock)
+            {
+                projects.insert(&envelope.item, (&envelope.clock, body.value["project"].as_str()));
+            }
+        }
+        for (id, envelope) in &space.store.records {
+            let Some(body) = space.store.bodies.get(id) else { continue };
+            if admitted.contains(id) { continue; }
+            let project = match envelope.kind {
+                Kind::Project => Some(body.id.as_str()),
+                Kind::Chat | Kind::Memory if body.deleted => projects.get(&envelope.item).and_then(|(_, p)| *p),
+                Kind::Chat | Kind::Memory => body.value["project"].as_str(),
+                Kind::Settings => ["project-sharing:", "project-deleted:", "project-alias:"]
+                    .into_iter().find_map(|prefix| body.id.strip_prefix(prefix)),
+                _ => None,
+            };
+            if self.device_rules.get(&envelope.device).is_none_or(|rules|
+                rules.allows(envelope.kind, body, project, &self.project_aliases)) {
+                admitted.insert(id.clone());
+            }
+        }
+        if space.store.bodies.keys().all(|id| admitted.contains(id)) {
+            return None;
+        }
+        Some(Space {
+            id: space.id.clone(),
+            store: super::core::Store {
+                records: space.store.records.iter().filter(|(id, _)| admitted.contains(*id))
+                    .map(|(id, record)| (id.clone(), record.clone())).collect(),
+                bodies: space.store.bodies.iter().filter(|(id, _)| admitted.contains(*id))
+                    .map(|(id, body)| (id.clone(), body.clone())).collect(),
+                last: space.store.last.clone(),
+                waiting: Default::default(),
+            },
+            dir: None,
+        })
     }
 
     /// Whether a project's conversations sync (the project wins over the global switch).
@@ -336,7 +457,7 @@ fn fingerprint(v: &Value) -> String {
 }
 
 /// Preference fields that stay with one device.
-const LOCAL_PREFS: [&str; 11] = [
+const LOCAL_PREFS: [&str; 14] = [
     "browser_path",
     "browser_mode",
     "disabled_browsers",
@@ -344,7 +465,10 @@ const LOCAL_PREFS: [&str; 11] = [
     "zoom",
     "compact_sidebar",
     "text_size",
+    "nerd_stats",
+    "over_18",
     "background",
+    "start_on_sign_in",
     // Addresses and folders: "localhost" or C:\ on one device means something else on another.
     "ollama",
     "ollama_on",
@@ -530,7 +654,8 @@ fn project_value(project: &crate::projects::Project, settings: &ProjectSync, hom
 
 /// Publish what changed on this device.
 pub fn export(state: &mut State, space: &mut Space) -> Result<usize> {
-    project_sync::read_links(state, space);
+    let filtered = state.space.as_mut().and_then(|sync| sync.incoming(space));
+    project_sync::read_links(state, filtered.as_ref().unwrap_or(space));
     project_sync::normalize_bindings(state);
     let Some(mut sync) = state.space.take() else {
         return Ok(0);
@@ -578,7 +703,11 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
     }
     let device = me(sync);
     n += project_sync::publish(sync, space)?;
-    let policies = Policies::read(space);
+    let policies = if let Some(filtered) = sync.incoming(space) {
+        Policies::read(&filtered)
+    } else {
+        Policies::read(space)
+    };
     for p in sync.projects.values_mut() {
         p.paused = policies.paused(&p.id);
     }
@@ -817,12 +946,17 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
 
 /// Apply what other devices published.
 pub fn import(state: &mut State, space: &Space) -> Result<usize> {
+    let Some(sync) = state.space.as_mut() else { return Ok(0) };
+    let n = super::remote::import(sync, space)?;
+    let incoming = sync.incoming(space);
+    let space = incoming.as_ref().unwrap_or(space);
     project_sync::read_links(state, space);
     project_sync::normalize_bindings(state);
     let Some(mut sync) = state.space.take() else {
         return Ok(0);
     };
-    let r = import_with(state, &mut sync, space);
+    super::remote::deliver(state,&mut sync);
+    let r = import_with(state, &mut sync, space).map(|count| n + count);
     state.space = Some(sync);
     r
 }
@@ -833,8 +967,7 @@ fn applied(sync: &mut SyncState, key: String, v: &Value) -> bool {
 }
 
 fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result<usize> {
-    let mut n = super::remote::import(sync,space)?;
-    super::remote::deliver(state,sync);
+    let mut n = 0;
     let device = me(sync);
     let names: BTreeMap<String, String> = space
         .members()
@@ -1521,6 +1654,37 @@ mod tests {
     fn say(state: &mut State, role: &str, text: &str) {
         state.history.push(Message::new(role, text));
         state.thread.title = "Chat".into();
+    }
+
+    #[tokio::test]
+    async fn pausing_a_device_keeps_prior_changes_and_holds_new_ones() -> Result<()> {
+        let transports = [(0, Transport::Memory(Hub::default()))];
+        let mut desktop = Space::create("Desktop", None)?;
+        let mut phone = joined(&mut desktop, "Phone");
+        let mut sender = device_state(&desktop);
+        let mut receiver = device_state(&phone);
+        let device = desktop.id.device.id.clone();
+        sender.skills.insert("tidy".into(), "Initial".into());
+        round(&mut sender, &mut desktop, &transports, true).await?;
+        round(&mut receiver, &mut phone, &transports, true).await?;
+        assert_eq!(receiver.skills.get("tidy").map(String::as_str), Some("Initial"));
+        let baseline = phone.store.bodies.keys().cloned().collect();
+        receiver.space.as_mut().unwrap().set_device_rule(&device, "sync", false, baseline)?;
+        sender.skills.insert("tidy".into(), "Updated".into());
+        sender.skills.insert("new-skill".into(), "New".into());
+        round(&mut sender, &mut desktop, &transports, true).await?;
+        round(&mut receiver, &mut phone, &transports, true).await?;
+        assert_eq!(receiver.skills.get("tidy").map(String::as_str), Some("Initial"));
+        assert!(!receiver.skills.contains_key("new-skill"));
+        receiver.space.as_mut().unwrap().set_device_rule(&device, "skills", false, Default::default())?;
+        receiver.space.as_mut().unwrap().set_device_rule(&device, "sync", true, Default::default())?;
+        round(&mut receiver, &mut phone, &transports, true).await?;
+        assert!(!receiver.skills.contains_key("new-skill"));
+        receiver.space.as_mut().unwrap().set_device_rule(&device, "skills", true, Default::default())?;
+        round(&mut receiver, &mut phone, &transports, true).await?;
+        assert_eq!(receiver.skills.get("tidy").map(String::as_str), Some("Updated"));
+        assert!(receiver.skills.contains_key("new-skill"));
+        Ok(())
     }
 
     #[tokio::test]

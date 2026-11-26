@@ -1076,6 +1076,14 @@ mod tests {
             snapshot(link.perform(Action::READ).await.unwrap())["title"],
             "Spindle browser fixture"
         );
+        let fixture = std::path::PathBuf::from(std::env::var_os("SPINDLE_BROWSER_FIXTURE_ROOT").unwrap());
+        std::fs::write(fixture.join("ready-for-escape"), b"").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !link.ended() {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }).await.expect("Escape disconnected the tab");
+        assert!(link.perform(Action::READ).await.is_err());
         link.close();
     }
 

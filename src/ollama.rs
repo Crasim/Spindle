@@ -27,16 +27,18 @@ pub(crate) fn enabled() -> bool {
 }
 
 fn set_endpoint(url: &str) {
+    let url = base_url(url);
+    if let Ok(mut c) = CHOSEN.write() && *c != url {
+        *c = url;
+    }
+}
+
+fn base_url(url: &str) -> String {
     let url = url.trim().trim_end_matches('/');
-    let url = if url.is_empty() || url.starts_with("http") {
+    if url.is_empty() || url.starts_with("http://") || url.starts_with("https://") {
         url.to_owned()
     } else {
         format!("http://{url}")
-    };
-    if let Ok(mut c) = CHOSEN.write()
-        && *c != url
-    {
-        *c = url;
     }
 }
 
@@ -46,11 +48,120 @@ pub(crate) fn endpoint() -> String {
     {
         return c.clone();
     }
+    default_endpoint()
+}
+
+fn default_endpoint() -> String {
     std::env::var("SPINDLE_OLLAMA")
         .ok()
         .filter(|u| u.starts_with("http"))
         .map(|u| u.trim_end_matches('/').to_owned())
         .unwrap_or_else(|| "http://127.0.0.1:11434".into())
+}
+
+static KEYS: std::sync::LazyLock<Mutex<HashMap<String, Option<String>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn credential(base: &str) -> String {
+    let hash = ring::digest::digest(&ring::digest::SHA256, base.as_bytes());
+    format!("ollama-{}", crate::sync::core::hex(hash.as_ref()))
+}
+
+#[cfg(not(any(windows, target_os = "android")))]
+fn key_path(target: &str) -> std::path::PathBuf {
+    crate::runtime::data_dir().join("credentials").join(target)
+}
+
+fn load_key(target: &str) -> Result<Option<String>> {
+    #[cfg(windows)]
+    return match keyring::Entry::new("Spindle", target)?.get_password() {
+        Ok(key) => Ok(Some(key)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(error).context("Read Ollama key in Windows Credential Manager"),
+    };
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "android")]
+        let path = crate::oauth::android_key_path(target)?;
+        #[cfg(not(target_os = "android"))]
+        let path = key_path(target);
+        if !path.try_exists()? {
+            return Ok(None);
+        }
+        #[cfg(target_os = "android")]
+        return crate::oauth::android_key(target).map(Some);
+        #[cfg(not(target_os = "android"))]
+        Ok(Some(String::from_utf8(crate::vault::local(&std::fs::read(path)?, false)?)?))
+    }
+}
+
+pub(crate) fn store_key(address: &str, key: &str) -> Result<()> {
+    let base = base_url(address);
+    let base = if base.is_empty() { default_endpoint() } else { base };
+    let url = reqwest::Url::parse(&base).context("Enter an Ollama server address")?;
+    ensure!(matches!(url.scheme(), "http" | "https") && url.has_host() && url.username().is_empty()
+        && url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
+        "Enter a server URL without credentials, a query, or a fragment");
+    ensure!(key.len() <= 4096 && key.bytes().all(|b| b.is_ascii_graphic()), "Invalid Ollama API key");
+    let target = credential(&base);
+    let mut keys = KEYS.lock().unwrap();
+    #[cfg(windows)]
+    {
+        let entry = keyring::Entry::new("Spindle", &target)?;
+        if key.is_empty() {
+            match entry.delete_credential() {
+                Ok(()) | Err(keyring::Error::NoEntry) => (),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            entry.set_password(key).context("Save Ollama key in Windows Credential Manager")?;
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "android")]
+        let path = crate::oauth::android_key_path(&target)?;
+        #[cfg(not(target_os = "android"))]
+        let path = key_path(&target);
+        if key.is_empty() {
+            match std::fs::remove_file(path) {
+                Ok(()) => (),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            #[cfg(target_os = "android")]
+            crate::oauth::store_android_key(&target, key)?;
+            #[cfg(not(target_os = "android"))]
+            {
+                std::fs::create_dir_all(path.parent().context("No credential directory")?)?;
+                let protected = crate::vault::local(key.as_bytes(), true)?;
+                crate::tools::write_generated(&path, &protected, true)?;
+            }
+        }
+    }
+    keys.insert(base, (!key.is_empty()).then(|| key.to_owned()));
+    Ok(())
+}
+
+pub(crate) fn request(client: &Client, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
+    request_for(client, method, &endpoint(), path)
+}
+
+fn request_for(client: &Client, method: reqwest::Method, base: &str, path: &str) -> Result<reqwest::RequestBuilder> {
+    let request = client.request(method, format!("{base}/api/{path}"));
+    let mut keys = KEYS.lock().unwrap();
+    let key = match keys.entry(base.to_owned()) {
+        std::collections::hash_map::Entry::Occupied(key) => key.into_mut(),
+        std::collections::hash_map::Entry::Vacant(key) => {
+            let found = load_key(&credential(key.key()))?;
+            key.insert(found)
+        }
+    };
+    match key {
+        Some(secret) => Ok(request.bearer_auth(secret.as_str())),
+        None => Ok(request),
+    }
 }
 
 /// SPINDLE_SAMPLING=default leaves small models at their own sampling settings, for comparing.
@@ -247,6 +358,20 @@ pub fn think_info(show: &Value) -> Option<ThinkInfo> {
 mod tests {
     use super::*;
     #[test]
+    fn ollama_key_applies_only_to_its_server() {
+        let first = "http://127.0.0.1:61001";
+        let second = "http://127.0.0.1:61002";
+        KEYS.lock().unwrap().extend([(first.to_owned(), Some("test-key".into())), (second.to_owned(), None)]);
+        let client = Client::new();
+        for (base, expected) in [(first, Some("Bearer test-key")), (second, None)] {
+            let req = request_for(&client, reqwest::Method::GET, base, "tags").unwrap().build().unwrap();
+            assert_eq!(req.headers().get(reqwest::header::AUTHORIZATION).and_then(|value| value.to_str().ok()), expected);
+        }
+        let mut keys = KEYS.lock().unwrap();
+        keys.remove(first);
+        keys.remove(second);
+    }
+    #[test]
     fn thinking_levels_come_from_show() {
         let gpt =
             think_info(&json!({"thinking":{"values":["low","medium","high"],"default":"medium"}}))
@@ -304,9 +429,7 @@ impl Ollama {
         struct Tags {
             models: Vec<Tag>,
         }
-        let tags: Tags = self
-            .0
-            .get(format!("{}/api/tags", endpoint()))
+        let tags: Tags = request(&self.0, reqwest::Method::GET, "tags")?
             .send()
             .await
             .with_context(|| format!("Cannot reach Ollama at {}", endpoint()))?
@@ -365,8 +488,7 @@ impl Ollama {
         }
         let tag = crate::providers::route(id).1;
         let result = async {
-            self.0
-                .post(format!("{}/api/show", endpoint()))
+            request(&self.0, reqwest::Method::POST, "show").ok()?
                 .timeout(Duration::from_secs(2))
                 .json(&json!({"model": tag}))
                 .send()
@@ -527,9 +649,7 @@ impl Ollama {
         }
         let preview_start = self.1.as_ref().map_or(0, |p| p.borrow().len());
         'attempt: loop {
-            let mut response = self
-                .0
-                .post(format!("{}/api/chat", endpoint()))
+            let mut response = request(&self.0, reqwest::Method::POST, "chat")?
                 .timeout(Duration::from_secs(3600))
                 .json(&body)
                 .send()

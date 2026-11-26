@@ -168,7 +168,7 @@ pub fn unavailable(state: &State) -> String {
     }
 }
 
-pub(crate) fn spec(runtime: &crate::runtime::Runtime, work: PathBuf, call: &Call) -> Result<Spec> {
+pub(crate) fn spec(runtime: &crate::runtime::Runtime, work: PathBuf, call: &Call, replace: bool) -> Result<Spec> {
     let (args, seconds) = match call {
         Call::Test { path } => {
             let start = path.clone().unwrap_or_else(|| ".".into());
@@ -195,7 +195,9 @@ pub(crate) fn spec(runtime: &crate::runtime::Runtime, work: PathBuf, call: &Call
                 ensure!(code.len() <= 512 * 1024, "Inline code is limited to 512 KB");
                 let (path, inside) = crate::tools::resolve(&work, file)?;
                 ensure!(inside, "Scripts must be inside the working folder");
-                std::fs::write(path, code)?;
+                if std::fs::read(&path).ok().as_deref() != Some(code.as_bytes()) {
+                    crate::tools::write_generated(&path, code.as_bytes(), replace)?;
+                }
             }
             let args = args.clone().unwrap_or_default();
             ensure!(
@@ -265,7 +267,7 @@ impl Engine {
         }
         let runtime = crate::runtime::installed().context("Spindle's Python isn't installed")?;
         let work = p.root.clone();
-        let spec = spec(&runtime, work.clone(), &p.call.call)?;
+        let spec = spec(&runtime, work.clone(), &p.call.call, p.confirmed_change())?;
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
         self.jobs.running = Some(p.call.call.summary());
@@ -589,7 +591,7 @@ impl Engine {
                 Call::WebOpen { url, start, diagnostics } => {
                     open_public(url, start, diagnostics, block_web, &browser_path, cancel).await
                 }
-                Call::BrowserTab(operation) if pending.approved && pending.risk == crate::policy::Risk::Browser => {
+                Call::BrowserTab(operation) if pending.approved && (pending.risk == crate::policy::Risk::Browser || pending.confirmed_change()) => {
                     match (tab_block, tab) {
                         (Some(reason), _) => Err(anyhow::anyhow!("{reason}")),
                         (_, Some(link)) => link.perform(operation).await,
@@ -879,7 +881,7 @@ impl Engine {
                     if let Some(dir) = p.target.parent() {
                         std::fs::create_dir_all(dir)?;
                     }
-                    std::fs::write(&p.target, &image.png)?;
+                    crate::tools::write_generated(&p.target, &image.png, p.confirmed_change())?;
                     Ok(image)
                 });
                 let (text, note, ok) = match saved {
@@ -949,7 +951,7 @@ impl Engine {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let (text, note, ok) = match result {
-                    Ok(Heard::Spoken(wav)) => match std::fs::write(&p.target, &wav) {
+                    Ok(Heard::Spoken(wav)) => match crate::tools::write_generated(&p.target, &wav, p.confirmed_change()) {
                         Ok(()) => {
                             if p.project.is_none() {
                                 crate::engine::produced(

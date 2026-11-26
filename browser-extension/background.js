@@ -6,6 +6,23 @@ let located = null;
 const clientId = crypto.randomUUID().replaceAll("-", "");
 const browser = /Edg\//.test(navigator.userAgent) ? "edge" : "chrome";
 const browserPermissions = { permissions: ["tabs"] };
+const revokedKey = tabId => `revoked:${tabId}`;
+
+async function isRevoked(tabId) {
+  const key = revokedKey(tabId);
+  return Boolean((await chrome.storage.session.get(key))[key]);
+}
+
+async function groupTab(tab) {
+  if (tab.pinned || tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) return;
+  const [group] = await chrome.tabGroups.query({windowId: tab.windowId, title: "Spindle"});
+  if (group) {
+    await chrome.tabs.group({tabIds: tab.id, groupId: group.id});
+  } else {
+    const groupId = await chrome.tabs.group({tabIds: tab.id});
+    await chrome.tabGroups.update(groupId, {title: "Spindle", color: "green"});
+  }
+}
 
 async function activeTab() {
   const window = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
@@ -77,6 +94,10 @@ function startNative() {
       let error;
       try {
         if (enabled) tab = await requestedTab(message.page);
+        if (tab && await isRevoked(tab.id)) {
+          tab = null;
+          error = "You disconnected this tab. To use it again, open Browser Link in that tab and choose Allow this tab again.";
+        }
       } catch (problem) { error = problem.message; }
       if (port !== nativePort) return;
       if (!tab) {
@@ -84,7 +105,7 @@ function startNative() {
         return;
       }
       const page = new URL(tab.url);
-      current = { tabId: tab.id, origin: page.origin, ready: false };
+      current = { tabId: tab.id, origin: page.origin, ready: false, nonce: crypto.randomUUID() };
       port.postMessage({ tab: page.origin + page.pathname });
     } else if (message.packet && current) {
       await receivePacket(current, message.packet);
@@ -116,12 +137,27 @@ chrome.permissions.onRemoved.addListener(() => {
 startNative();
 
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
+  if (message.kind === "revoke-tab" && sender.id === chrome.runtime.id && sender.frameId === 0
+      && current?.tabId === sender.tab?.id && current.nonce === message.nonce) {
+    const tabId = current.tabId;
+    chrome.storage.session.set({[revokedKey(tabId)]: true}).then(() => {
+      if (current?.tabId === tabId) stop();
+    }).catch(() => { if (current?.tabId === tabId) stop(); });
+    return;
+  }
   if (sender.url !== chrome.runtime.getURL("popup.html")) return;
   if (message.kind === "status") {
     startNative();
-    chrome.permissions.contains(browserPermissions).then(value => {
+    chrome.permissions.contains(browserPermissions).then(async value => {
       enabled = value;
-      respond(status());
+      respond(await popupStatus());
+    });
+    return true;
+  }
+  if (message.kind === "allow-tab") {
+    activeTab().then(async tab => {
+      if (tab) await chrome.storage.session.remove(revokedKey(tab.id));
+      respond(await popupStatus());
     });
     return true;
   }
@@ -146,6 +182,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  chrome.storage.session.remove(revokedKey(tabId)).catch(() => {});
   if (current?.tabId === tabId) stop();
 });
 
@@ -156,6 +193,7 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
   } else if (current.ready) {
     const location = new URL(change.url);
     current.rule = null;
+    clearActivity(current);
     sendPacket({ location: location.origin + location.pathname });
   }
 });
@@ -181,12 +219,24 @@ function status() {
     rules: current?.rules || [], requested: current?.requested, mode: current?.mode };
 }
 
+async function popupStatus() {
+  const tab = await activeTab();
+  return {...status(), revoked: Boolean(tab && await isRevoked(tab.id))};
+}
+
+function clearActivity(session) {
+  chrome.scripting.executeScript({target: {tabId: session.tabId}, func: nonce => {
+    if (globalThis.spindleTabActivity?.nonce === nonce) globalThis.spindleTabActivity.clear();
+  }, args: [session.nonce]}).catch(() => {});
+}
+
 function clearTab() {
   const old = current;
   current = undefined;
   if (old) {
+    clearActivity(old);
     chrome.action.setBadgeText({ tabId: old.tabId, text: "" }).catch(() => {});
-    chrome.runtime.sendMessage({ kind: "update", status: status() }).catch(() => {});
+    popupStatus().then(status => chrome.runtime.sendMessage({kind: "update", status})).catch(() => {});
   }
 }
 
@@ -206,6 +256,7 @@ async function receivePacket(session, message) {
     session.mode = message.mode;
     session.ready = true;
     if (session.rule) session.requested = false;
+    else clearActivity(session);
     chrome.action.setBadgeText({ tabId: session.tabId, text: session.rule ? "ON" : "OFF" }).catch(() => {});
     chrome.runtime.sendMessage({ kind: "update", status: status() }).catch(() => {});
     return;
@@ -214,7 +265,7 @@ async function receivePacket(session, message) {
   try {
     const tab = await chrome.tabs.get(session.tabId);
     const requested = message.operation?.action === "read" && message.operation.url ? new URL(message.operation.url) : null;
-    if (current !== session || !allowed(tab.url, session.rule) ||
+    if (await isRevoked(tab.id) || current !== session || !allowed(tab.url, session.rule) ||
         (requested && (new URL(tab.url).origin !== requested.origin || new URL(tab.url).pathname !== requested.pathname
           || (requested.search && new URL(tab.url).search !== requested.search))) ||
         (session.mode === "blocklist" && session.rules.some(rule => allowed(tab.url, rule)))) {
@@ -223,16 +274,17 @@ async function receivePacket(session, message) {
     const [response] = await chrome.scripting.executeScript({
       target: { tabId: session.tabId },
       func: operate,
-      args: [message.operation, session.rule, session.mode === "blocklist" ? session.rules : []]
+      args: [message.operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce]
     });
     reply = response?.result || { error: "The tab did not return a result." };
+    if (reply.result && current === session) await groupTab(tab).catch(() => {});
   } catch {
     reply = { error: "The browser could not access this page. If your browser restricts the extension on this site, open its extension menu and allow Browser Link on this site, then retry here." };
   }
   if (current === session) sendPacket({ id: message.id, ...reply });
 }
 
-function operate(operation, rule, blocked) {
+function operate(operation, rule, blocked, sessionNonce) {
   const site = new URL(rule);
   const prefix = site.pathname.replace(/\/+$/, "");
   const matches = (url, site, prefix) => url.origin === site.origin && !url.username && !url.password &&
@@ -242,6 +294,9 @@ function operate(operation, rule, blocked) {
     return matches(url, denied, denied.pathname.replace(/\/+$/, ""));
   });
   if (!allowedPath(location)) return { error: "The tab left the allowlisted URL." };
+  if (globalThis.spindleTabActivity?.revoked && globalThis.spindleTabActivity.nonce === sessionNonce) {
+    return {error: "You disconnected this tab. Open Browser Link and choose Allow this tab again to reconnect."};
+  }
   if (operation.action === "read" && operation.url) {
     const requested = new URL(operation.url);
     if (location.origin !== requested.origin || location.pathname !== requested.pathname ||
@@ -251,6 +306,60 @@ function operate(operation, rule, blocked) {
   }
   // This state lives in the extension's isolated world for this document.
   const cache = globalThis.spindleTabTargets ||= new Map();
+  let activity = globalThis.spindleTabActivity;
+  if (activity?.nonce !== sessionNonce) {
+    activity?.clear();
+    const host = document.createElement("spindle-browser-activity");
+    host.style.cssText = "all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important";
+    const shadow = host.attachShadow({mode: "closed"});
+    const style = document.createElement("style");
+    style.textContent = `
+      :host { box-shadow: inset 0 0 0 2px #54c788, inset 0 0 18px #54c78860 !important }
+      div { position: absolute; right: 16px; top: 16px; background: #12251c; color: #dcf8e6;
+        border: 1px solid #54c788; border-radius: 9px; padding: 8px 12px; font: 13px system-ui;
+        box-shadow: 0 3px 16px #0005; }
+      span { position: absolute; width: 16px; height: 21px; background: #54c788;
+        clip-path: polygon(0 0, 100% 65%, 60% 68%, 68% 100%, 46% 95%, 36% 69%, 0 92%); }
+    `;
+    const badge = document.createElement("div");
+    badge.setAttribute("role", "status");
+    const cursor = document.createElement("span");
+    cursor.hidden = true;
+    shadow.append(style, badge, cursor);
+    document.documentElement.append(host);
+    let timer;
+    const onKey = event => {
+      if (!event.isTrusted || event.key !== "Escape") return;
+      activity.revoked = true;
+      activity.clear();
+      cache.clear();
+      chrome.runtime.sendMessage({kind: "revoke-tab", nonce: sessionNonce}).catch(() => {});
+    };
+    window.addEventListener("keydown", onKey, {capture: true});
+    activity = globalThis.spindleTabActivity = {
+      nonce: sessionNonce,
+      clear() {
+        clearTimeout(timer);
+        host.remove();
+        window.removeEventListener("keydown", onKey, true);
+        if (!this.revoked && globalThis.spindleTabActivity === this) delete globalThis.spindleTabActivity;
+      },
+      show(element) {
+        if (element) {
+          const bounds = element.getBoundingClientRect();
+          cursor.style.left = `${bounds.left + bounds.width / 2}px`;
+          cursor.style.top = `${bounds.top + bounds.height / 2}px`;
+        }
+        cursor.hidden = !element;
+        badge.textContent = "Spindle is working · Esc to disconnect";
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+          badge.textContent = "Spindle connected · Esc to disconnect";
+          cursor.hidden = true;
+        }, 1250);
+      }
+    };
+  }
   const visible = element => Boolean(element.getClientRects().length) &&
     getComputedStyle(element).visibility === "visible" && !element.closest("[hidden],[inert]");
   const field = element => element instanceof HTMLTextAreaElement ||
@@ -268,6 +377,7 @@ function operate(operation, rule, blocked) {
     return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url : undefined;
   };
   if (operation.action === "read") {
+    activity.show();
     cache.clear();
     const nonce = Array.from(crypto.getRandomValues(new Uint32Array(2)), n => n.toString(16)).join("-");
     const controls = [];
@@ -320,6 +430,7 @@ function operate(operation, rule, blocked) {
   }
   cache.clear();
   const element = target.element;
+  activity.show(element);
   if (operation.action === "fill") {
     if (!field(element) || element.readOnly || typeof operation.text !== "string" || operation.text.length > 4000) {
       return { error: "This field cannot be filled." };

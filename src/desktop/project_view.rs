@@ -334,20 +334,21 @@ impl Desktop {
         ui.add_space(12.);
         ui.heading("Project library");
         let mut new_chat = None;
+        let mut project_home = None;
         for p in screen.recent.clone() {
-            ui.horizontal_wrapped(|ui| {
-                symbol(ui, Icon::Folder, muted());
-                ui.label(p.name);
-                ui.label(Text::new(display_path(&p.path)).color(muted()).size(12.));
-                if p.path != self.root
-                    && ui
-                        .button("New chat")
-                        .on_hover_text("Start a conversation in this project")
-                        .clicked()
-                {
-                    new_chat = Some(p.path.clone());
-                }
+            egui::Frame::new().fill(panel()).inner_margin(14).corner_radius(10).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    symbol(ui, Icon::Folder, accent());
+                    ui.label(Text::new(&p.name).strong());
+                });
+                ui.weak(display_path(&p.path));
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Open project").clicked() { project_home = Some(p.path.clone()); }
+                    if ui.button("New chat").clicked() { new_chat = Some(p.path.clone()); }
+                });
             });
+            ui.add_space(8.);
         }
         if screen.recent.is_empty() {
             ui.label(
@@ -356,7 +357,8 @@ impl Desktop {
         }
         if let Some(path) = new_chat {
             self.new_chat_in(&path);
-            return;
+        } else if let Some(path) = project_home {
+            self.open_project(&path);
         }
     }
 }

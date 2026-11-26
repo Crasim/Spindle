@@ -112,6 +112,12 @@ pub struct Pending {
     pub preview: String,
 }
 
+impl Pending {
+    pub(crate) fn confirmed_change(&self) -> bool {
+        self.risk == crate::policy::Risk::Destructive && self.approved && self.reason == "Allowed once by you"
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActionRecord {
     pub id: u64,
@@ -334,6 +340,10 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
     pub enter_sends: bool,
+    #[serde(default)]
+    pub nerd_stats: bool,
+    #[serde(default)]
+    pub over_18: bool,
     pub text_size: u8,
     /// Interface zoom in percent, changed with Ctrl+Scroll or Ctrl+Plus/Minus.
     #[serde(default = "default_zoom")]
@@ -418,6 +428,8 @@ pub struct Preferences {
     /// Run in the background (starts at sign-in; closing the window hides it to the tray).
     #[serde(default)]
     pub background: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_on_sign_in: Option<bool>,
     /// Who speaks: "" for the OpenAI-style server above (Ollama by default), "fish" for
     /// Fish Audio.
     #[serde(default)]
@@ -447,6 +459,8 @@ impl Default for Preferences {
             compact_sidebar: false,
             sidebar_width: None,
             enter_sends: true,
+            nerd_stats: false,
+            over_18: false,
             text_size: 16,
             zoom: 100,
             accent: Default::default(),
@@ -477,6 +491,7 @@ impl Default for Preferences {
             stt_model: String::new(),
             read_aloud: false,
             background: false,
+            start_on_sign_in: None,
             tts_provider: String::new(),
             stt_provider: String::new(),
             fish_key: String::new(),
@@ -639,6 +654,9 @@ impl ThreadInfo {
 
 pub const APK_SKILL_NAME: &str = "android-apk";
 pub const APK_SKILL: &str = include_str!("../skills/android-apk/SKILL.md");
+pub const BROWSER_SKILL_NAME: &str = "browser-use";
+pub const BROWSER_SKILL: &str = include_str!("../skills/browser-use/SKILL.md");
+pub const BUILTIN_SKILLS: [(&str, &str); 2] = [(APK_SKILL_NAME, APK_SKILL), (BROWSER_SKILL_NAME, BROWSER_SKILL)];
 
 impl State {
     pub(crate) fn current_plan(&self, chat: u64) -> Option<(u64, String)> {
@@ -667,14 +685,12 @@ impl State {
         self.skills
             .get(name)
             .map(String::as_str)
-            .or_else(|| (name == APK_SKILL_NAME).then_some(APK_SKILL))
+            .or_else(|| BUILTIN_SKILLS.iter().find(|(key, _)| *key == name).map(|(_, text)| *text))
     }
 
     pub fn skill_catalog(&self, limit: usize) -> String {
-        std::iter::once(APK_SKILL_NAME)
-            .chain(
-                self.skills.keys().map(String::as_str).filter(|name| *name != APK_SKILL_NAME),
-            )
+        BUILTIN_SKILLS.iter().map(|(name, _)| *name)
+            .chain(self.skills.keys().map(String::as_str).filter(|name| !BUILTIN_SKILLS.iter().any(|(key, _)| key == name)))
             .take(limit)
             .filter_map(|name| {
                 let definition = self.skill_definition(name)?;

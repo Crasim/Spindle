@@ -1433,7 +1433,7 @@ fn cap(mut text: String) -> String {
 }
 
 /// Run a call that the broker has allowed. `path` is the resolved target from `classify`.
-pub fn run(root: &Path, call: &Call, path: &Path) -> Result<String> {
+pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<String> {
     let out = match call {
         Call::List { .. } => {
             ensure!(path.is_dir(), "{} is not a folder", rel(root, path));
@@ -1611,13 +1611,11 @@ pub fn run(root: &Path, call: &Call, path: &Path) -> Result<String> {
                 content.len() <= 512 * 1024,
                 "Files created by a tool are limited to 512 KB"
             );
-            // Writing a whole file again replaces it: small models often rewrite instead of
-            // patching, and refusing only makes them loop.
             let existed = path.is_file();
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_atomic(path, content.as_bytes())?;
+            write_generated(path, content.as_bytes(), replace_file)?;
             format!(
                 "{} {} · hash {}",
                 if existed { "Replaced" } else { "Created" },
@@ -1828,12 +1826,21 @@ fn locate(
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_generated(path, bytes, true)
+}
+
+pub(crate) fn write_generated(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     use std::io::Write;
     let dir = path.parent().context("No parent folder")?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
-    tmp.persist(path).map_err(|e| e.error)?;
+    if replace {
+        tmp.persist(path).map_err(|e| e.error)?;
+    } else {
+        tmp.persist_noclobber(path).map_err(|e| e.error)
+            .context("The output already exists. Choose a new filename or ask to confirm replacement")?;
+    }
     Ok(())
 }
 
@@ -2094,7 +2101,7 @@ mod tests {
         };
         let (risk, path) = classify(&root, &read, false).unwrap();
         assert_eq!(risk, Risk::Read);
-        let out = run(&root, &read, &path).unwrap();
+        let out = run(&root, &read, &path, false).unwrap();
         assert!(out.contains("    2      return x < 10"), "{out}");
         let h = hash(b"def f(x):\n    return x < 10\n");
         assert!(out.contains(&h));
@@ -2104,7 +2111,7 @@ mod tests {
             replace: "<=".into(),
             hash: "000000000000".into(),
         };
-        assert!(run(&root, &stale, &path).is_err());
+        assert!(run(&root, &stale, &path, false).is_err());
         let patch = Call::Patch {
             path: "src/a.py".into(),
             find: "x < 10".into(),
@@ -2113,14 +2120,14 @@ mod tests {
         };
         let (risk, _) = classify(&root, &patch, false).unwrap();
         assert_eq!(risk, Risk::Write);
-        run(&root, &patch, &path).unwrap();
+        run(&root, &patch, &path, false).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("x <= 10"));
         let search = Call::Search {
             query: "<= 10".into(),
             path: None,
         };
         let (_, p) = classify(&root, &search, false).unwrap();
-        assert!(run(&root, &search, &p).unwrap().contains("src/a.py:2:"));
+        assert!(run(&root, &search, &p, false).unwrap().contains("src/a.py:2:"));
         // Leaving the project by .. or an absolute path is classified as outside.
         let escape = Call::Create {
             path: "../evil.txt".into(),
@@ -2142,7 +2149,7 @@ mod tests {
         };
         let (risk, p) = classify(&root, &create, false).unwrap();
         assert_eq!(risk, Risk::Write);
-        run(&root, &create, &p).unwrap();
+        run(&root, &create, &p, false).unwrap();
         let other = Call::Create {
             path: "docs/new.md".into(),
             content: "different\n".into(),
@@ -2151,21 +2158,20 @@ mod tests {
             classify(&root, &other, false).is_err(),
             "outside the sandbox, create never replaces a file"
         );
-        // In the sandbox copy (or a chat's own folder) it replaces the file.
+        // Replacing a file in a chat's working copy needs one-time approval.
         let first = Call::Create {
             path: "docs/scratch.md".into(),
             content: "a\n".into(),
         };
-        run(&root, &first, &classify(&root, &first, true).unwrap().1).unwrap();
+        run(&root, &first, &classify(&root, &first, true).unwrap().1, false).unwrap();
         let again = Call::Create {
             path: "docs/scratch.md".into(),
             content: "b\n".into(),
         };
-        assert!(
-            run(&root, &again, &classify(&root, &again, true).unwrap().1)
-                .unwrap()
-                .starts_with("Replaced docs/scratch.md")
-        );
+        let target = classify(&root, &again, true).unwrap().1;
+        assert!(run(&root, &again, &target, false).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "a\n");
+        assert!(run(&root, &again, &target, true).unwrap().starts_with("Replaced docs/scratch.md"));
         assert!(
             classify(
                 &root,
@@ -2214,7 +2220,7 @@ mod tests {
                 .contains("You sent:")
         );
         assert!(
-            run(&root, &create, &p)
+            run(&root, &create, &p, false)
                 .unwrap()
                 .contains("already exists with exactly this content")
         );

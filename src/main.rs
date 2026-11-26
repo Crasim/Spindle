@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod artifacts;
 mod android_apk;
 mod automation;
@@ -528,6 +530,15 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(origin) = args.first().filter(|arg| arg.starts_with("chrome-extension://")) {
         return browser_native::host(origin);
+    }
+    #[cfg(all(windows, not(debug_assertions)))]
+    if std::env::var_os("SPINDLE_GUI_LAUNCH").is_none() && args.first().is_some_and(|first|
+        !matches!(first.as_str(), "serve" | "--run-due")
+            && (first != "service" || matches!(args.get(1).map(String::as_str), Some("install" | "uninstall" | "status" | "stop")))) {
+        // Command-line use from an existing console still has stdin, stdout and stderr.
+        // A direct desktop launch never allocates a console of its own.
+        use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+        unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
     }
     #[cfg(any(windows, target_os = "linux"))]
     if args.is_empty() {

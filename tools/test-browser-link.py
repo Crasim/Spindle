@@ -187,6 +187,7 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
         try:
             deadline = time.monotonic() + (155 if model else 65)
             requested = False
+            escaped = False
             text = "Waiting for the native browser connection"
             while tester.poll() is None and time.monotonic() < deadline:
                 if popup:
@@ -197,6 +198,19 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                     if text.startswith("Blocked") and not requested:
                         cdp.call("Runtime.evaluate", {"expression": "document.querySelector('#request').click()"}, popup)
                         requested = True
+                    if not escaped and (folder / "ready-for-escape").exists():
+                        active = cdp.call("Runtime.evaluate", {
+                            "expression": "Boolean(document.querySelector('spindle-browser-activity'))",
+                        }, page)
+                        assert active["result"]["value"], "Missing activity indicator"
+                        groups = cdp.call("Runtime.evaluate", {
+                            "expression": "chrome.tabGroups.query({title:'Spindle'}).then(groups => groups.length)",
+                            "awaitPromise": True,
+                        }, popup)
+                        assert groups["result"]["value"] == 1, groups
+                        cdp.call("Input.dispatchKeyEvent", {"type": "keyDown", "key": "Escape", "code": "Escape", "windowsVirtualKeyCode": 27}, page)
+                        cdp.call("Input.dispatchKeyEvent", {"type": "keyUp", "key": "Escape", "code": "Escape", "windowsVirtualKeyCode": 27}, page)
+                        escaped = True
                 time.sleep(.25)
             if tester.poll() != 0:
                 raise RuntimeError("Browser Link status: " + text)
@@ -213,7 +227,13 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                     else:
                         print("Verified Spindle opened exactly one requested cart tab from a blank window.", flush=True)
             else:
-                print("Verified automatic connection, site approval, visible text, links, password exclusion, text entry, click and revocation in", Path(exe).name, flush=True)
+                assert escaped
+                revoked = cdp.call("Runtime.evaluate", {
+                    "expression": "chrome.runtime.sendMessage({kind:'status'}).then(status => status.revoked)",
+                    "awaitPromise": True,
+                }, popup)
+                assert revoked["result"]["value"], revoked
+                print("Verified access, cart contents, edit, Spindle tab group, activity indicator and Escape revocation in", Path(exe).name, flush=True)
         finally:
             if tester.poll() is None:
                 tester.terminate()

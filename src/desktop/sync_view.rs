@@ -5,7 +5,6 @@ use super::*;
 #[derive(Default)]
 pub(super) struct SyncForm {
     name: String,
-    folder: String,
     server: String,
     admin: String,
     user: String,
@@ -16,6 +15,7 @@ pub(super) struct SyncForm {
     join_password: String,
     confirm_remove: Option<String>,
     show_removed: bool,
+    manage_device: Option<String>,
     provider_host: Option<String>,
     pair_number: String,
     /// The projects folder being typed (None: show the saved one or the suggestion).
@@ -92,6 +92,48 @@ fn card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
             body(ui);
         });
     ui.add_space(12.);
+}
+
+fn device_icon(ui: &mut egui::Ui, os: &str) {
+    let (bounds, response) = ui.allocate_exact_size(egui::vec2(27., 27.), egui::Sense::hover());
+    let paint = ui.painter();
+    let at = |x: f32, y: f32| bounds.min + egui::vec2(x, y);
+    let rect = |left, top, right, bottom| egui::Rect::from_min_max(at(left, top), at(right, bottom));
+    let name = match os {
+        "windows" => {
+            for (x, y) in [(3., 3.), (14., 3.), (3., 14.), (14., 14.)] {
+                paint.rect_filled(rect(x, y, x + 9., y + 9.), 1., Color::from_rgb(63, 146, 235));
+            }
+            "Windows"
+        }
+        "linux" => {
+            let charcoal = Color::from_rgb(55, 61, 70);
+            paint.circle_filled(at(13., 15.), 10., charcoal);
+            paint.circle_filled(at(13., 8.), 7., charcoal);
+            paint.circle_filled(at(13., 17.), 6., Color::WHITE);
+            for x in [9., 17.] {
+                paint.circle_filled(at(x, 7.), 1.4, Color::WHITE);
+                paint.circle_filled(at(x, 23.), 2.5, Color::from_rgb(235, 173, 69));
+            }
+            paint.rect_filled(rect(10., 10., 16., 13.), 2., Color::from_rgb(235, 173, 69));
+            "Linux"
+        }
+        "android" => {
+            let green = Color::from_rgb(64, 174, 119);
+            paint.rect_filled(rect(3., 8., 24., 23.), 6., green);
+            for (from, to) in [(at(6., 5.), at(9., 10.)), (at(21., 5.), at(18., 10.))] {
+                paint.line_segment([from, to], egui::Stroke::new(1.6_f32, green));
+            }
+            for x in [9., 18.] { paint.circle_filled(at(x, 14.), 1.4, Color::WHITE); }
+            "Android"
+        }
+        _ => {
+            paint.rect_stroke(rect(4., 5., 23., 19.), 3., egui::Stroke::new(1.5_f32, muted()), egui::StrokeKind::Inside);
+            paint.line_segment([at(9., 23.), at(18., 23.)], egui::Stroke::new(1.5_f32, muted()));
+            if os == "macos" { "macOS" } else { "Device OS unknown" }
+        }
+    };
+    response.on_hover_text(name);
 }
 
 impl Desktop {
@@ -378,32 +420,63 @@ impl Desktop {
                 });
             }
         });
-        // Devices.
-        card(ui, "Devices", |ui| {
-            let devices = crate::sync::live::devices(&state);
-            if devices.iter().any(|(_, _, _, removed)| *removed) {
-                ui.checkbox(&mut f.show_removed, "Show removed devices");
-            }
-            for (id, name, me, removed) in devices {
-                if removed && !f.show_removed {
-                    continue;
-                }
+        ui.heading("Devices");
+        let devices = crate::sync::live::devices(&state);
+        if devices.iter().any(|(_, _, _, removed)| *removed) {
+            ui.checkbox(&mut f.show_removed, "Show removed devices");
+        }
+        for (id, name, me, removed) in devices {
+            if removed && !f.show_removed { continue; }
+            let os = if me { std::env::consts::OS } else { sync.remote.platforms.get(&id).map_or("", String::as_str) };
+            let rules = sync.device_rules.get(&id).cloned().unwrap_or_default();
+            let change = |option: &str, on| format!("/sync device-rule {}", serde_json::json!([id, option, on]));
+            card(ui, &name, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(Text::new(&name).strong());
+                    device_icon(ui, os);
                     if me {
-                        ui.weak("this device");
+                        ui.weak("This device");
                     }
                     if removed {
-                        ui.weak("removed");
+                        ui.weak("Removed");
                     }
-                    ui.weak(&id[..12]);
                     if !me && !removed {
-                        if let Some(os)=sync.remote.platforms.get(&id) {ui.weak(os);}
-                        let mut allowed=sync.remote.allowed.contains(&id);
-                        if ui.checkbox(&mut allowed,"Allow sandbox jobs from this device").changed() {
-                            send.push(format!("/remote {} {id}",if allowed {"allow"} else {"deny"}));
+                        let mut enabled = !rules.paused;
+                        if ui.checkbox(&mut enabled, "Receive sync").changed() {
+                            send.push(change("sync", enabled));
                         }
-                        if f.confirm_remove.as_deref() == Some(&id) {
+                        let open = f.manage_device.as_deref() == Some(id.as_str());
+                        if ui.button(if open { "Close" } else { "Manage" }).clicked() {
+                            f.manage_device = if open { None } else { Some(id.clone()) };
+                        }
+                    }
+                });
+                if !removed && !me && f.manage_device.as_deref() == Some(id.as_str()) {
+                    ui.separator();
+                    ui.weak("These permissions apply to incoming changes and work on this device.");
+                    ui.horizontal_wrapped(|ui| {
+                        for (key, label) in [("projects", "Project entries"), ("conversations", "Conversations"),
+                            ("settings", "Settings"), ("skills", "Skills"), ("memories", "Memories"),
+                            ("providers", "Providers")] {
+                            let mut enabled = !rules.blocked.contains(key);
+                            if ui.checkbox(&mut enabled, label).changed() { send.push(change(key, enabled)); }
+                        }
+                    });
+                    if !sync.projects.is_empty() {
+                        ui.label("Project permissions");
+                        for (path, project) in &sync.projects {
+                            if project.id.is_empty() { continue; }
+                            let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                            let mut enabled = !rules.blocked_projects.contains(&project.id);
+                            if ui.checkbox(&mut enabled, name).changed() { send.push(change(&format!("project:{}", project.id), enabled)); }
+                        }
+                    }
+                    let mut allowed = sync.remote.allowed.contains(&id);
+                    if ui.checkbox(&mut allowed, "Allow sandboxed jobs from this device").changed() {
+                        send.push(format!("/remote {} {id}", if allowed { "allow" } else { "deny" }));
+                    }
+                    ui.weak("Project file transfer, unsandboxed jobs, and remote Computer use are unavailable.");
+                    ui.horizontal_wrapped(|ui| {
+                        if f.confirm_remove.as_deref() == Some(id.as_str()) {
                             if ui
                                 .button(
                                     Text::new("Remove from sync")
@@ -420,10 +493,10 @@ impl Desktop {
                         } else if ui.small_button("Remove device").clicked() {
                             f.confirm_remove = Some(id.clone());
                         }
-                    }
-                });
-            }
-        });
+                    });
+                }
+            });
+        }
         // Adding a device.
         #[cfg(target_os = "android")]
         let alone = crate::sync::live::devices(&state).into_iter()
@@ -522,13 +595,16 @@ impl Desktop {
         });
         let f = &mut self.sync_form;
         // Where records go.
-        card(ui, "Your network, folders and servers", |ui| {
+        card(ui, "Network and servers", |ui| {
             ui.weak(if sync.switches.peers {
                 "Your devices on the same network find each other and sync directly: no server or folder needed. A folder or server also reaches devices that aren't on the network."
             } else {
                 "Syncing on your network is off (see What syncs)."
             });
             for (i, l) in sync.links.iter().enumerate() {
+                if matches!(&l.place, crate::sync::adapter::Place::Peer { device: Some(_), .. }) {
+                    continue;
+                }
                 ui.horizontal_wrapped(|ui| {
                     ui.label(match &l.place {
                         crate::sync::adapter::Place::Folder { path } => {
@@ -567,21 +643,6 @@ impl Desktop {
                         .unwrap_or_else(|| format!("port {p}"))
                 ));
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut f.folder)
-                        .id_salt("sync_view-field-11")
-                        .hint_text("A shared folder (OneDrive, Syncthing…)")
-                        .desired_width((ui.available_width().max(230.)).min(300.)),
-                );
-                if ui
-                    .add_enabled(!f.folder.trim().is_empty(), egui::Button::new("Add folder"))
-                    .clicked()
-                {
-                    send.push(format!("/sync folder {}", f.folder.trim()));
-                    f.folder.clear();
-                }
-            });
             ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut f.server)
@@ -639,6 +700,7 @@ impl Desktop {
         });
         // What syncs and when.
         card(ui, "What syncs", |ui| {
+            ui.weak("These defaults apply across projects on this device. Each project can override conversation and file sync.");
             let s = &sync.switches;
             let mut row = |ui: &mut egui::Ui, on: bool, name: &str, label: &str, hover: &str| {
                 let mut v = on;
@@ -709,15 +771,6 @@ impl Desktop {
                     send.push(format!("/sync provider-host {}", name.trim()));
                 }
             }
-            ui.separator();
-            let mut bg = self.view.state.preferences.background;
-            if ui
-                .checkbox(&mut bg, "Run Spindle in the background")
-                .on_hover_text("Keeps syncing and running schedules when the window is closed, and starts when you sign in. A tray icon opens Spindle or exits it.")
-                .changed()
-            {
-                send.push(if bg { "/service install".into() } else { "/service uninstall".into() });
-            }
         });
         // Per-project choices.
         let projects: Vec<std::path::PathBuf> = state
@@ -731,17 +784,17 @@ impl Desktop {
             .into_iter()
             .collect();
         if !projects.is_empty() || !sync.remote_projects.is_empty() {
-            card(ui, "Projects", |ui| {
-                ui.weak("A project's own choice wins over the defaults above.");
+            ui.heading("Projects");
+            ui.weak("Project choices override the sync defaults.");
                 for p in &projects {
                     let ps = sync.projects.get(p).cloned().unwrap_or_default();
                     let name = p
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(Text::new(&name).strong())
-                            .on_hover_text(p.display().to_string());
+                    card(ui, &name, |ui| {
+                        ui.weak(p.display().to_string());
+                        ui.horizontal_wrapped(|ui| {
                         if ui.button(if ps.paused { "Resume sync" } else { "Stop sync" }).clicked() {
                             send.push(format!("/sync project-pause {}", serde_json::json!([p, !ps.paused])));
                         }
@@ -785,12 +838,12 @@ impl Desktop {
                                 if hidden { "on" } else { "off" }
                             ));
                         }
+                        });
                     });
                 }
                 let choose = self.view.state.preferences.projects_dir.trim().is_empty();
                 for v in sync.remote_projects.values() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(v["name"].as_str().unwrap_or("Project"));
+                    card(ui, v["name"].as_str().unwrap_or("Project"), |ui| {
                         if v["paused"] == true {
                             ui.weak("Sync paused");
                         } else if choose {
@@ -803,7 +856,6 @@ impl Desktop {
                         }
                     });
                 }
-            });
         }
         if !sync.activity.is_empty() {
             card(ui, "Activity", |ui| {

@@ -106,8 +106,7 @@ impl CloudUsage {
 }
 
 async fn get(client: &reqwest::Client, path: &str) -> Result<Value> {
-    Ok(client
-        .get(format!("http://127.0.0.1:11434/api/{path}"))
+    Ok(crate::ollama::request(client, reqwest::Method::GET, path)?
         .timeout(std::time::Duration::from_secs(7))
         .send()
         .await?

@@ -2340,7 +2340,7 @@ mod tests {
         let labels = run(&mut app, &ctx, vec![]);
         for text in [
             "Add a device",
-            "Your network, folders and servers",
+            "Network and servers",
             "Projects from other devices",
             "Sync now",
             "Synced 2 min ago",

@@ -474,7 +474,14 @@ impl Engine {
                 .map(|p| format!("{}  {}  {}", p.id, p.name, p.base))
                 .collect::<Vec<_>>()
                 .join("\n")),
-            "/remote" => crate::sync::remote::command(&mut self.state,&self.root,args),
+            "/remote" => {
+                let result = crate::sync::remote::command(&mut self.state, &self.root, args)?;
+                if self.state.space.as_ref().is_some_and(|sync| sync.remote.running_peer.as_ref()
+                    .is_some_and(|peer| !sync.remote.allowed.contains(peer))) {
+                    self.jobs.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(result)
+            }
             "/automation" | "/fallback" | "/quota" | "/defer" => self.automation_command(cmd, args),
             "/read" => crate::documents::read_section(
                 &self.root,
@@ -1213,6 +1220,21 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     }
                 }
             }
+            "/ollama-key" => {
+                let (address, key): (String, String) = serde_json::from_str(args).context("Invalid Ollama key configuration")?;
+                crate::ollama::store_key(&address, &key)?;
+                Ok(if key.is_empty() { "Ollama API key cleared" } else { "Ollama API key saved on this device" }.into())
+            }
+            "/ollama-connect" => {
+                let (address, key): (String, String) = serde_json::from_str(args).context("Invalid Ollama configuration")?;
+                if !key.is_empty() {
+                    crate::ollama::store_key(&address, &key)?;
+                }
+                crate::ollama::configure(true, &address);
+                self.state.preferences.ollama_on = true;
+                self.state.preferences.ollama = address;
+                Ok("Ollama connection saved".into())
+            }
             "/preferences" => {
                 let pref: Preferences = serde_json::from_str(args)?;
                 ensure!(
@@ -1355,12 +1377,12 @@ The user denied this action. Continue with other work or explain the denial. Do 
             "/sync" => self.sync_command(args),
             "/service" => {
                 let out = match args {
-                    "install" => crate::service::install(&self.root)?,
+                    "install" => crate::service::register(&self.root, false)?,
                     "uninstall" => crate::service::uninstall(&self.root)?,
                     _ => crate::service::status(&self.root),
                 };
                 if matches!(args, "install" | "uninstall") {
-                    self.state.preferences.background = args == "install";
+                    self.state.preferences.start_on_sign_in = Some(args == "install");
                 }
                 Ok(out)
             }
@@ -1841,7 +1863,7 @@ const BROWSER_LINK_BLOCKED: &str =
 pub(crate) const SITE_BLOCKED: &str =
     "This tab matches a rule in Settings › Computer use › Website access › Blocklist. Remove that rule there if you want to allow this site.";
 const TOOL_ACCESS_GUIDANCE: &str =
-    "Use tools to request approval. Honor denials. Check capabilities before claiming inability. For settings that block the task, name the setting, its location and what to change.";
+    "Use tools before claiming inability. Ask before destructive actions. Honor denials. If a setting blocks a tool, explain how to change it.";
 
 pub(crate) fn browser_access_blocker(state: &State) -> Option<&'static str> {
     if state.preferences.block_web {
@@ -2005,6 +2027,9 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
             system.push_str("\n\nAndroid build reference for this task:\n");
             system.push_str(apk_guidance);
         }
+    }
+    if !state.preferences.over_18 {
+        system.push_str("\n\nKeep language and content suitable for minors.");
     }
     if !matches!(task.mode, Mode::Conversation) && !goal.is_empty()
         && state.thread_data(task.origin.unwrap_or(state.chat_id)).is_some_and(|(thread, _)| !thread.goal_done) {
@@ -2423,14 +2448,26 @@ pub(crate) fn auto_apply(state: &mut State, chat: u64) {
     }
     let data = crate::runtime::data_dir();
     let copy = crate::workcopy::folder(&data, chat, &project);
-    if !copy.exists() || crate::workcopy::changes(&copy).map_or(true, |c| c.is_empty()) {
+    let Ok(changes) = crate::workcopy::changes(&copy) else { return };
+    if changes.is_empty() {
+        return;
+    }
+    if crate::workcopy::deletion_preview(&changes).is_some() {
+        if !state.requests.iter().any(|p| p.chat == chat && matches!(p.call.call, crate::tools::Call::Apply {})) {
+            let model = state.thread_model(chat).to_owned();
+            route_resolved_call(state, chat, &model, 0, Some(&project), Ok(crate::tools::Envelope {
+                v: 1,
+                id: "apply-project".into(),
+                call: crate::tools::Call::Apply {},
+            }), false);
+        }
         return;
     }
     state.serial += 1;
     let keep = data
         .join("checkpoints")
         .join(format!("{chat}-{}", state.serial));
-    let (note, ok) = match crate::workcopy::apply_checkpointed(&copy, &keep) {
+    let (note, ok) = match crate::workcopy::apply_checkpointed_changes(&copy, &keep, changes) {
         Ok((summary, diff, _)) => (
             crate::state::Applied {
                 summary,
@@ -3181,7 +3218,12 @@ fn route_resolved_call(
             let paired = state.browser_session.as_ref().filter(|pair| pair.chat == chat)
                 .context("Connect a browser tab to this chat before using it")?;
             preview = format!("Allowed URL: {}\n\n{}", paired.rule, operation.preview());
-            Ok((crate::policy::Risk::Browser, paired.target(model, operation)))
+            let risk = if matches!(operation, crate::browser_link::Action::Read { .. }) {
+                crate::policy::Risk::Browser
+            } else {
+                crate::policy::Risk::Destructive
+            };
+            Ok((risk, paired.target(model, operation)))
         })
     } else if let crate::tools::Call::ConnectorRead { service, query } = &env.call {
         if !service.connected() {
@@ -3242,11 +3284,7 @@ fn route_resolved_call(
             Ok((crate::policy::Risk::Install, crate::runtime::data_dir()))
         }
     } else if matches!(env.call, crate::tools::Call::Apply {}) {
-        if project_chat && sandboxed && state.preferences.auto_apply {
-            Err(anyhow::anyhow!(
-                "Not needed: Spindle copies your changes into the project when you finish your reply. Carry on, or finish."
-            ))
-        } else if !project_chat {
+        if !project_chat {
             Err(anyhow::anyhow!(
                 "Nothing to apply: files in this chat are saved directly and already appear in the conversation."
             ))
@@ -3259,10 +3297,19 @@ fn route_resolved_call(
                 Ok(changes) if changes.is_empty() => Err(anyhow::anyhow!(
                     "Nothing to apply: the copy matches the project."
                 )),
-                Ok(changes) => {
-                    preview = crate::workcopy::preview(&tools_root, &changes, 6_000);
-                    Ok((crate::policy::Risk::Write, root.clone()))
-                }
+                Ok(changes) => match crate::workcopy::deletion_preview(&changes) {
+                    Some(deletions) => {
+                        preview = deletions;
+                        Ok((crate::policy::Risk::Destructive, root.clone()))
+                    }
+                    None if state.preferences.auto_apply => Err(anyhow::anyhow!(
+                        "Spindle copies your edits into the project when you finish your reply."
+                    )),
+                    None => {
+                        preview = crate::workcopy::preview(&tools_root, &changes, 6_000);
+                        Ok((crate::policy::Risk::Write, root.clone()))
+                    }
+                },
                 Err(e) => Err(e),
             }
         }
@@ -3285,7 +3332,7 @@ fn route_resolved_call(
     } else {
         crate::tools::classify(&tools_root, &env.call, contained)
     };
-    let (risk, target) = match classified {
+    let (mut risk, target) = match classified {
         Ok(r) => r,
         Err(e) => {
             let detail = format!("{e:#}");
@@ -3318,6 +3365,16 @@ Error: {detail}",
             return;
         }
     };
+    let replacement = match &env.call {
+        crate::tools::Call::Create { content, .. } => Some(content.as_bytes()),
+        crate::tools::Call::Python { code: Some(code), .. } => Some(code.as_bytes()),
+        _ => None,
+    };
+    if target.exists() && (replacement.is_some_and(|bytes| std::fs::read(&target).ok().as_deref() != Some(bytes))
+        || matches!(env.call, crate::tools::Call::Image { .. } | crate::tools::Call::Speak { .. })) {
+        risk = crate::policy::Risk::Destructive;
+        preview = format!("Replace the existing file at {}? This tool does not keep a backup of that version.", target.display());
+    }
     if let crate::tools::Call::Patch { find, replace, .. } = &env.call
         && preview.is_empty()
         && let Some(diff) = crate::tools::patch_preview(&target, find, replace)
@@ -3593,8 +3650,17 @@ impl Engine {
                 p.approved && !(p.call.call.background() && self.jobs.running.is_some())
             })
         {
-            let p = self.state.requests.remove(at);
+            let mut p = self.state.requests.remove(at);
             let summary = p.call.call.summary();
+            if matches!(p.call.call, crate::tools::Call::BrowserTab(crate::browser_link::Action::Click { .. } | crate::browser_link::Action::Fill { .. }))
+                && !p.confirmed_change() {
+                p.risk = crate::policy::Risk::Destructive;
+                p.approved = false;
+                p.reason.clear();
+                set_tool_note(&mut self.state, p.chat, summary, "Waiting for your approval");
+                self.state.requests.push(p);
+                continue;
+            }
             journal(
                 &mut self.state,
                 crate::state::ActionRecord {
@@ -3802,9 +3868,10 @@ impl Engine {
                     notice
                 })
             } else if matches!(p.call.call, crate::tools::Call::Apply {}) {
-                crate::workcopy::apply(&p.root)
+                let approved = p.confirmed_change().then_some(p.preview.as_str());
+                crate::workcopy::apply_approved(&p.root, approved)
             } else {
-                crate::tools::run(&p.root, &p.call.call, &p.target)
+                crate::tools::run(&p.root, &p.call.call, &p.target, p.confirmed_change())
             };
             if result.is_ok()
                 && matches!(p.call.call, crate::tools::Call::Create { .. } | crate::tools::Call::Patch { .. })
@@ -3852,7 +3919,7 @@ impl Engine {
                     vec![rel.to_string_lossy().replace('\\', "/")],
                 );
             }
-            if matches!(p.risk, crate::policy::Risk::Sandboxed)
+            if matches!(p.risk, crate::policy::Risk::Sandboxed | crate::policy::Risk::Destructive)
                 || matches!(p.call.call, crate::tools::Call::Apply {})
             {
                 refresh_changes(&mut self.state, p.chat);
@@ -4600,6 +4667,16 @@ impl Engine {
                 }
                 sync.wanted = Some(adapter::Want::Now);
                 Ok(format!("{name} {}", if on { "on" } else { "off" }))
+            }
+            "device-rule" => {
+                let (id, option, enabled): (String, String, bool) = serde_json::from_str(rest)
+                    .context("Use /sync device-rule [device ID, permission, enabled]")?;
+                let result = live::set_device_rule(&mut self.state, &id, &option, enabled)?;
+                if option == "sync" && !enabled && self.state.space.as_ref().is_some_and(|sync|
+                    sync.remote.running_peer.as_deref() == Some(&id)) {
+                    self.jobs.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(result)
             }
             "provider-host" => live::provider_hostname(&mut self.state, rest),
             "project-pause" => {
@@ -7261,6 +7338,9 @@ impl Engine {
                         }
                         let previous_task=self.state.queue.front().map(|q|q.id);
                         let message = self.command(line,active.is_some())?;
+                        if matches!(cmd, "/ollama-key" | "/ollama-connect") {
+                            self.refresh_ollama().await?;
+                        }
                         if previous_task!=self.state.queue.front().map(|q|q.id) || (cmd.eq_ignore_ascii_case("/plan-steps") && message == "Plan updated" && self.state.queue.front().is_some_and(|q| q.origin.unwrap_or(self.state.chat_id) == self.state.chat_id))
                             || matches!(cmd.to_ascii_lowercase().as_str(),"/steer"|"/cancel"|"/defer") || (cmd == "/queue" && split(args).0 == "steer") {
                             if let Some(handle)=active.take() {handle.abort(); let _ = handle.await;}

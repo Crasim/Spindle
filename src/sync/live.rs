@@ -198,7 +198,10 @@ fn transports(sync: &SyncState, members: &[String]) -> Result<Vec<(usize, Transp
     sync.links
         .iter()
         .enumerate()
-        .filter(|(_, l)| sync.switches.peers || !matches!(l.place, Place::Peer { .. }))
+        .filter(|(_, link)| match &link.place {
+            Place::Peer { device, .. } => sync.switches.peers && device.as_ref().is_none_or(|id| !sync.source_paused(id)),
+            _ => true,
+        })
         .map(|(i, l)| {
             Ok((
                 i,
@@ -961,6 +964,24 @@ pub fn devices(state: &State) -> Vec<(String, String, bool, bool)> {
             (m.id, m.name, me, m.removed.is_some())
         })
         .collect()
+}
+
+pub fn set_device_rule(state: &mut State, id: &str, option: &str, on: bool) -> Result<String> {
+    anyhow::ensure!(devices(state).iter().any(|(device, _, me, removed)| device == id && !me && !removed), "Choose a paired device");
+    let sync = state.space.as_mut().context("Set up sync first")?;
+    let mut baseline = std::collections::BTreeSet::new();
+    if sync.device_rules.is_empty() && !on {
+        let guard = LIVE.lock().unwrap();
+        if let Some(space) = guard.as_ref().and_then(|live| live.space.as_ref()) {
+            baseline.extend(space.store.bodies.keys().cloned());
+        } else {
+            let data = crate::runtime::data_dir();
+            let space = Space::open(sync.identity.clone(), Some(store_dir(&data, &sync.identity.keys.space)))?;
+            baseline.extend(space.store.bodies.keys().cloned());
+        }
+    }
+    sync.set_device_rule(id, option, on, baseline)?;
+    Ok("Device permissions saved".into())
 }
 
 /// Add a device after pairing (the new device's entry, with its keys already handed over).

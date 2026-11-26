@@ -272,6 +272,7 @@ pub struct Desktop {
     drawer: bool,
     /// The Ollama address being typed in Settings (None: show the saved one).
     ollama_address: Option<String>,
+    ollama_key: String,
     /// The page and chat when the drawer opened: moving to another closes it.
     drawer_at: Option<(std::mem::Discriminant<Page>, u64)>,
     reported_view: Option<u64>,
@@ -786,6 +787,7 @@ impl Desktop {
             drawer_at: None,
             reported_view: None,
             ollama_address: None,
+            ollama_key: String::new(),
             sync_tab: false,
             tray: None,
             shutdown: Default::default(),
@@ -1658,12 +1660,14 @@ impl Desktop {
                 if (submit || steer) && (!self.draft.trim().is_empty() || has_pastes || !self.image_drafts.is_empty()) {
                     self.submit_chat(steer);
                 }
+                ui.add_space(5.);
                 ui.horizontal(|ui| {
                     let first = self.notice.lines().next().unwrap_or("Ready");
                     if self.view.busy {
                         ui.spinner();
                     }
                     let state=&self.view.state;
+                    if state.preferences.nerd_stats {
                     let last=state.thread.turns.values().rev().find(|t|t.model==state.model);
                     let cap=self.view.context.or_else(||last.and_then(|t|t.window));
                     let usage=last.filter(|t|t.input>0).map(|t|(t.input+t.output).to_string()).unwrap_or_else(||"—".into());
@@ -1680,8 +1684,10 @@ impl Desktop {
                     } else if let Some(rate)=last.and_then(|t|t.tokens_per_second) {ui.weak(format!("{rate:.1} tok/s")).on_hover_text("Provider generation timing when available, otherwise output tokens per elapsed request second");}
                     else {ui.weak("— tok/s");}
                     ui.separator();
+                    }
                     ui.add(egui::Label::new(Text::new(first).color(muted()).size(12.)).truncate());
                 });
+                ui.add_space(4.);
             });
     }
 
@@ -1832,7 +1838,7 @@ impl Desktop {
                             && ui.small_button("Continue goal").on_hover_text("Use the selected model and the saved plan").clicked() {
                             let _ = self.tx.send("/goal continue".into());
                         }
-                        if let Some(turn)=turn {
+                        if let Some(turn)=turn.filter(|_| state.preferences.nerd_stats) {
                             if let Some(rate)=turn.tokens_per_second {ui.weak(format!("{rate:.1} tok/s"));}
                             if turn.output>0 || turn.earlier_output>0 {
                                 let count=ui.weak(format!("{} output tokens",turn.output.saturating_add(turn.earlier_output)));
@@ -2189,13 +2195,16 @@ impl Desktop {
                 }
             });
         });
-        if !self.view.state.skills.contains_key(crate::state::APK_SKILL_NAME) {
-            egui::CollapsingHeader::new("/android-apk")
-                .id_salt("built-in-android-apk")
+        for (name, definition) in crate::state::BUILTIN_SKILLS {
+            if self.view.state.skills.contains_key(name) {
+                continue;
+            }
+            egui::CollapsingHeader::new(format!("/{name}"))
+                .id_salt(("built-in-skill", name))
                 .show(ui, |ui| {
-                    ui.label(crate::state::APK_SKILL);
+                    ui.label(definition);
                     if ui.button("Use skill").clicked() {
-                        self.compose("/android-apk ");
+                        self.compose(&format!("/{name} "));
                     }
                 });
         }
@@ -3105,6 +3114,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/image server ", "Set the local ComfyUI address"),
     ("/council", "Independent review of the last answer"),
     ("/android-apk ", "Choose an Android APK build workflow"),
+    ("/browser-use ", "Use Spindle’s browser or Browser Link"),
     ("/swarm ", "Ask worker models, then combine their findings"),
     ("/steer ", "Correct the answer in progress"),
     ("/queue", "Show or manage queued messages"),
@@ -3255,7 +3265,8 @@ fn command_matches(
         skills
             .keys()
             .filter(|name| {
-                name.as_str() != crate::state::APK_SKILL_NAME && name.to_lowercase().starts_with(&word)
+                !crate::state::BUILTIN_SKILLS.iter().any(|(key, _)| *key == name.as_str())
+                    && name.to_lowercase().starts_with(&word)
             })
             .map(|name| (format!("/{name} "), "Installed skill".to_owned())),
     );

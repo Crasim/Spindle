@@ -133,6 +133,7 @@ pub enum Risk {
     Connector,
     /// Download and install software for Spindle (its Python, or packages for the sandbox).
     Install,
+    Destructive,
 }
 
 impl Risk {
@@ -148,6 +149,7 @@ impl Risk {
             Risk::Browser => "Use the connected browser tab",
             Risk::Connector => "Read from a connected account",
             Risk::Install => "Download and install software for Spindle",
+            Risk::Destructive => "Confirm this change",
         }
     }
     pub fn outside(self) -> bool {
@@ -187,7 +189,7 @@ pub fn levels(risk: Risk, trust: Trust) -> &'static [Level] {
         (Risk::WriteOutside, Trust::Trusted) => &[Once, Conversation, Project],
         (Risk::Install, Trust::Trusted) => &[Once, Conversation],
         (Risk::Install, _) => &[Once],
-        (Risk::Native | Risk::Connector, _) => &[Once],
+        (Risk::Native | Risk::Connector | Risk::Destructive, _) => &[Once],
         (Risk::Browser, _) => &[Once, Conversation, Project, Always],
     }
 }
@@ -289,13 +291,13 @@ pub struct Request<'a> {
 }
 
 pub fn decide(grants: &[Grant], r: &Request) -> Decision {
-    if matches!(r.risk, Risk::Native | Risk::Connector) {
-        return Decision::Ask;
-    }
-    if matches!(r.risk, Risk::Write | Risk::WriteOutside) && protected(r.target) {
+    if matches!(r.risk, Risk::Write | Risk::WriteOutside | Risk::Destructive) && protected(r.target) {
         return Decision::Deny(
             "That location is protected; Spindle never lets a model change it".into(),
         );
+    }
+    if matches!(r.risk, Risk::Native | Risk::Connector | Risk::Destructive) {
+        return Decision::Ask;
     }
     // Reading the project, and anything contained by the sandbox, needs no approval.
     if matches!(r.risk, Risk::Read | Risk::Sandboxed | Risk::Run) {

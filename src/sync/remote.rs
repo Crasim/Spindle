@@ -61,6 +61,8 @@ pub struct Remote {
     claims: BTreeMap<String, i64>,
     #[serde(skip)]
     running: Option<String>,
+    #[serde(skip)]
+    pub running_peer: Option<String>,
     received: BTreeMap<String, Receipt>,
     waiting: BTreeMap<String, (u64, String, u32, u64)>,
     #[serde(skip)]
@@ -161,6 +163,7 @@ pub fn export(sync: &SyncState, space: &mut Space) -> Result<usize> {
 
 pub fn import(sync: &mut SyncState, space: &Space) -> Result<usize> {
     let me = &sync.identity.device.id;
+    let rules = &sync.device_rules;
     let remote = &mut sync.remote;
     remote.pending.clear();
     remote.platforms.clear();
@@ -188,6 +191,8 @@ pub fn import(sync: &mut SyncState, space: &Space) -> Result<usize> {
             {
                 remote.platforms.insert(host.into(), os.into());
             }
+        } else if rules.get(&e.device).is_some_and(|rules| rules.paused) {
+            continue;
         } else if let Some(id) = key.strip_prefix("request/") {
             if !valid_id(id)
                 || !remote.allowed.contains(&e.device)
@@ -641,6 +646,7 @@ fn perform(r: &Request, data: &Path, ready: bool, cancel: &Arc<AtomicBool>) -> R
                     args: Some(r.args.clone()),
                     code: None,
                 },
+                false,
             )?;
             let result = crate::sandbox::run_private(&spec, cancel)?;
             (result.report(&spec.work, 3600), result.ok(), None)
@@ -700,7 +706,7 @@ impl crate::engine::Engine {
         let Some((id, r)) = sync.remote.pending.pop_first() else {
             return Ok(());
         };
-        if !sync.remote.allowed.contains(&r.from)
+        if sync.source_paused(&r.from) || !sync.remote.allowed.contains(&r.from)
             || !fresh(&r, crate::automation::now())
             || sync.remote.answers.contains_key(&id)
         {
@@ -710,6 +716,7 @@ impl crate::engine::Engine {
         // Persist the claim before launching. A crash cannot cause a second execution.
         sync.remote.claims.insert(id.clone(), r.created);
         sync.remote.running = Some(id.clone());
+        sync.remote.running_peer = Some(r.from.clone());
         if let Some(store) = &self.store {
             store.save(&self.state)?;
         }
@@ -740,6 +747,7 @@ pub fn finish(state: &mut State, space: &str, id: String, result: Receipt) -> St
             if result.ok { "finished" } else { "failed" }
         );
         s.remote.running = None;
+        s.remote.running_peer = None;
         s.remote.answers.insert(id, result);
         s.wanted = Some(crate::sync::adapter::Want::Now);
         return notice;

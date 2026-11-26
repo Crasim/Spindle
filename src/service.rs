@@ -43,12 +43,16 @@ pub fn unit(root: &Path, exe: &Path) -> String {
 
 /// Start at sign-in, and start now.
 pub fn install(root: &Path) -> Result<String> {
+    register(root, true)
+}
+
+pub fn register(root: &Path, start: bool) -> Result<String> {
     let exe = exe()?;
     #[cfg(windows)]
     {
         let task = format!("Spindle {}", name(root));
         let run = format!("\"{}\" service --dir \"{}\"", exe.display(), root.display());
-        let out = std::process::Command::new("schtasks")
+        let out = scheduler()
             .args([
                 "/Create", "/F", "/SC", "ONLOGON", "/RL", "LIMITED", "/TN", &task, "/TR", &run,
             ])
@@ -60,11 +64,11 @@ pub fn install(root: &Path) -> Result<String> {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        let _ = std::process::Command::new("schtasks")
-            .args(["/Run", "/TN", &task])
-            .output();
+        if start {
+            let _ = scheduler().args(["/Run", "/TN", &task]).output();
+        }
         return Ok(format!(
-            "Spindle runs in the background from now on (Task Scheduler: \"{task}\")."
+            "Spindle starts at sign-in (Task Scheduler: \"{task}\")."
         ));
     }
     #[cfg(target_os = "linux")]
@@ -78,7 +82,9 @@ pub fn install(root: &Path) -> Result<String> {
             .output()
             .is_ok_and(|o| o.status.success())
             && std::process::Command::new("systemctl")
-                .args(["--user", "enable", "--now", &unit_name])
+                .args(["--user", "enable"])
+                .args(start.then_some("--now"))
+                .arg(&unit_name)
                 .output()
                 .is_ok_and(|o| o.status.success());
         let mut msg = format!("Installed {}", path.display());
@@ -93,18 +99,29 @@ pub fn install(root: &Path) -> Result<String> {
     }
     #[allow(unreachable_code)]
     {
-        let _ = (root, exe);
+        let _ = (root, exe, start);
         bail!("Running in the background isn't supported on this system yet")
     }
+}
+
+#[cfg(windows)]
+fn scheduler() -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = std::process::Command::new("schtasks");
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    command
 }
 
 pub fn uninstall(root: &Path) -> Result<String> {
     #[cfg(windows)]
     {
         let task = format!("Spindle {}", name(root));
-        let _ = std::process::Command::new("schtasks")
+        let out = scheduler()
             .args(["/Delete", "/F", "/TN", &task])
-            .output();
+            .output()?;
+        if !out.status.success() && installed(root) {
+            bail!("Task Scheduler: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
         return Ok("Spindle no longer starts in the background.".into());
     }
     #[cfg(target_os = "linux")]
@@ -134,7 +151,7 @@ pub fn installed(root: &Path) -> bool {
     #[cfg(windows)]
     {
         let task = format!("Spindle {}", name(root));
-        return std::process::Command::new("schtasks")
+        return scheduler()
             .args(["/Query", "/TN", &task])
             .output()
             .is_ok_and(|o| o.status.success());

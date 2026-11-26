@@ -189,12 +189,31 @@ pub fn preview(copy: &Path, changes: &[Change], limit: usize) -> String {
 
 /// Copy the changes into the project. A project file that changed since the copy was made is
 /// left alone and reported as a conflict. Returns a summary.
-pub fn apply(copy: &Path) -> Result<String> {
+#[cfg(test)]
+fn apply(copy: &Path) -> Result<String> {
+    apply_changes(copy, changes(copy)?)
+}
+
+pub(crate) fn deletion_preview(changes: &[Change]) -> Option<String> {
+    let paths: Vec<_> = changes.iter().filter_map(|change| match change {
+        Change::Deleted(path) => Some(format!("• {path}")),
+        _ => None,
+    }).collect();
+    (!paths.is_empty()).then(|| format!("Apply the sandbox changes and delete these project files?\n\n{}", paths.join("\n")))
+}
+
+pub(crate) fn apply_approved(copy: &Path, confirmed: Option<&str>) -> Result<String> {
+    let found = changes(copy)?;
+    ensure!(deletion_preview(&found).as_deref() == confirmed, "Project deletions require confirmation for the current list of files");
+    apply_changes(copy, found)
+}
+
+fn apply_changes(copy: &Path, changes: Vec<Change>) -> Result<String> {
     let mut record = base(copy)?;
     let project = record.project.clone();
     let mut applied = vec![];
     let mut conflicts = vec![];
-    for change in changes(copy)? {
+    for change in changes {
         let rel = change.path().to_owned();
         let target = project.join(&rel);
         ensure!(
@@ -256,8 +275,12 @@ pub struct Checkpoint {
 
 /// Apply the copy's changes, first saving the project's versions of those files in `keep`
 /// so the apply can be undone. Returns the summary, a diff and what to keep.
-pub fn apply_checkpointed(copy: &Path, keep: &Path) -> Result<(String, String, Checkpoint)> {
-    let found = changes(copy)?;
+#[cfg(test)]
+fn apply_checkpointed(copy: &Path, keep: &Path) -> Result<(String, String, Checkpoint)> {
+    apply_checkpointed_changes(copy, keep, changes(copy)?)
+}
+
+pub(crate) fn apply_checkpointed_changes(copy: &Path, keep: &Path, found: Vec<Change>) -> Result<(String, String, Checkpoint)> {
     let diff = preview(copy, &found, 20_000);
     let project = base(copy)?.project;
     std::fs::create_dir_all(keep)?;
@@ -275,7 +298,7 @@ pub fn apply_checkpointed(copy: &Path, keep: &Path) -> Result<(String, String, C
         };
         saved.insert(rel.to_owned(), before);
     }
-    let summary = apply(copy)?;
+    let summary = apply_changes(copy, found)?;
     let record = base(copy)?;
     let mut checkpoint = Checkpoint::default();
     for (rel, before) in saved {
@@ -363,6 +386,25 @@ pub fn discard(data: &Path, chat: u64, project: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn applying_project_deletions_requires_the_current_list() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project)?;
+        for name in ["keep.txt", "remove.txt"] { std::fs::write(project.join(name), name)?; }
+        let copy = ensure(&tmp.path().join("data"), 1, &project)?;
+        std::fs::remove_file(copy.join("remove.txt"))?;
+        assert!(apply_approved(&copy, None).is_err());
+        let old = deletion_preview(&changes(&copy)?).unwrap();
+        std::fs::remove_file(copy.join("keep.txt"))?;
+        assert!(apply_approved(&copy, Some(&old)).is_err());
+        assert!(project.join("keep.txt").exists());
+        std::fs::write(copy.join("keep.txt"), "keep.txt")?;
+        apply_approved(&copy, Some(&old))?;
+        assert!(!project.join("remove.txt").exists());
+        Ok(())
+    }
 
     #[test]
     fn automatic_apply_can_be_undone() {
