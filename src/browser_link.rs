@@ -208,12 +208,14 @@ fn stage_downloads_files(
     bail!("No available Browser Link folder name in Downloads")
 }
 
-const EXTENSION_FILES: [(&str, &[u8]); 6] = [
+const EXTENSION_FILES: [(&str, &[u8]); 8] = [
     ("manifest.json", include_bytes!("../browser-extension/manifest.json")),
     ("background.js", include_bytes!("../browser-extension/background.js")),
     ("popup.html", include_bytes!("../browser-extension/popup.html")),
     ("popup.css", include_bytes!("../browser-extension/popup.css")),
     ("popup.js", include_bytes!("../browser-extension/popup.js")),
+    ("activity.css", include_bytes!("../browser-extension/activity.css")),
+    ("cursor.png", include_bytes!("../browser-extension/cursor.png")),
     ("icon.png", include_bytes!("../browser-extension/icon.png")),
 ];
 
@@ -234,7 +236,7 @@ const MAX_EXTENSION_ZIP: usize = 512 * 1024;
 type ExtensionFiles = Vec<Vec<u8>>;
 
 fn extension_file_matches(name: &str, bytes: &[u8], bundled: &[u8]) -> bool {
-    if name == "icon.png" { return bytes == bundled; }
+    if name.ends_with(".png") { return bytes == bundled; }
     // Git archives use LF even when an app is built from a Windows checkout.
     match (std::str::from_utf8(bytes), std::str::from_utf8(bundled)) {
         (Ok(actual), Ok(expected)) => actual.replace("\r\n", "\n") == expected.replace("\r\n", "\n"),

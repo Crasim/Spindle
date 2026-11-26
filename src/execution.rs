@@ -91,6 +91,8 @@ pub struct Jobs {
     pub browser_client: Option<crate::browser_native::BrowserClient>,
     pub browser_site_request: Option<String>,
     pub browser_panel: Option<BrowserPanel>,
+    #[cfg(windows)]
+    pub panel_read: Option<(u64, u64, String, Option<tokio::sync::oneshot::Sender<Result<String>>>)>,
     pub browser_retries: Vec<BrowserRetry>,
     pub web_region_ui: bool,
     pub web_region_fallback: Option<u64>,
@@ -106,6 +108,8 @@ pub struct BrowserPanel {
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrowserActivity {
     Opening,
+    #[cfg(windows)]
+    Reading { id: u64, proxy: Arc<crate::public_web::PanelProxy> },
     Loaded(String),
     Unavailable(String),
     Linked,
@@ -587,6 +591,39 @@ impl Engine {
         let cancel = self.jobs.cancel.clone();
         self.jobs.running = Some(pending.call.call.summary());
         let block_web = self.state.preferences.block_web;
+        #[cfg(windows)]
+        if !block_web && self.jobs.web_region_ui && self.state.chat_id == pending.chat
+            && crate::engine::builtin_browser_request(&self.state, pending.chat)
+            && let Call::WebOpen { url, start: 0, diagnostics: false } = &pending.call.call
+            && let Ok(address) = crate::browser::public_page(url)
+            && address.scheme() == "https"
+        {
+            let proxy = crate::public_web::PanelProxy::start().map(Arc::new);
+            let (send, receive) = tokio::sync::oneshot::channel();
+            if let Ok(proxy) = &proxy {
+                self.jobs.panel_read = Some((pending.id, pending.chat, address.to_string(), Some(send)));
+                self.jobs.browser_panel = Some(BrowserPanel { chat: pending.chat, address: address.to_string(),
+                    activity: BrowserActivity::Reading { id: pending.id, proxy: proxy.clone() } });
+            }
+            self.jobs.started = Some(tokio::spawn(async move {
+                let result = async {
+                    let _proxy = proxy?;
+                    let wait = tokio::time::timeout(Duration::from_secs(45), receive);
+                    tokio::pin!(wait);
+                    loop {
+                        tokio::select! {
+                            reply = &mut wait => return reply.context("Browser panel timed out")?
+                                .context("Browser panel closed")?,
+                            _ = tokio::time::sleep(Duration::from_millis(150)) => {
+                                ensure!(!cancel.load(Ordering::Relaxed), "Browsing stopped");
+                            }
+                        }
+                    }
+                }.await;
+                JobDone::Catalog { pending: Box::new(pending), result }
+            }));
+            return;
+        }
         if !block_web && let Call::WebOpen { url, start: 0, .. } = &pending.call.call
             && let Ok(address) = crate::browser::public_page(url) {
             self.jobs.browser_panel = Some(BrowserPanel {
@@ -716,6 +753,14 @@ impl Engine {
         self.jobs.running = None;
         match done {
             JobDone::Catalog{pending:p,result}=>{
+                #[cfg(windows)]
+                let panel_read = self.jobs.panel_read.as_ref().is_some_and(|(id, ..)| *id == p.id);
+                #[cfg(not(windows))]
+                let panel_read = false;
+                #[cfg(windows)]
+                if panel_read {
+                    self.jobs.panel_read = None;
+                }
                 if self.jobs.cancel.load(Ordering::Relaxed) {
                     if let Call::WebOpen { url, start: 0, .. } = &p.call.call
                         && let Ok(address) = crate::browser::public_page(url)
@@ -746,7 +791,9 @@ impl Engine {
                     if restricted && let Some(index) = message {
                         self.jobs.browser_retries.push(BrowserRetry { chat: p.chat, message: index,
                             id: p.id, address: address.to_string(), model: p.model.clone(), read_only: p.chat_read_only });
-                        if cfg!(windows) {
+                        if panel_read {
+                            text.push_str("\nThis result came from the visible Spindle Browser tab. The site did not provide the requested content. Use another relevant public source, or offer the permissioned regular browser in chat.");
+                        } else if cfg!(windows) {
                             text.push_str("\nThe user can choose Open and share here in the built-in Browser tab to continue with its interactive page. If this site is needed, point to that action. Do not ask for pasted content.");
                         } else {
                             text.push_str("\nSpindle offers Use regular browser in this chat. It will request tab access and continue the task. Do not ask for pasted content.");
@@ -1189,7 +1236,7 @@ impl Engine {
     }
 }
 
-async fn open_public(
+pub(crate) async fn open_public(
     url: String,
     start: usize,
     diagnostics: bool,
@@ -1206,7 +1253,29 @@ async fn open_public(
             crate::browser::open_public(&exe, &url, start, diagnostics, &runtime, &cancel)
         }).await?;
     }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(target_os = "android")]
+    {
+        let _ = (diagnostics, browser_path);
+        let mut address = crate::public_web::url(&url)?;
+        let mut net = crate::public_web::Network::default();
+        for _ in 0..6 {
+            ensure!(!cancel.load(Ordering::Relaxed), "Browsing stopped");
+            let response = net.read(address.as_str(), "GET", Some("text/html,text/plain"), 2 * 1024 * 1024).await?;
+            if (300..400).contains(&response.status) {
+                let next = response.headers.iter().find(|(k, _)| k == "location").context("Redirect without a destination")?;
+                address = crate::public_web::url(address.join(&next.1)?.as_str())?;
+                continue;
+            }
+            if response.status >= 400 { return Err(crate::browser::PageAccess::Http(response.status).into()); }
+            ensure!(response.headers.iter().any(|(k,v)| k == "content-type" && v.starts_with("text/")), "This page is not text or HTML");
+            let text = html2text::from_read(response.bytes.as_slice(), 100)?;
+            ensure!(!text.trim().is_empty(), "The page returned no readable text");
+            if crate::browser::verification_page("", &text) { return Err(crate::browser::PageAccess::Challenge.into()); }
+            return Ok(format!("Public page: {address}\n{}", text.chars().skip(start).take(14000).collect::<String>()));
+        }
+        bail!("The site redirected too many times")
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     {
         let _ = (url, start, diagnostics, browser_path, cancel);
         bail!("Public Chromium browsing is available on Windows and Linux");

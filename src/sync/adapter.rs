@@ -200,6 +200,8 @@ pub struct SyncState {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DeviceRules {
+    pub allow_host_jobs: bool,
+    pub allow_browser: bool,
     pub paused: bool,
     pub blocked: BTreeSet<String>,
     pub blocked_projects: BTreeSet<String>,
@@ -357,6 +359,10 @@ impl SyncState {
         let mut rules = self.device_rules.get(device).cloned().unwrap_or_default();
         if key == "sync" {
             rules.paused = !on;
+        } else if key == "host-jobs" {
+            rules.allow_host_jobs = on;
+        } else if key == "host-browser" {
+            rules.allow_browser = on;
         } else if let Some(key) = key.strip_prefix("job:") {
             let job = super::placement::Kind::OPERATIONS.into_iter()
                 .find(|job| job.key() == key)

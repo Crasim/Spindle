@@ -15,9 +15,9 @@ pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 const SETTINGS: &str = "Settings → Sandbox → Model browser";
 
 pub(crate) fn public_page(address: &str) -> Result<reqwest::Url> {
-    #[cfg(any(windows, target_os = "linux"))]
+    #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     { crate::public_web::url(address) }
-    #[cfg(not(any(windows, target_os = "linux")))]
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
     {
         let _ = address;
         bail!("Public Chromium browsing is available on Windows and Linux")
@@ -58,8 +58,45 @@ impl std::fmt::Display for PageAccess {
 impl std::error::Error for PageAccess {}
 
 #[cfg(windows)]
+pub(crate) fn panel_cursor_script() -> String {
+    let css = include_str!("../browser-extension/activity.css");
+    let pointer = base64::engine::general_purpose::STANDARD.encode(include_bytes!("../browser-extension/cursor.png"));
+    let css = serde_json::to_string(&format!("{css}\n:host {{ --spindle-pointer: url(data:image/png;base64,{pointer}); }}")).unwrap();
+    format!(r#"if (window === top && !document.querySelector('spindle-browser-activity')) {{
+            const host = document.createElement('spindle-browser-activity');
+            host.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important';
+            host.setAttribute('data-working','');
+            const shadow = host.attachShadow({{mode:'closed'}});
+            const style = document.createElement('style');
+            style.textContent = {css};
+            const badge = document.createElement('div');
+            badge.textContent = 'Spindle is reading this page · Esc to stop';
+            const pointer = document.createElement('span');
+            const first = document.querySelector('main h1, [role=main] h1, h1, main, article');
+            if (first) {{
+                const bounds = first.getBoundingClientRect();
+                const x = Math.max(0, Math.min(innerWidth - 35, bounds.left));
+                const y = Math.max(0, Math.min(innerHeight - 44, bounds.top));
+                pointer.style.transform = 'translate(' + x + 'px,' + y + 'px)';
+            }}
+            shadow.append(style, badge, pointer);
+            document.documentElement.append(host);
+            const stop = event => {{
+                if (event.isTrusted && event.key === 'Escape') {{
+                    document.documentElement.dataset.spindleReadStopped = '1';
+                    host.remove();
+                }}
+            }};
+            addEventListener('keydown',stop,true);
+            addEventListener('spindle-read-finished', () => {{host.remove();removeEventListener('keydown',stop,true);}}, {{once:true}});
+    }}"#)
+}
+
+#[cfg(windows)]
 pub(crate) const VISIBLE_PAGE_SCRIPT: &str = r#"(() => {
     if (document.readyState !== 'complete') return null;
+    window.dispatchEvent(new Event('spindle-read-finished'));
+    if (document.documentElement.dataset.spindleReadStopped === '1') return {stopped:true};
     const page = document.querySelector('main, [role=main], article') || document.body;
     const links = [];
     for (const link of page?.querySelectorAll('a[href]') || []) {

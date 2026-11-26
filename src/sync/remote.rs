@@ -39,6 +39,7 @@ pub struct Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum Operation {
     Inventory,
+    PublicPage { url: String },
     Tool { id: String, command: String },
     Build,
     Python,
@@ -48,7 +49,7 @@ enum Operation {
 impl Operation {
     fn job_kind(&self) -> Option<JobKind> {
         match self {
-            Self::Inventory => None,
+            Self::Inventory | Self::PublicPage { .. } => None,
             Self::Tool { .. } => Some(JobKind::Tool),
             Self::Build => Some(JobKind::Build),
             Self::Python => Some(JobKind::Python),
@@ -78,6 +79,8 @@ pub struct Remote {
     pub running_peer: Option<String>,
     #[serde(skip)]
     running_kind: Option<JobKind>,
+    #[serde(skip)]
+    running_host_browser: bool,
     received: BTreeMap<String, Receipt>,
     waiting: BTreeMap<String, (u64, String, u32, u64)>,
     #[serde(skip)]
@@ -89,9 +92,13 @@ pub struct Remote {
 }
 
 impl Remote {
+    pub(crate) fn running_sandbox_access_revoked(&self) -> bool {
+        self.running_kind.is_some() && self.running_peer.as_ref().is_some_and(|peer| !self.allowed.contains(peer))
+    }
+
     pub fn running_matches_rule(&self, peer: &str, rule: &str) -> bool {
         self.running_peer.as_deref() == Some(peer)
-            && (rule == "sync" || self.running_kind.is_some_and(|kind|
+            && (rule == "sync" || (self.running_host_browser && matches!(rule, "host-jobs" | "host-browser")) || self.running_kind.is_some_and(|kind|
                 rule.strip_prefix("job:") == Some(kind.key())))
     }
 
@@ -134,6 +141,13 @@ fn permission_denial(
     rules: Option<&super::adapter::DeviceRules>,
     request: &Request,
 ) -> Option<String> {
+    if matches!(request.operation, Operation::PublicPage { .. }) {
+        return (!rules.is_some_and(|r| r.allow_host_jobs && r.allow_browser && !r.paused))
+            .then(|| "To allow public page reads from this device, enable host jobs and the public browser in Settings › Sync › Devices › Manage on the destination.".into());
+    }
+    if matches!(request.operation, Operation::Inventory) && rules.is_some_and(|r| r.allow_host_jobs && !r.paused) {
+        return None;
+    }
     if !allowed.contains(&request.from) {
         Some("The host has not allowed jobs from this device. On the host, open Settings › Sync › Devices › Manage and enable Allow sandboxed jobs for the source device.".into())
     } else {
@@ -162,6 +176,7 @@ impl Request {
     fn label(&self) -> String {
         match &self.operation {
             Operation::Inventory => "Check capabilities".into(),
+            Operation::PublicPage { url } => format!("Read public page {url}"),
             Operation::Tool { command, .. } => format!("Run {command}"),
             Operation::Build => format!("Build and test {}", self.entry),
             Operation::Python => format!("Run {}", self.entry),
@@ -186,6 +201,10 @@ impl Request {
                 self.entry.is_empty() && self.files.is_empty() && self.args.is_empty(),
                 "Inventory takes no files or arguments"
             ),
+            Operation::PublicPage { url } => {
+                ensure!(self.entry.is_empty() && self.files.is_empty() && self.args.is_empty(), "A public browser job accepts only a URL");
+                crate::browser::public_page(url)?;
+            }
             Operation::Tool { id, command } => ensure!(
                 self.entry.is_empty()
                     && id.len() == 24
@@ -219,7 +238,7 @@ impl Request {
             let ext = path.rsplit('.').next().unwrap_or("");
             ensure!(
                 match self.operation {
-                    Operation::Inventory => false,
+                    Operation::Inventory | Operation::PublicPage { .. } => false,
                     Operation::Tool { .. } => true,
                     Operation::Build if self.entry.ends_with(".rs") => ext == "rs",
                     Operation::Build =>
@@ -407,7 +426,7 @@ pub fn command(state: &mut State, root: &Path, args: &str) -> Result<String> {
             .collect::<Vec<_>>()
             .join("\n"));
     }
-    let who=words.next().context("Use /remote devices, status, inventory DEVICE, tool DEVICE ID COMMAND [INPUTS] -- [ARGS], build DEVICE ENTRY [FILES], run DEVICE SCRIPT [FILES], apk DEVICE PACKAGE ACTIVITY ENTRY [FILES], allow DEVICE, deny DEVICE, or save JOB")?;
+    let who=words.next().context("Use /remote devices, status, inventory DEVICE, web_open DEVICE URL, tool DEVICE ID COMMAND [INPUTS] -- [ARGS], build DEVICE ENTRY [FILES], run DEVICE SCRIPT [FILES], apk DEVICE PACKAGE ACTIVITY ENTRY [FILES], allow DEVICE, deny DEVICE, or save JOB")?;
     if op == "save" {
         let id = sync
             .remote
@@ -458,12 +477,12 @@ pub fn command(state: &mut State, root: &Path, args: &str) -> Result<String> {
     }
     if op == "deny" {
         sync.remote.allowed.remove(&to);
-        sync.remote.pending.retain(|_, r| r.from != to);
-        return Ok("Future jobs from this peer disabled".into());
+        return Ok("Sandboxed jobs from this peer disabled".into());
     }
     ensure!(!sync.paused && !sync.source_paused(&to), "Resume sync with the destination before sending a job");
     let operation = match op {
         "inventory" => Operation::Inventory,
+        "web_open" => Operation::PublicPage { url: words.next().context("Enter a public URL")?.into() },
         "tool" => Operation::Tool {
             id: words.next().context("Tool ID required")?.into(),
             command: words.next().context("Tool command required")?.into(),
@@ -476,7 +495,7 @@ pub fn command(state: &mut State, root: &Path, args: &str) -> Result<String> {
         },
         _ => bail!("Unknown remote operation"),
     };
-    let entry = if matches!(operation, Operation::Inventory | Operation::Tool { .. }) {
+    let entry = if matches!(operation, Operation::Inventory | Operation::PublicPage { .. } | Operation::Tool { .. }) {
         String::new()
     } else {
         words
@@ -595,13 +614,15 @@ pub fn snapshot_call(state: &State, root: &Path, chat: u64, device: &str, call: 
         Call::RemoteJob { operation, path, inputs, args, package, activity, tool, command, .. } => {
             let op = match operation.as_str() {
                 "inventory" => Operation::Inventory,
+                "web_open" => Operation::PublicPage { url: path.clone() },
                 "tool" => Operation::Tool { id: tool.clone(), command: command.clone() },
                 "build" => Operation::Build,
                 "run" => Operation::Python,
                 "apk" => Operation::Apk { package: package.clone(), activity: activity.clone() },
-                _ => bail!("Choose inventory, tool, build, run or apk"),
+                _ => bail!("Choose inventory, web_open, tool, build, run or apk"),
             };
-            (op, path.as_str(), inputs.as_slice(), args.as_slice(), None)
+            let entry = if matches!(op, Operation::PublicPage { .. }) { "" } else { path.as_str() };
+            (op, entry, inputs.as_slice(), args.as_slice(), None)
         }
         Call::BuildBinary { path, inputs, args, .. } => (Operation::Build, path.as_str(), inputs.as_slice(), args.as_slice(), None),
         Call::Python { file, args, code } => (Operation::Python, file.as_str(), &[][..], args.as_deref().unwrap_or(&[]), code.as_deref()),
@@ -726,6 +747,7 @@ fn perform(r: &Request, data: &Path, ready: bool, cancel: &Arc<AtomicBool>) -> R
     }
     let inputs = r.files.keys().filter(|k| *k != &r.entry).cloned().collect();
     let (text, ok, file) = match &r.operation {
+        Operation::PublicPage { .. } => bail!("Browser jobs require the host browser settings"),
         Operation::Inventory => (
             crate::tool_catalog::host_inventory(ready)
                 .join("\n")
@@ -852,15 +874,23 @@ impl crate::engine::Engine {
         sync.remote.running = Some(id.clone());
         sync.remote.running_peer = Some(r.from.clone());
         sync.remote.running_kind = r.operation.job_kind();
+        sync.remote.running_host_browser = matches!(r.operation, Operation::PublicPage { .. });
         if let Some(store) = &self.store {
             store.save(&self.state)?;
         }
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
-        self.jobs.running = Some(format!("Remote job · {}", r.entry));
+        let block_web = self.state.preferences.block_web;
+        let browser = self.state.preferences.browser_path.clone();
+        self.jobs.running = Some(format!("Remote job · {}", r.label()));
         self.jobs.started =
             Some(tokio::task::spawn_blocking(move || {
-                let result = perform(&r, &crate::runtime::data_dir(), ready, &cancel)
+                let outcome = if let Operation::PublicPage { url } = &r.operation {
+                    tokio::runtime::Handle::current().block_on(crate::execution::open_public(
+                        url.clone(), 0, false, block_web, &browser, cancel.clone()))
+                        .map(|text| Receipt { ok: true, text: text.chars().take(2600).collect(), ..Default::default() })
+                } else { perform(&r, &crate::runtime::data_dir(), ready, &cancel) };
+                let result = outcome
                     .unwrap_or_else(|e| Receipt {
                         text: format!("{e:#}"),
                         ..Default::default()
@@ -884,6 +914,7 @@ pub fn finish(state: &mut State, space: &str, id: String, result: Receipt) -> St
         s.remote.running = None;
         s.remote.running_peer = None;
         s.remote.running_kind = None;
+        s.remote.running_host_browser = false;
         s.remote.answers.insert(id, result);
         s.wanted = Some(crate::sync::adapter::Want::Now);
         return notice;
@@ -957,6 +988,27 @@ mod tests {
         import(&mut inbound, &host)?;
         assert_eq!(inbound.remote.pending.keys().collect::<Vec<_>>(), vec![&allowed]);
         assert!(inbound.remote.answers[&denied].text.contains("disabled python scripts"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_remote_public_read_needs_both_live_host_permissions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sync = SyncState::new(Space::create("sender", None)?.id);
+        let request = snapshot(&sync, dir.path(), "host".into(), String::new(), &[],
+            Operation::PublicPage { url: "https://example.com/".into() }, vec![], None)?;
+        assert!(request.files.is_empty());
+        let sandbox = BTreeSet::from([request.from.clone()]);
+        let mut rules = super::super::adapter::DeviceRules::default();
+        for (host, browser, paused, allowed) in [
+            (false,false,false,false), (true,false,false,false), (false,true,false,false),
+            (true,true,false,true), (true,true,true,false),
+        ] {
+            rules.allow_host_jobs = host;
+            rules.allow_browser = browser;
+            rules.paused = paused;
+            assert_eq!(permission_denial(&sandbox, Some(&rules), &request).is_none(), allowed);
+        }
         Ok(())
     }
 

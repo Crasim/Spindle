@@ -56,6 +56,75 @@ fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Give an isolated WebView its native HTTPS connection while enforcing the same
+/// public-address boundary as headless reads. Dropping the guard closes all tunnels.
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct PanelProxy {
+    pub port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(windows)]
+impl PartialEq for PanelProxy {
+    fn eq(&self, other: &Self) -> bool { self.port == other.port }
+}
+
+#[cfg(windows)]
+impl Drop for PanelProxy {
+    fn drop(&mut self) { self.task.abort(); }
+}
+
+#[cfg(windows)]
+impl PanelProxy {
+    pub fn start() -> Result<Self> {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+        let port = listener.local_addr()?.port();
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    incoming = listener.accept(), if connections.len() < 48 => {
+                        let Ok((stream, _)) = incoming else { break };
+                        connections.spawn(async move {
+                            let _ = tokio::time::timeout(Duration::from_secs(60), public_tunnel(stream)).await;
+                        });
+                    }
+                    _ = connections.join_next(), if !connections.is_empty() => {}
+                }
+            }
+        });
+        Ok(Self { port, task })
+    }
+}
+
+#[cfg(windows)]
+async fn public_tunnel(mut browser: tokio::net::TcpStream) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // Chromium's proxy CONNECT headers precede the browser's TLS handshake.
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        ensure!(head.len() < 8192, "Proxy header too large");
+        head.push(browser.read_u8().await?);
+    }
+    let line = std::str::from_utf8(&head)?.lines().next().context("Missing CONNECT")?;
+    let authority = line.strip_prefix("CONNECT ").and_then(|rest| rest.split_once(' '))
+        .map(|(host, _)| host).context("Only HTTPS tunnels are available")?;
+    let host = authority.strip_suffix(":443").context("Only HTTPS port 443 is available")?;
+    ensure!(!host.contains(['/', '?', '#', '@', '\\']), "Invalid tunnel destination");
+    let page = url(&format!("https://{host}/"))?;
+    let host = page.host_str().context("Missing hostname")?.trim_matches(['[', ']']);
+    let addresses: Vec<_> = tokio::net::lookup_host((host, 443)).await?.collect();
+    ensure!(!addresses.is_empty() && addresses.iter().all(|a| public_ip(a.ip())),
+        "Only public destinations are accessible");
+    let mut remote = tokio::net::TcpStream::connect(&addresses[..]).await?;
+    browser.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
+    tokio::io::copy_bidirectional(&mut browser, &mut remote).await?;
+    Ok(())
+}
+
 fn public_ipv4(ip: Ipv4Addr) -> bool {
     !matches!(
         ip.octets(),

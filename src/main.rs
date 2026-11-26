@@ -12,7 +12,7 @@ mod browser_native;
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 mod updates;
 mod local_servers;
-#[cfg(any(windows, target_os = "linux", test))]
+#[cfg(any(windows, target_os = "linux", target_os = "android", test))]
 mod public_web;
 mod cli;
 #[cfg(any(windows, target_os = "linux"))]

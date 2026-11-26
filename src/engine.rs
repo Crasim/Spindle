@@ -490,8 +490,8 @@ impl Engine {
             }
             "/remote" => {
                 let result = crate::sync::remote::command(&mut self.state, &self.root, args)?;
-                if self.state.space.as_ref().is_some_and(|sync| sync.remote.running_peer.as_ref()
-                    .is_some_and(|peer| !sync.remote.allowed.contains(peer))) {
+                if args.split_whitespace().next() == Some("deny") && self.state.space.as_ref()
+                    .is_some_and(|sync| sync.remote.running_sandbox_access_revoked()) {
                     self.jobs.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 Ok(result)
@@ -875,6 +875,20 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     _ => bail!("Choose how Spindle should use your web region"),
                 }
                 Ok("Web region choice saved".into())
+            }
+            #[cfg(windows)]
+            "/browser-panel-result" => {
+                let (id, snapshot, error): (u64, Option<crate::browser::VisiblePage>, String) = serde_json::from_str(args)?;
+                let (active, chat, address, _) = self.jobs.panel_read.as_ref().context("Browser read ended")?;
+                ensure!(*active == id && *chat == self.state.chat_id, "This browser read belongs to another request");
+                let result = if self.state.preferences.block_web { Err(anyhow::anyhow!("{WEB_ACCESS_BLOCKED}")) }
+                    else if let Some(page) = snapshot { page.read(address) }
+                    else if error == "The website redirected away from the requested page." {
+                        Err(anyhow::Error::from(crate::browser::PageAccess::Challenge).context(error))
+                    } else { Err(anyhow::anyhow!("{}", error.chars().take(240).collect::<String>())) };
+                let sender = self.jobs.panel_read.as_mut().and_then(|r| r.3.take()).context("Browser read ended")?;
+                let _ = sender.send(result);
+                Ok("Browser read finished".into())
             }
             #[cfg(windows)]
             "/browser-preview-read" => {
@@ -2522,7 +2536,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
     }
     if let Some(sync)=state.space.as_ref().filter(|s|!s.paused) {
         let peers=sync.remote.platforms.iter().filter(|(id,_)| *id!=&sync.identity.device.id).map(|(id,os)|format!("{os}={id}")).collect::<Vec<_>>();
-        if !peers.is_empty() { tools.push(format!(r#"- Send sources to a paired host for sandboxed work: {{"name":"remote_job","args":{{"device":"DEVICE_ID","operation":"build","path":"main.rs","inputs":[],"args":[]}}}}. Use inventory to list target tools, tool with a returned tool ID and command to run one, build for Rust or C/C++, run for Python, or apk with package and activity for Android Java. Use when the user requests a remote target. One-time approval shares the listed files with the sync pool; the result returns automatically. Targets: {}"#,peers.join(", "))); }
+        if !peers.is_empty() { tools.push(format!(r#"- Send sources to a paired host for sandboxed work: {{"name":"remote_job","args":{{"device":"DEVICE_ID","operation":"build","path":"main.rs","inputs":[],"args":[]}}}}. Use inventory to list target tools, web_open with the public URL in path for a permitted host browser read, tool with a returned tool ID and command to run one, build for Rust or C/C++, run for Python, or apk with package and activity for Android Java. Use when the user requests a remote target. One-time approval shares the listed files with the sync pool; the result returns automatically. Targets: {}"#,peers.join(", "))); }
         else if mentions(&["remote build", "remote job", "paired device", "remote host"]) {
             tools.push("- Remote work needs a paired destination. Add a device in Settings › Sync.".into());
         }
@@ -5396,6 +5410,33 @@ mod tests {
                 activity: crate::execution::BrowserActivity::Loaded("Example Domain".into()),
             }));
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn built_in_browser_reads_the_visible_result_once_in_the_requesting_chat() {
+        let root = tempfile::tempdir().unwrap();
+        let mut e = fixture(root.path());
+        e.jobs.web_region_ui = true;
+        e.command("Open https://example.com/ in the built-in browser.", false).unwrap();
+        finish_turn(&mut e.state, BROWSER_TOOL_EXAMPLE.into(), Turn::default(), Some(root.path())).unwrap();
+        let pending = e.state.requests.remove(0);
+        let id = pending.id;
+        let chat = pending.chat;
+        e.start_catalog(pending);
+        assert!(matches!(e.jobs.browser_panel.take().unwrap().activity,
+            crate::execution::BrowserActivity::Reading { id: active, .. } if active == id));
+        let page = serde_json::json!({"address":"https://example.com/", "title":"Rendered page",
+            "status":200, "text":"Content from the visible panel", "links":[]});
+        let response = format!("/browser-panel-result {}", serde_json::json!([id, page, ""]));
+        e.state.chat_id = chat + 1;
+        assert!(e.command(&response, true).is_err());
+        e.state.chat_id = chat;
+        e.command(&response, true).unwrap();
+        assert!(e.command(&response, true).is_err());
+        let result = e.jobs.started.take().unwrap().await.unwrap();
+        assert!(e.finish_job(result).contains("Content from the visible panel"));
+        assert!(e.jobs.panel_read.is_none());
     }
 
     #[test]

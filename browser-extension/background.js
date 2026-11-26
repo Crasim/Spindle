@@ -17,8 +17,9 @@ async function isRevoked(tabId) {
 }
 
 async function groupTab(tab) {
-  if (tab.pinned || tab.groupId >= 0) return;
+  if (tab.pinned) return;
   const [group] = await chrome.tabGroups.query({windowId: tab.windowId, title: "Spindle"});
+  if (group?.id === tab.groupId) return;
   if (group) {
     await chrome.tabs.group({tabIds: tab.id, groupId: group.id});
   } else {
@@ -26,6 +27,14 @@ async function groupTab(tab) {
     await chrome.tabGroups.update(groupId, {title: "Spindle", color: "green"});
   }
 }
+
+// Children opened by an action belong with their opener. Each child still needs
+// its own site and tab permission before Spindle can read or control it.
+chrome.tabs.onCreated.addListener(tab => {
+  if (current?.engaged && tab.openerTabId === current.tabId) {
+    groupTab(tab).catch(error => console.warn("Could not group Spindle tab", error.message));
+  }
+});
 
 async function activeTab() {
   const window = await chrome.windows.getLastFocused({ windowTypes: ["normal"] }).catch(() => null);
@@ -289,11 +298,19 @@ function sendPacket(packet) {
   nativePort?.postMessage({ packet });
 }
 
-function runInTab(session, operation) {
+const cursorStyle = Promise.all([
+  fetch(chrome.runtime.getURL("activity.css")).then(response => response.text()),
+  fetch(chrome.runtime.getURL("cursor.png")).then(response => response.arrayBuffer())
+]).then(([css, pointer]) => {
+  const data = btoa(Array.from(new Uint8Array(pointer), byte => String.fromCharCode(byte)).join(""));
+  return css + `:host { --spindle-pointer: url("data:image/png;base64,${data}"); }`;
+});
+
+async function runInTab(session, operation) {
   return chrome.scripting.executeScript({
     target: {tabId: session.tabId},
     func: operate,
-    args: [operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce]
+    args: [operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce, await cursorStyle]
   });
 }
 
@@ -326,8 +343,7 @@ async function receivePacket(session, message) {
         (session.mode === "blocklist" && session.rules.some(rule => allowed(tab.url, rule)))) {
       throw Error("This URL is blocked in Spindle.");
     }
-    // A tab the user already grouped stays with their other tabs.
-    await groupTab(tab).catch(() => {});
+    await groupTab(tab);
     if (current !== session) return;
     if (!allowed(tab.url, session.rule)) throw Error("This URL is blocked in Spindle.");
     session.engaged = true;
@@ -339,7 +355,7 @@ async function receivePacket(session, message) {
   if (current === session) sendPacket({ id: message.id, ...reply });
 }
 
-async function operate(operation, rule, blocked, sessionNonce) {
+async function operate(operation, rule, blocked, sessionNonce, cursorStyle) {
   const site = new URL(rule);
   const prefix = site.pathname.replace(/\/+$/, "");
   const matches = (url, site, prefix) => url.origin === site.origin && !url.username && !url.password &&
@@ -368,21 +384,7 @@ async function operate(operation, rule, blocked, sessionNonce) {
     host.style.cssText = "all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important";
     const shadow = host.attachShadow({mode: "closed"});
     const style = document.createElement("style");
-    style.textContent = `
-      :host { box-shadow: inset 0 0 0 2px #54c788, inset 0 0 18px #54c78860 !important; }
-      :host([data-working]) { box-shadow: inset 0 0 0 4px #70efa7, inset 0 0 32px #54c7889c !important; }
-      div { position: absolute; right: 16px; top: 16px; background: #10251b; color: #f0fff5;
-        border: 1px solid #70efa7; border-radius: 10px; padding: 9px 13px;
-        max-width: calc(100% - 60px); font: 600 13px/1.4 system-ui; box-shadow: 0 4px 18px #0009; }
-      span { position: absolute; top: 0; left: 0; width: 29px; height: 33px; color: #10251b;
-        filter: drop-shadow(0 2px 4px #000d) drop-shadow(0 0 8px #70efa7);
-        transform: translate(16px, 64px); transition: transform 140ms ease-out; }
-      @media (prefers-reduced-motion: reduce) { span { transition: none; } }
-      span::before { content: ""; position: absolute; inset: 0; background: #70efa7;
-        clip-path: polygon(0 0, 100% 61%, 62% 67%, 77% 96%, 60% 100%, 43% 73%, 9% 93%); }
-      span::after { content: "S"; position: absolute; top: 8px; left: 6px;
-        font: 800 12px/1 system-ui; }
-    `;
+    style.textContent = cursorStyle;
     const badge = document.createElement("div");
     badge.setAttribute("role", "status");
     badge.textContent = "Spindle has access to this tab · Esc to revoke access";

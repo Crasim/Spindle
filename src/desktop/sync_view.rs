@@ -441,7 +441,8 @@ impl Desktop {
                     }
                     if !me && !removed {
                         let mut enabled = !rules.paused;
-                        if ui.checkbox(&mut enabled, "Receive sync").changed() {
+                        ui.label("Receive sync");
+                        if crate::widgets::switch(ui, &mut enabled, "Receive sync").changed() {
                             send.push(change("sync", enabled));
                         }
                         let open = f.manage_device.as_deref() == Some(id.as_str());
@@ -487,7 +488,17 @@ impl Desktop {
                             }
                         });
                     }
-                    ui.weak("Remote work runs in this device’s sandbox. Computer use stays on the device where you start it.");
+                    let mut host_jobs = rules.allow_host_jobs;
+                    if ui.checkbox(&mut host_jobs, "Allow host jobs from this device").changed() {
+                        send.push(change("host-jobs", host_jobs));
+                    }
+                    ui.weak("Host jobs can inspect installed tools. Choose which computer-use resources this peer can use.");
+                    ui.add_enabled_ui(host_jobs && crate::browser::SUPPORTED, |ui| {
+                        let mut browser = rules.allow_browser;
+                        if ui.checkbox(&mut browser, "Read public pages with the isolated browser").changed() {
+                            send.push(change("host-browser", browser));
+                        }
+                    });
                     ui.horizontal_wrapped(|ui| {
                         if f.confirm_remove.as_deref() == Some(id.as_str()) {
                             if ui

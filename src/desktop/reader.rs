@@ -824,7 +824,7 @@ impl ReaderPane {
                     }
                     side_tabs::Tab::Browser => {
                         let (chat, fallbacks, ready) = browser_chat;
-                        self.picked = self.browser.show(ui, frame, chat, fallbacks, ready);
+                        self.picked = self.browser.show(ui, frame, chat, fallbacks, ready, browser_path);
                         return;
                     }
                 }

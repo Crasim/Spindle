@@ -2853,6 +2853,10 @@ impl eframe::App for Desktop {
                 &self.view.state.preferences.browser_path, browser_chat);
         }
         match self.reader.picked.take() {
+            #[cfg(windows)]
+            Some(side_tabs::Pick::PanelResult { id, snapshot, error }) => {
+                let _ = self.tx.send(format!("/browser-panel-result {}", serde_json::json!([id, snapshot, error])));
+            }
             Some(side_tabs::Pick::DisconnectBrowser(chat)) => self.send(format!("/browser-link stop {chat}")),
             #[cfg(windows)]
             Some(side_tabs::Pick::ShareBrowserPage { id, snapshot }) => {

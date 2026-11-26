@@ -900,6 +900,65 @@ impl Desktop {
                 });
             }
         });
+        card(ui, &mut |ui| {
+            ui.horizontal(|ui| {
+                ui.label(Text::new("Sandbox check").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            runtime.is_some() && job.is_none(),
+                            egui::Button::new("Run the check"),
+                        )
+                        .on_hover_text("Tries to break each promise the sandbox makes")
+                        .clicked()
+                    {
+                        command = Some("/sandbox-check".into());
+                    }
+                });
+            });
+            if let Some(r) = &report
+                && ui
+                    .small_button("Copy report")
+                    .on_hover_text("Copy the check results as text")
+                    .clicked()
+            {
+                ui.ctx().copy_text(r.text());
+            }
+            match &report {
+                None => {
+                    ui.weak("Not run yet.");
+                }
+                Some(r) => {
+                    let when = chrono::DateTime::from_timestamp(r.time, 0)
+                        .map(|d| {
+                            d.with_timezone(&chrono::Local)
+                                .format("%b %-d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    ui.label(
+                        Text::new(format!("{} · {when}", r.backend))
+                            .size(12.)
+                            .color(muted()),
+                    );
+                    for c in &r.checks {
+                        ui.horizontal(|ui| {
+                            let (mark, color) = if c.passed {
+                                ("✓", accent())
+                            } else {
+                                ("✗", Color::LIGHT_RED)
+                            };
+                            ui.label(Text::new(mark).color(color).strong());
+                            ui.label(Text::new(&c.name).size(13.).color(ink()));
+                            ui.label(Text::new(&c.detail).size(12.).color(muted()));
+                        });
+                    }
+                    if !r.problem.is_empty() {
+                        ui.label(Text::new(&r.problem).size(13.).color(ink()));
+                    }
+                }
+            }
+        });
         if crate::browser::SUPPORTED {
             card(ui, &mut |ui| self.model_browser_settings(ui));
         }
@@ -1078,65 +1137,6 @@ impl Desktop {
         if let Some(specs) = install {
             command = Some(format!("/install-packages {specs}"));
         }
-        card(ui, &mut |ui| {
-            ui.horizontal(|ui| {
-                ui.label(Text::new("Sandbox check").strong());
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            runtime.is_some() && job.is_none(),
-                            egui::Button::new("Run the check"),
-                        )
-                        .on_hover_text("Tries to break each promise the sandbox makes")
-                        .clicked()
-                    {
-                        command = Some("/sandbox-check".into());
-                    }
-                });
-            });
-            if let Some(r) = &report
-                && ui
-                    .small_button("Copy report")
-                    .on_hover_text("Copy the check results as text")
-                    .clicked()
-            {
-                ui.ctx().copy_text(r.text());
-            }
-            match &report {
-                None => {
-                    ui.weak("Not run yet.");
-                }
-                Some(r) => {
-                    let when = chrono::DateTime::from_timestamp(r.time, 0)
-                        .map(|d| {
-                            d.with_timezone(&chrono::Local)
-                                .format("%b %-d %H:%M")
-                                .to_string()
-                        })
-                        .unwrap_or_default();
-                    ui.label(
-                        Text::new(format!("{} · {when}", r.backend))
-                            .size(12.)
-                            .color(muted()),
-                    );
-                    for c in &r.checks {
-                        ui.horizontal(|ui| {
-                            let (mark, color) = if c.passed {
-                                ("✓", accent())
-                            } else {
-                                ("✗", Color::LIGHT_RED)
-                            };
-                            ui.label(Text::new(mark).color(color).strong());
-                            ui.label(Text::new(&c.name).size(13.).color(ink()));
-                            ui.label(Text::new(&c.detail).size(12.).color(muted()));
-                        });
-                    }
-                    if !r.problem.is_empty() {
-                        ui.label(Text::new(&r.problem).size(13.).color(ink()));
-                    }
-                }
-            }
-        });
         if let Some(cmd) = command {
             self.send(cmd);
         }

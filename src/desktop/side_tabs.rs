@@ -51,6 +51,8 @@ pub(super) enum Pick {
     DisconnectBrowser(u64),
     #[cfg(windows)]
     ShareBrowserPage { id: u64, snapshot: String },
+    #[cfg(windows)]
+    PanelResult { id: u64, snapshot: Option<serde_json::Value>, error: String },
     /// Open a chat file: from disk if it's there, or else its snapshot.
     ChatFile {
         name: String,
@@ -284,6 +286,8 @@ enum BrowserSource {
 
 #[derive(Default)]
 struct BrowserTab {
+    #[cfg(not(windows))]
+    navigating: Option<std::sync::mpsc::Receiver<anyhow::Result<String>>>,
     source: Option<BrowserSource>,
     address: String,
     error: String,
@@ -291,6 +295,10 @@ struct BrowserTab {
     activity: Option<crate::execution::BrowserActivity>,
     #[cfg(windows)]
     web: Option<wry::WebView>,
+    #[cfg(windows)]
+    profile: Option<tempfile::TempDir>,
+    #[cfg(windows)]
+    network: Option<std::sync::Arc<crate::public_web::PanelProxy>>,
     #[cfg(windows)]
     visible: bool,
     #[cfg(windows)]
@@ -304,10 +312,12 @@ struct BrowserTab {
 #[cfg(windows)]
 struct PendingRead {
     id: u64,
+    proxy: Option<u16>,
     address: String,
     started: std::time::Instant,
     result: Option<std::sync::mpsc::Receiver<String>>,
     loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    marked: Option<std::time::Instant>,
 }
 
 /// Turn what the user typed into a URL: add https:// to a bare host, and search for anything
@@ -349,6 +359,8 @@ impl BrowserPane {
     pub fn present(&mut self, page: crate::execution::BrowserPanel, foreground: bool) -> bool {
         use crate::execution::BrowserActivity;
         let starting = matches!(page.activity, BrowserActivity::Opening | BrowserActivity::Linked);
+        #[cfg(windows)]
+        let starting = starting || matches!(page.activity, BrowserActivity::Reading { .. });
         let source = if matches!(page.activity, BrowserActivity::Linked) {
             BrowserSource::Linked { chat: page.chat }
         } else {
@@ -415,7 +427,7 @@ impl BrowserPane {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame,
-        chat: u64, fallbacks: &[(u64, String)], ready: bool) -> Option<Pick> {
+        chat: u64, fallbacks: &[(u64, String)], ready: bool, browser_path: &str) -> Option<Pick> {
         let mut select = None;
         let mut close = None;
         let new_tab = ui.horizontal(|ui| {
@@ -438,7 +450,13 @@ impl BrowserPane {
             new_tab
         }).inner;
         if let Some(index) = close {
+            #[cfg(windows)]
+            let pending = self.tabs[index].pending_read.take().filter(|r| r.proxy.is_some());
             self.close(index);
+            #[cfg(windows)]
+            if let Some(read) = pending {
+                return Some(Pick::PanelResult { id: read.id, snapshot: None, error: "You closed the browser tab.".into() });
+            }
         } else if new_tab {
             self.tabs.push(BrowserTab::default());
             self.select(self.tabs.len() - 1);
@@ -451,7 +469,7 @@ impl BrowserPane {
             && *owner == chat {
             fallbacks.iter().find(|(_, url)| url == address)
         } else { None };
-        ui.push_id(self.selected, |ui| tab.show(ui, frame, retry, ready)).inner
+        ui.push_id(self.selected, |ui| tab.show(ui, frame, retry, ready, browser_path)).inner
     }
 }
 
@@ -475,8 +493,25 @@ impl BrowserTab {
         self.model_page = None;
         self.activity = None;
         #[cfg(windows)]
-        { self.pending_read = None; }
+        {
+            self.pending_read = None;
+            if let Some(web) = &self.web {
+                let _ = web.evaluate_script("window.dispatchEvent(new Event('spindle-read-finished'))");
+            }
+            if matches!(page.activity, BrowserActivity::Opening) && self.network.is_some() {
+                self.web = None;
+                self.network = None;
+                self.profile = None;
+                self.visible = false;
+                self.current = Default::default();
+            }
+        }
         match page.activity {
+            #[cfg(windows)]
+            BrowserActivity::Loaded(_) | BrowserActivity::Unavailable(_) if self.profile.is_some() && self.web.is_some() => {
+                // The live document is already here, including any site-generated error.
+                // Re-navigating would show a different page from the one the model read.
+            }
             BrowserActivity::Loaded(text) => self.model_page = Some((self.address.clone(), text)),
             activity => {
                 self.hide();
@@ -495,7 +530,9 @@ impl BrowserTab {
     }
 
     fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame,
-        retry: Option<&(u64, String)>, ready: bool) -> Option<Pick> {
+        retry: Option<&(u64, String)>, ready: bool, browser_path: &str) -> Option<Pick> {
+        #[cfg(windows)]
+        let _ = browser_path;
         #[cfg(not(windows))]
         let _ = (retry, ready);
         #[cfg(windows)]
@@ -504,7 +541,11 @@ impl BrowserTab {
         }
         let mut go = None;
         #[cfg(windows)]
+        let mut navigation_result = None;
+        #[cfg(windows)]
         let mut share_here = false;
+        #[cfg(windows)]
+        let mut direct = None;
         let mut typing = false;
         ui.horizontal(|ui| {
             #[cfg(windows)]
@@ -535,11 +576,29 @@ impl BrowserTab {
             self.source = None;
             self.model_page = None;
             #[cfg(windows)]
-            { self.pending_read = None; }
+            {
+                let pending = self.pending_read.take();
+                if self.network.take().is_some() {
+                    self.web = None;
+                    self.profile = None;
+                    self.visible = false;
+                    self.current = Default::default();
+                }
+                if let Some(read) = pending.filter(|r| r.proxy.is_some()) {
+                    navigation_result = Some(Pick::PanelResult { id: read.id, snapshot: None,
+                        error: "You navigated away during the browser read.".into() });
+                }
+            }
         } else if let Some(activity) = &self.activity {
             use crate::execution::BrowserActivity;
             ui.add_space(8.);
             match activity {
+                #[cfg(windows)]
+                BrowserActivity::Reading { id, proxy } => {
+                    direct = Some((*id, proxy.port));
+                    self.network = Some(proxy.clone());
+                    go = Some(self.address.clone());
+                }
                 BrowserActivity::Opening => {
                     ui.horizontal_wrapped(|ui| {
                         ui.spinner();
@@ -573,14 +632,17 @@ impl BrowserTab {
             if go.is_none() { return None; }
         }
         #[cfg(windows)]
-        if share_here && let Some((id, address)) = retry {
+        if direct.is_some() || share_here {
+            let (id, proxy) = direct.map(|(id, port)| (id, Some(port)))
+                .unwrap_or_else(|| (retry.expect("explicit retry").0, None));
             self.hide();
             self.web = None;
+            self.profile = None;
             self.visible = false;
             self.current = Default::default();
             self.activity = None;
-            self.pending_read = Some(PendingRead { id: *id, address: address.clone(),
-                started: std::time::Instant::now(), result: None, loaded: Default::default() });
+            self.pending_read = Some(PendingRead { id, proxy, address: self.address.clone(),
+                started: std::time::Instant::now(), result: None, loaded: Default::default(), marked: None });
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
         }
         #[cfg(windows)]
@@ -606,8 +668,16 @@ impl BrowserTab {
             ui.colored_label(accent(), &self.error);
         }
         #[cfg(windows)]
-        if self.pending_read.is_some() {
-            ui.horizontal(|ui| { ui.spinner(); ui.label("Opening and reading the page for this chat…"); });
+        if let Some(read) = &self.pending_read {
+            let stop = ui.horizontal_wrapped(|ui| {
+                ui.spinner();
+                ui.label("Waiting for the requested page…");
+                read.proxy.is_some() && ui.button("Stop reading").clicked()
+            }).inner;
+            if stop {
+                return Some(Pick::PanelResult { id: self.pending_read.take()?.id, snapshot: None,
+                    error: "You stopped this browser read.".into() });
+            }
         }
         #[cfg(windows)]
         {
@@ -648,11 +718,25 @@ impl BrowserTab {
                 let loaded = self.pending_read.as_ref().map(|request| request.loaded.clone());
                 // A browser for the user, not the model: ordinary web pages, no access to
                 // Spindle or the workspace, and no downloads.
-                let web = wry::WebViewBuilder::new()
+                let port = self.pending_read.as_ref().and_then(|read| read.proxy);
+                let mut context;
+                let builder = if let Some(port) = port {
+                    use wry::WebViewBuilderExtWindows;
+                    let profile = match tempfile::Builder::new().prefix("spindle-browser-").tempdir() {
+                        Ok(profile) => profile,
+                        Err(error) => return Some(Pick::PanelResult { id: self.pending_read.take()?.id,
+                            snapshot: None, error: error.to_string() }),
+                    };
+                    context = wry::WebContext::new(Some(profile.path().to_owned()));
+                    self.profile = Some(profile);
+                    wry::WebViewBuilder::new_with_web_context(&mut context)
+                        .with_additional_browser_args(format!("--proxy-server=http://127.0.0.1:{port} --proxy-bypass-list=<-loopback> --disable-quic --force-webrtc-ip-handling-policy=disable_non_proxied_udp --disable-background-networking"))
+                } else { wry::WebViewBuilder::new() };
+                let web = builder
                     .with_url(&url)
-                    .with_incognito(share_here)
-                    .with_focused(!from_model)
-                    .with_devtools(true)
+                    .with_incognito(share_here || port.is_some())
+                    .with_focused(!from_model && port.is_none())
+                    .with_devtools(port.is_none())
                     .with_bounds(bounds)
                     .with_download_started_handler(|_, _| false)
                     .with_on_page_load_handler(move |event, _| {
@@ -661,9 +745,9 @@ impl BrowserTab {
                         }
                     })
                     .with_navigation_handler(move |url| {
-                        let ok = url.starts_with("http://")
+                        let ok = if port.is_some() { crate::browser::public_page(&url).is_ok_and(|u| u.scheme() == "https") } else { url.starts_with("http://")
                             || url.starts_with("https://")
-                            || url.starts_with("about:");
+                            || url.starts_with("about:") };
                         if ok && let Ok(mut c) = current.lock() {
                             *c = url;
                             ctx.request_repaint();
@@ -679,7 +763,12 @@ impl BrowserTab {
                         self.visible = true;
                         self.error.clear();
                     }
-                    Err(e) => self.error = format!("WebView2 could not start the browser: {e}"),
+                    Err(e) => {
+                        self.error = format!("WebView2 could not start the browser: {e}");
+                        if port.is_some() {
+                            return Some(Pick::PanelResult { id: self.pending_read.take()?.id, snapshot: None, error: self.error.clone() });
+                        }
+                    }
                 }
             } else {
                 ui.add_space(12.);
@@ -692,10 +781,30 @@ impl BrowserTab {
             if let Some(url) = go {
                 self.model_page = None;
                 self.address = url.clone();
-                self.error = match webbrowser::open(&url) {
-                    Ok(()) => String::new(),
-                    Err(e) => format!("Could not open the page: {e}"),
-                };
+                self.error.clear();
+                let (send, receive) = std::sync::mpsc::channel();
+                self.navigating = Some(receive);
+                let browser_path = browser_path.to_owned();
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from)
+                        .and_then(|rt| rt.block_on(crate::execution::open_public(url, 0, false, false, &browser_path, Default::default())));
+                    let _ = send.send(result);
+                    ctx.request_repaint();
+                });
+            }
+            if let Some(job) = &self.navigating {
+                match job.try_recv() {
+                    Ok(result) => {
+                        self.navigating = None;
+                        match result {
+                            Ok(text) => self.model_page = Some((self.address.clone(), text)),
+                            Err(error) => self.error = format!("Could not read this page. {error:#}"),
+                        }
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => { ui.spinner(); }
+                    Err(_) => { self.navigating = None; self.error = "Page read interrupted.".into(); }
+                }
             }
             ui.add_space(12.);
             if let Some((_, text)) = &self.model_page {
@@ -704,23 +813,55 @@ impl BrowserTab {
                     ui.add(egui::Label::new(text).wrap().selectable(true));
                 });
             } else {
-                ui.weak("The Windows build can display interactive pages here. Use Go to open a page in your browser.");
+                ui.weak("Enter a public address to read the page here.");
             }
         }
-        None
+        #[cfg(windows)]
+        { navigation_result }
+        #[cfg(not(windows))]
+        { None }
     }
 
     #[cfg(windows)]
     fn poll_shared_page(&mut self, ui: &mut egui::Ui, retry: Option<u64>, ready: bool) -> Option<Pick> {
         let mut pending = self.pending_read.take()?;
-        if retry != Some(pending.id) { return None; }
-        let result = if pending.started.elapsed().as_secs() >= 25 {
+        let direct = pending.proxy.is_some();
+        if !direct && retry != Some(pending.id) { return None; }
+        // A site can briefly navigate to a verification or consent screen.
+        // Wait for its normal return to the requested address before reading any text.
+        let waiting_for_return = direct && self.current.lock().ok().is_some_and(|current| {
+            !current.is_empty() && crate::browser::public_page(&current).is_ok_and(|mut url| {
+                url.set_fragment(None);
+                crate::browser::public_page(&pending.address).is_ok_and(|mut expected| {
+                    expected.set_fragment(None); url != expected
+                })
+            })
+        });
+        let loaded = pending.loaded.load(std::sync::atomic::Ordering::Relaxed);
+        if direct && loaded && pending.marked.is_none() && let Some(web) = &self.web {
+            let _ = web.evaluate_script(&crate::browser::panel_cursor_script());
+            pending.marked = Some(std::time::Instant::now());
+        } else if !loaded {
+            pending.marked = None;
+        }
+        let result = if waiting_for_return && pending.started.elapsed().as_secs() >= 30 {
+            return Some(Pick::PanelResult { id: pending.id, snapshot: None,
+                error: "The website redirected away from the requested page.".into() });
+        } else if pending.marked.is_some_and(|mark| mark.elapsed().as_millis() < 500) {
+            None
+        } else if pending.started.elapsed().as_secs() >= 30 {
             Some(Err(anyhow::anyhow!("The page did not finish loading in time.")))
-        } else if !ready {
+        } else if !ready && !direct {
             None
         } else if let Some(receiver) = &pending.result {
             match receiver.try_recv() {
                 Ok(snapshot) if snapshot != "null" && snapshot.len() <= 300_000 => {
+                    if direct {
+                        let page = serde_json::from_str::<serde_json::Value>(&snapshot).ok();
+                        let stopped = page.as_ref().is_some_and(|v| v["stopped"] == true);
+                        return Some(Pick::PanelResult { id: pending.id, snapshot: page.filter(|v| v["address"].is_string()),
+                            error: if stopped { "You stopped this browser read." } else { "The page did not return a readable document." }.into() });
+                    }
                     Some(serde_json::from_str::<crate::browser::VisiblePage>(&snapshot)
                         .map_err(anyhow::Error::from)
                         .and_then(|page| page.read(&pending.address))
@@ -732,7 +873,12 @@ impl BrowserTab {
         } else if pending.loaded.load(std::sync::atomic::Ordering::Relaxed) && let Some(web) = &self.web {
             let (sender, receiver) = std::sync::mpsc::channel();
             let ctx = ui.ctx().clone();
-            match web.evaluate_script_with_callback(crate::browser::VISIBLE_PAGE_SCRIPT, move |snapshot| {
+            let script = if waiting_for_return {
+                "document.documentElement.dataset.spindleReadStopped === '1' ? {stopped:true} : null"
+            } else {
+                crate::browser::VISIBLE_PAGE_SCRIPT
+            };
+            match web.evaluate_script_with_callback(script, move |snapshot| {
                 let _ = sender.send(snapshot);
                 ctx.request_repaint();
             }) {
@@ -741,6 +887,7 @@ impl BrowserTab {
             }
         } else { None };
         match result {
+            Some(Err(error)) if direct => Some(Pick::PanelResult { id: pending.id, snapshot: None, error: error.to_string() }),
             Some(Ok(snapshot)) => Some(Pick::ShareBrowserPage { id: pending.id, snapshot }),
             Some(Err(error)) => {
                 self.hide();

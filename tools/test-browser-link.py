@@ -7,6 +7,7 @@ Set SPINDLE_BROWSER_FIXTURE_COWORK to test Cowork instead of Chat.
 Set SPINDLE_BROWSER_FIXTURE_GUIDED=launch to test opening a grouped tab from scratch.
 """
 import contextlib
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -225,6 +226,14 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                             return next((found for child in node.get("children", []) if (found := activity_node(child))), None)
                         overlay = activity_node(tree)
                         cursor = next(child for child in overlay["shadowRoots"][0]["children"] if child["nodeName"] == "SPAN")
+                        pointer_object = cdp.call("DOM.resolveNode", {"backendNodeId": cursor["backendNodeId"]}, page)["object"]["objectId"]
+                        painted = cdp.call("Runtime.callFunctionOn", {
+                            "objectId": pointer_object,
+                            "functionDeclaration": "function() {return getComputedStyle(this).backgroundImage}",
+                            "returnByValue": True,
+                        }, page)["result"]["value"]
+                        image = re.fullmatch(r'url\("data:image/png;base64,([^"]+)"\)', painted)
+                        assert image and base64.b64decode(image[1]) == (ROOT / "browser-extension/cursor.png").read_bytes(), "Wrong pointer artwork"
                         attributes = cursor["attributes"]
                         assert "hidden" not in attributes, "Cursor disappeared before the tab was released"
                         expected = cdp.call("Runtime.evaluate", {
