@@ -474,7 +474,20 @@ impl Desktop {
                     if ui.checkbox(&mut allowed, "Allow sandboxed jobs from this device").changed() {
                         send.push(format!("/remote {} {id}", if allowed { "allow" } else { "deny" }));
                     }
-                    ui.weak("Project file transfer, unsandboxed jobs, and remote Computer use are unavailable.");
+                    if allowed {
+                        ui.horizontal_wrapped(|ui| {
+                            let host_os = std::env::consts::OS;
+                            for kind in crate::sync::placement::Kind::OPERATIONS {
+                                if kind.supports(host_os) {
+                                    let mut enabled = !rules.blocked_jobs.contains(&kind);
+                                    if ui.checkbox(&mut enabled, kind.label()).changed() {
+                                        send.push(change(&format!("job:{}", kind.key()), enabled));
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    ui.weak("Remote work runs in this device’s sandbox. Computer use stays on the device where you start it.");
                     ui.horizontal_wrapped(|ui| {
                         if f.confirm_remove.as_deref() == Some(id.as_str()) {
                             if ui
@@ -599,7 +612,7 @@ impl Desktop {
             ui.weak(if sync.switches.peers {
                 "Your devices on the same network find each other and sync directly: no server or folder needed. A folder or server also reaches devices that aren't on the network."
             } else {
-                "Syncing on your network is off (see What syncs)."
+                "Syncing on your network is off. You can enable it in Sync defaults."
             });
             for (i, l) in sync.links.iter().enumerate() {
                 if matches!(&l.place, crate::sync::adapter::Place::Peer { device: Some(_), .. }) {
@@ -699,8 +712,8 @@ impl Desktop {
             });
         });
         // What syncs and when.
-        card(ui, "What syncs", |ui| {
-            ui.weak("These defaults apply across projects on this device. Each project can override conversation and file sync.");
+        card(ui, "Sync defaults", |ui| {
+            ui.weak("These defaults apply across projects on this device. Each project can override conversation sync.");
             let s = &sync.switches;
             let mut row = |ui: &mut egui::Ui, on: bool, name: &str, label: &str, hover: &str| {
                 let mut v = on;
@@ -717,13 +730,6 @@ impl Desktop {
                 "conversations",
                 "Conversations",
                 "The default for every project; a project can override it.",
-            );
-            row(
-                ui,
-                s.files,
-                "files",
-                "Project files",
-                "The default for every project; a project can override it. (File transfer arrives in the next update; the choice is kept now.)",
             );
             row(ui, s.skills, "skills", "Installed skills", "Share installed skills with devices that enable this option.");
             row(
@@ -801,17 +807,13 @@ impl Desktop {
                         if ps.paused {
                             ui.weak("Paused on all devices");
                         }
-                        for (key, label, value) in [
-                            ("conversations", "Conversations", ps.conversations),
-                            ("files", "Files", ps.files),
-                        ] {
-                            let text = match value {
-                                None => format!("{label}: use default"),
-                                Some(true) => format!("{label}: sync"),
-                                Some(false) => format!("{label}: keep here"),
-                            };
-                            crate::widgets::InlineChoice::from_id_salt((key, p))
-                                .selected_text(text)
+                        let conversations = match ps.conversations {
+                            None => "Conversations: use default",
+                            Some(true) => "Conversations: sync",
+                            Some(false) => "Conversations: keep here",
+                        };
+                        crate::widgets::InlineChoice::from_id_salt(("conversations", p))
+                                .selected_text(conversations)
                                 .show_ui(ui, |ui| {
                                     for (v, l) in [
                                         ("global", "Use default"),
@@ -820,13 +822,12 @@ impl Desktop {
                                     ] {
                                         if ui.selectable_label(false, l).clicked() {
                                             send.push(format!(
-                                                "/sync project {} {key}={v}",
+                                                "/sync project {} conversations={v}",
                                                 p.display()
                                             ));
                                         }
                                     }
                                 });
-                        }
                         let mut hidden = ps.hidden;
                         if ui
                             .checkbox(&mut hidden, "Don't show on other devices")
@@ -893,9 +894,9 @@ impl Desktop {
         let saved = self.view.state.preferences.projects_dir.clone();
         let waiting = self.waiting_projects();
         ui.weak(if saved.is_empty() {
-            "Choose where projects from your other devices are kept here. Each gets a folder with its name, notes and chats; its files come too only if that project syncs files."
+            "Choose where projects from your other devices are kept here. Each gets a folder with its name, notes and chats. Project files stay on the original device."
         } else {
-            "Each project from another device has a folder here, with its name, notes and chats; its files come too only if that project syncs files."
+            "Each project from another device has a folder here, with its name, notes and chats. Project files stay on the original device."
         });
         if !waiting.is_empty() {
             ui.label(format!("Waiting for a folder: {}", waiting.join(", ")));

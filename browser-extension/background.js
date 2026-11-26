@@ -1,4 +1,5 @@
 let current;
+let connectionAttempt = 0;
 let nativePort;
 let pollTimer;
 let enabled = false;
@@ -7,10 +8,12 @@ const clientId = crypto.randomUUID().replaceAll("-", "");
 const browser = /Edg\//.test(navigator.userAgent) ? "edge" : "chrome";
 const browserPermissions = { permissions: ["tabs"] };
 const revokedKey = tabId => `revoked:${tabId}`;
+const revokingTabs = new Set();
 
 async function isRevoked(tabId) {
   const key = revokedKey(tabId);
-  return Boolean((await chrome.storage.session.get(key))[key]);
+  const saved = await chrome.storage.session.get(key);
+  return revokingTabs.has(tabId) || Boolean(saved[key]);
 }
 
 async function groupTab(tab) {
@@ -71,7 +74,8 @@ async function heartbeat() {
   enabled = await chrome.permissions.contains(browserPermissions);
   const tab = enabled ? await activeTab() : null;
   if (port === nativePort) {
-    port.postMessage({ browser: { id: clientId, browser, ready: enabled, has_tab: Boolean(tab), guided: true,
+    port.postMessage({ browser: { id: clientId, browser, version: chrome.runtime.getManifest().version,
+      ready: enabled, has_tab: Boolean(tab), guided: true,
       managed: Boolean(globalThis.spindleManagedProfile), located } });
   }
 }
@@ -90,6 +94,7 @@ function startNative() {
       clearTab();
     } else if (message.connect) {
       clearTab();
+      const attempt = connectionAttempt;
       let tab;
       let error;
       try {
@@ -99,7 +104,7 @@ function startNative() {
           error = "You disconnected this tab. To use it again, open Browser Link in that tab and choose Allow this tab again.";
         }
       } catch (problem) { error = problem.message; }
-      if (port !== nativePort) return;
+      if (port !== nativePort || attempt !== connectionAttempt) return;
       if (!tab) {
         port.postMessage({ tab: null, error });
         return;
@@ -139,11 +144,8 @@ startNative();
 chrome.runtime.onMessage.addListener((message, sender, respond) => {
   if (message.kind === "revoke-tab" && sender.id === chrome.runtime.id && sender.frameId === 0
       && current?.tabId === sender.tab?.id && current.nonce === message.nonce) {
-    const tabId = current.tabId;
-    chrome.storage.session.set({[revokedKey(tabId)]: true}).then(() => {
-      if (current?.tabId === tabId) stop();
-    }).catch(() => { if (current?.tabId === tabId) stop(); });
-    return;
+    revoke(current).then(respond);
+    return true;
   }
   if (sender.url !== chrome.runtime.getURL("popup.html")) return;
   if (message.kind === "status") {
@@ -156,12 +158,18 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
   }
   if (message.kind === "allow-tab") {
     activeTab().then(async tab => {
-      if (tab) await chrome.storage.session.remove(revokedKey(tab.id));
+      if (tab) {
+        await chrome.storage.session.remove(revokedKey(tab.id));
+        revokingTabs.delete(tab.id);
+      }
       respond(await popupStatus());
     });
     return true;
   }
-  if (message.kind === "disconnect") stop();
+  if (message.kind === "disconnect" && current) {
+    revoke(current).then(popupStatus).then(respond);
+    return true;
+  }
   if (message.kind === "request-site" && current?.ready && !current.rule) {
     sendPacket({ request_site: true });
     current.requested = true;
@@ -182,6 +190,7 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 });
 
 chrome.tabs.onRemoved.addListener(tabId => {
+  revokingTabs.delete(tabId);
   chrome.storage.session.remove(revokedKey(tabId)).catch(() => {});
   if (current?.tabId === tabId) stop();
 });
@@ -231,12 +240,25 @@ function clearActivity(session) {
 }
 
 function clearTab() {
+  connectionAttempt += 1;
   const old = current;
   current = undefined;
   if (old) {
     clearActivity(old);
     chrome.action.setBadgeText({ tabId: old.tabId, text: "" }).catch(() => {});
     popupStatus().then(status => chrome.runtime.sendMessage({kind: "update", status})).catch(() => {});
+  }
+}
+
+async function revoke(session) {
+  const tabId = session.tabId;
+  revokingTabs.add(tabId);
+  stop();
+  try {
+    await chrome.storage.session.set({[revokedKey(tabId)]: true});
+    revokingTabs.delete(tabId);
+  } catch {
+    // Keep the tab revoked in memory if session storage is temporarily unavailable.
   }
 }
 

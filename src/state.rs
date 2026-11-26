@@ -154,6 +154,8 @@ pub struct BrowserRead {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default, skip_serializing_if = "crate::sync::placement::Placement::is_empty")]
+    pub placement: crate::sync::placement::Placement,
     #[serde(skip)]
     pub browser_session: Option<crate::browser_link::Paired>,
     #[serde(skip)]

@@ -1,5 +1,6 @@
 pub mod adapter;
 pub mod remote;
+pub mod placement;
 pub mod chat;
 pub mod core;
 pub mod hosted;

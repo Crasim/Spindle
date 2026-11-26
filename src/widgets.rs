@@ -83,6 +83,31 @@ impl InlineChoice {
     }
 }
 
+pub fn switch(ui: &mut Ui, enabled: &mut bool, label: &str) -> Response {
+    let (rect, mut response) = ui.allocate_exact_size(vec2(48., 24.), Sense::click());
+    if response.clicked() {
+        *enabled = !*enabled;
+        response.mark_changed();
+    }
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *enabled, label)
+    });
+    let track = rect.shrink2(vec2(0., 2.));
+    let fill = if *enabled { accent() } else { raised() };
+    let stroke = if response.has_focus() || response.hovered() { ink() } else { line() };
+    ui.painter().rect(track, 10., fill, Stroke::new(1_f32, stroke), egui::StrokeKind::Inside);
+    let x = if *enabled { track.right() - 10. } else { track.left() + 10. };
+    ui.painter().circle_filled(pos2(x, track.center().y), 7., Color32::WHITE);
+    let (text, x, color) = if *enabled {
+        ("On", track.left() + 16., Color32::from_rgb(15, 21, 29))
+    } else {
+        ("Off", track.right() - 16., ink())
+    };
+    ui.painter().text(pos2(x, track.center().y), Align2::CENTER_CENTER,
+        text, FontId::proportional(10.), color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// The accent palette offered in Settings → Preferences.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Accent {

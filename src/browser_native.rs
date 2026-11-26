@@ -15,6 +15,8 @@ const LIFETIME: i64 = 8;
 pub struct BrowserClient {
     pub id: String,
     pub browser: crate::browser::LinkBrowser,
+    #[serde(default)]
+    pub version: Option<String>,
     pub ready: bool,
     pub has_tab: bool,
     #[serde(default)]

@@ -68,6 +68,7 @@ pub(super) struct BrowserSetup {
     install: Option<std::sync::mpsc::Receiver<anyhow::Result<std::path::PathBuf>>>,
     folder: Option<std::path::PathBuf>,
     existing_clients: Vec<String>,
+    updating: bool,
     manage: Option<crate::browser::LinkBrowser>,
     status: String,
     url: String,
@@ -646,8 +647,10 @@ impl Desktop {
                 });
             ui.add_space(14.);
             ui.heading("Appearance");
+            ui.add_space(5.);
             changed |= ui.checkbox(&mut prefs.nerd_stats, "Show nerd stats").changed();
             ui.weak("Show context usage, generation speed, and output token counts in chats.");
+            ui.add_space(8.);
             ui.horizontal(|ui| {
                 for (theme, label, tip) in [
                     (
@@ -709,7 +712,7 @@ impl Desktop {
             }
             ui.heading("Model guidance");
             changed |= ui.checkbox(&mut prefs.over_18, "I’m over 18").changed();
-            ui.weak("When unchecked, Spindle asks models to respond in a way suitable for minors. This is self-reported guidance. Models may ignore it.");
+            ui.weak("When unchecked, Spindle asks models to respond in a way suitable for minors. Models may ignore this guidance. Parental supervision is still needed.");
             ui.add_space(14.);
             ui.heading("Context compaction");
             ui.weak("Summarize older exchanges before the next request when the estimated prompt reaches this threshold.");
@@ -967,26 +970,6 @@ impl Desktop {
             self.browser_settings_card(ui, browser);
             ui.add_space(8.);
         }
-        egui::CollapsingHeader::new("Website access and model permissions").show(ui, |ui| {
-            self.browser_policy(ui);
-            if let Some(blocker) = crate::engine::browser_access_blocker(&self.view.state) {
-                ui.weak(blocker);
-            }
-            ui.add_space(12.);
-            ui.strong("Saved model permissions");
-            let grants: Vec<_> = self.view.state.grants.iter()
-                .filter(|grant| grant.risk == crate::policy::Risk::Browser)
-                .map(|grant| (grant.id, grant.describe())).collect();
-            if grants.is_empty() { ui.weak("No standing approvals."); }
-            for (id, description) in grants {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(description);
-                    if ui.small_button("Revoke").clicked() {
-                        self.send(format!("/revoke {id}"));
-                    }
-                });
-            }
-        });
         ui.add_space(12.);
         ui.horizontal_wrapped(|ui| {
             if ui.button("Sandbox and native builds").clicked() {
@@ -1056,7 +1039,8 @@ impl Desktop {
     fn browser_access_toggle(&mut self, ui: &mut egui::Ui, browser: crate::browser::LinkBrowser) {
         let mut enabled = !self.view.state.preferences.disabled_browsers.contains(&browser);
         let label = if enabled { "On" } else { "Off" };
-        if ui.toggle_value(&mut enabled, label).on_hover_text("Allow Spindle to use this browser in this workspace").changed() {
+        if crate::widgets::switch(ui, &mut enabled, browser.label())
+            .on_hover_text(format!("{label} · Allow Spindle to use this browser in this workspace")).changed() {
             self.send(format!("/browser-control {} {}", browser.key(), if enabled { "on" } else { "off" }));
         }
     }
@@ -1082,8 +1066,38 @@ impl Desktop {
         if self.browser_setup.browser == browser {
             self.browser_setup_details(ui);
         }
-        if ui.add_enabled(self.browser_setup.install.is_none(), egui::Button::new("Set up again")).clicked() {
+        let available = crate::browser_link::extension_version();
+        let versions: std::collections::BTreeSet<_> = self.view.browser_clients.iter()
+            .filter(|client| client.browser == browser && client.regular_profile())
+            .map(|client| client.version.as_deref().unwrap_or("Unknown")).collect();
+        let version_parts = |version: &str| version.split('.').map(str::parse::<u16>)
+            .collect::<Result<Vec<_>, _>>();
+        let latest = version_parts(available).expect("Bundled extension version is numeric");
+        let needs_update = versions.iter()
+            .any(|version| version_parts(version).map_or(true, |installed| installed < latest));
+        if !versions.is_empty() {
+            ui.label(format!("Installed · {}", versions.into_iter().collect::<Vec<_>>().join(", ")));
+        }
+        ui.weak(format!("Available with this build · {available}"));
+        if ui.add_enabled(self.browser_setup.install.is_none(),
+            egui::Button::new(if needs_update { "Update Browser Link" } else { "Set up again" })).clicked() {
             self.launch_browser_link(browser);
+            self.browser_setup.updating = needs_update;
+        }
+        ui.separator();
+        self.browser_policy(ui);
+        if let Some(blocker) = crate::engine::browser_access_blocker(&self.view.state) {
+            ui.weak(blocker);
+        }
+        ui.add_space(12.);
+        ui.strong("Saved model permissions");
+        for grant in self.view.state.grants.iter().filter(|grant| grant.risk == crate::policy::Risk::Browser) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(grant.describe());
+                if ui.small_button("Revoke").clicked() {
+                    let _ = self.tx.send(format!("/revoke {}", grant.id));
+                }
+            });
         }
     }
 
@@ -1203,6 +1217,7 @@ impl Desktop {
             let _ = tx.send(browser.prepare_existing_profile());
         });
         self.browser_setup.browser = browser;
+        self.browser_setup.updating = false;
         self.browser_setup.existing_clients = self.view.browser_clients.iter()
             .filter(|client| client.browser == browser && client.regular_profile())
             .map(|client| client.id.clone()).collect();
@@ -1223,11 +1238,15 @@ impl Desktop {
         if let Some(folder) = &setup.folder {
             let connected = self.view.browser_clients.iter().any(|client|
                 client.regular_profile() && client.browser == setup.browser
-                    && !setup.existing_clients.contains(&client.id));
+                    && !setup.existing_clients.contains(&client.id)
+                    && (!setup.updating || client.version.as_deref() == Some(crate::browser_link::extension_version())));
             if connected {
                 ui.strong(format!("Browser Link connected · {}", setup.browser.label()));
             } else {
                 ui.strong(format!("Ready to add to {}", setup.browser.label()));
+                if setup.updating {
+                    ui.label("In Manage extensions, remove the older Spindle Browser Link before loading this folder. Spindle will show the new version when it connects.");
+                }
                 if cfg!(windows) {
                     ui.label("Browser Link is unpacked in Downloads. In Manage extensions, turn on Developer mode, choose Load unpacked, and select the Browser Link folder.");
                 } else {
@@ -1291,6 +1310,7 @@ impl Desktop {
         use crate::browser_link::Mode;
         let policy = crate::browser_link::Policy::from_preferences(&self.view.state.preferences);
         ui.strong("Website access");
+        ui.weak("Website rules apply to both Edge and Chrome in this workspace.");
         ui.horizontal_wrapped(|ui| {
             for mode in [Mode::AllowAll, Mode::Allowlist, Mode::Blocklist, Mode::BlockAll] {
                 if ui.selectable_label(mode == policy.mode, mode.label()).clicked() {
@@ -1796,30 +1816,24 @@ impl Desktop {
                     .collect();
                 providers.sort_by_cached_key(|p| (self.provider_name(p).to_lowercase(), p.clone()));
                 providers.dedup();
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.model_query)
-                        .id_salt("settings-field-6")
-                            .hint_text("Search models")
-                            .desired_width(ui.available_width().min(240.)),
-                    );
-                    let label = self
-                        .model_provider
-                        .as_deref()
-                        .map(|p| self.provider_name(p).to_owned())
-                        .unwrap_or_else(|| "All providers".into());
-                    let mut choice = self.model_provider.clone();
-                    crate::widgets::InlineChoice::from_id_salt("model-provider-filter")
-                        .selected_text(label)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut choice, None, "All providers");
-                            for p in &providers {
-                                let name = self.provider_name(p).to_owned();
-                                ui.selectable_value(&mut choice, Some(p.clone()), name);
-                            }
-                        });
-                    self.model_provider = choice;
-                });
+                let width = ui.available_width().min(340.);
+                ui.add(egui::TextEdit::singleline(&mut self.model_query)
+                    .id_salt("settings-field-6")
+                    .hint_text("Search models")
+                    .desired_width(width));
+                let label = self.model_provider.as_deref()
+                    .map_or("All providers", |p| self.provider_name(p));
+                let mut choice = self.model_provider.clone();
+                crate::widgets::InlineChoice::from_label("Provider")
+                    .width(width)
+                    .selected_text(label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut choice, None, "All providers");
+                        for p in &providers {
+                            ui.selectable_value(&mut choice, Some(p.clone()), self.provider_name(p));
+                        }
+                    });
+                self.model_provider = choice;
                 let query = self.model_query.to_lowercase();
                 let shown: Vec<String> = self
                     .view
@@ -1958,10 +1972,12 @@ impl Desktop {
                     Some(v) => crate::ollama::ThinkInfo::label(v),
                     None => tuning.thinking.label().to_owned(),
                 };
+                let reported = self.view.think_levels.get(model).filter(|info| info.supported());
                 crate::widgets::InlineChoice::from_id_salt("tuning-thinking")
                     .selected_text(shown)
                     .show_ui(ui, |ui| {
-                        for t in Thinking::ALL {
+                        let standard = if reported.is_some() { &Thinking::ALL[..1] } else { &Thinking::ALL[..] };
+                        for &t in standard {
                             if ui
                                 .selectable_label(
                                     tuning.think_value.is_none() && tuning.thinking == t,
@@ -1971,6 +1987,16 @@ impl Desktop {
                             {
                                 tuning.thinking = t;
                                 tuning.think_value = None;
+                            }
+                        }
+                        if let Some(info) = reported {
+                            for value in &info.values {
+                                if ui.selectable_label(tuning.think_value.as_ref() == Some(value),
+                                    crate::ollama::ThinkInfo::label(value)).clicked()
+                                {
+                                    tuning.thinking = Thinking::Default;
+                                    tuning.think_value = Some(value.clone());
+                                }
                             }
                         }
                     });
@@ -2168,7 +2194,9 @@ impl Desktop {
         };
         let selected = |t: &crate::state::Tuning| {
             steps.iter().position(|(_, s)| match s {
-                Step::Value(v) => t.think_value.as_ref() == Some(v),
+                Step::Value(v) => t.think_value.as_ref() == Some(v)
+                    || (t.think_value.is_none()
+                        && (t.thinking.effort() == Some(v.as_str()) || (v == "none" && t.thinking == Thinking::Off))),
                 Step::Level(l) => t.think_value.is_none() && t.thinking == *l,
             })
         };

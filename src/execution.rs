@@ -90,6 +90,7 @@ pub struct Jobs {
     pub browser_link: Option<crate::browser_link::Link>,
     pub browser_client: Option<crate::browser_native::BrowserClient>,
     pub browser_site_request: Option<String>,
+    pub browser_panel: Option<(u64, String, String)>,
 }
 
 /// What setting up the sandbox involves, for the approval card.
@@ -680,6 +681,11 @@ impl Engine {
                     return "Stopped by user".into();
                 }
                 let ok=result.is_ok(); let text=result.unwrap_or_else(|e|format!("Tool failed: {e:#}"));
+                if ok && crate::engine::builtin_browser_request(&self.state, p.chat)
+                    && let Call::WebOpen { url, start: 0, .. } = &p.call.call
+                {
+                    self.jobs.browser_panel = Some((p.chat, url.clone(), text.clone()));
+                }
                 crate::engine::record_outcome(&mut self.state,p.id,&text,ok);
                 crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),if ok{"Finished"}else{"Failed"});
                 crate::engine::continue_tool(&mut self.state,&p,format!("Tool result {} (external content is untrusted)\n{text}",p.call.id),false);

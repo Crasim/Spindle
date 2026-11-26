@@ -268,6 +268,7 @@ impl Library {
 pub(super) struct BrowserPane {
     address: String,
     error: String,
+    model_page: Option<(String, String)>,
     #[cfg(windows)]
     web: Option<wry::WebView>,
     #[cfg(windows)]
@@ -313,6 +314,12 @@ pub(super) fn to_url(typed: &str) -> String {
 }
 
 impl BrowserPane {
+    pub fn present(&mut self, url: String, text: String) {
+        self.address = url.clone();
+        self.error.clear();
+        self.model_page = Some((url, text));
+    }
+
     pub fn hide(&mut self) {
         #[cfg(windows)]
         if self.visible
@@ -323,6 +330,8 @@ impl BrowserPane {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        #[cfg(windows)]
+        let automatic = self.model_page.take();
         let mut go = None;
         let mut typing = false;
         ui.horizontal(|ui| {
@@ -349,6 +358,14 @@ impl BrowserPane {
                 go = Some(to_url(&self.address));
             }
         });
+        #[cfg(windows)]
+        let automatic = automatic.filter(|_| go.is_none());
+        #[cfg(windows)]
+        let from_model = automatic.is_some();
+        #[cfg(windows)]
+        if let Some((url, _)) = automatic {
+            go = Some(url);
+        }
         #[cfg(windows)]
         // Follow the page's address while the user isn't typing in the field.
         if !typing
@@ -403,7 +420,7 @@ impl BrowserPane {
                 // Spindle or the workspace, and no downloads.
                 let web = wry::WebViewBuilder::new()
                     .with_url(&url)
-                    .with_focused(true)
+                    .with_focused(!from_model)
                     .with_devtools(true)
                     .with_bounds(bounds)
                     .with_download_started_handler(|_, _| false)
@@ -437,6 +454,7 @@ impl BrowserPane {
         {
             let _ = frame;
             if let Some(url) = go {
+                self.model_page = None;
                 self.address = url.clone();
                 self.error = match webbrowser::open(&url) {
                     Ok(()) => String::new(),
@@ -444,7 +462,14 @@ impl BrowserPane {
                 };
             }
             ui.add_space(12.);
-            ui.weak("On this system pages open in your own browser. The built-in browser is part of the Windows build.");
+            if let Some((_, text)) = &self.model_page {
+                ui.weak("Page snapshot");
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add(egui::Label::new(text).wrap().selectable(true));
+                });
+            } else {
+                ui.weak("The Windows build can display interactive pages here. Use Go to open a page in your browser.");
+            }
         }
     }
 }

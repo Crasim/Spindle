@@ -90,6 +90,7 @@ pub fn reasoning_name(id: &str) -> bool {
     ]
     .iter()
     .any(|k| base.contains(k))
+        || gpt_major(base).is_some_and(|major| major >= 6)
         || ["o1", "o3", "o4"]
             .iter()
             .any(|k| base == *k || base.starts_with(&format!("{k}-")))
@@ -98,6 +99,33 @@ pub fn reasoning_name(id: &str) -> bool {
 fn base_name(id: &str) -> String {
     let tag = route(id).1.to_ascii_lowercase();
     tag.rsplit('/').next().unwrap_or(&tag).to_owned()
+}
+
+fn gpt_major(tag: &str) -> Option<u32> {
+    tag.strip_prefix("gpt-")?.split(['.', '-']).next()?.parse().ok()
+}
+
+pub(crate) fn openai_efforts(protocol: Protocol, model: &str) -> Option<crate::ollama::ThinkInfo> {
+    if !matches!(protocol, Protocol::ChatGpt | Protocol::Responses) {
+        return None;
+    }
+    let tag = base_name(model);
+    let major = gpt_major(&tag)?;
+    if major < 6 {
+        return None;
+    }
+    let matches_family = |family: &str| {
+        tag == family || tag.strip_prefix(family).is_some_and(|rest| rest.starts_with('-'))
+    };
+    let off = ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"].into_iter().any(matches_family);
+    let mut values = Vec::new();
+    if off { values.push("none".into()); }
+    values.extend(["low", "medium", "high"].map(String::from));
+    if off || ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"]
+        .into_iter().any(matches_family) {
+        values.extend(["xhigh", "max"].map(String::from));
+    }
+    Some(crate::ollama::ThinkInfo { values, default: None })
 }
 
 /// Known image-capable model families, for providers whose catalogs don't say.
@@ -847,6 +875,25 @@ fn apply_tuning(
                 body["temperature"] = json!(t.min(1.0));
             }
         }
+        Protocol::Responses | Protocol::ChatGpt if let Some(profile) =
+            body["model"].as_str().and_then(|model| openai_efforts(protocol, model)) =>
+        {
+            let effort = tuning.think_value.as_deref()
+                .or_else(|| if thinking == Thinking::Off { Some("none") } else { thinking.effort() });
+            if let Some(effort) = effort {
+                let effort = if profile.values.iter().any(|value| value == effort) {
+                    effort
+                } else if matches!(effort, "none" | "minimal") {
+                    "low"
+                } else {
+                    "high"
+                };
+                body["reasoning"] = json!({ "effort": effort });
+                if effort == "none" && let Some(t) = tuning.temperature {
+                    body["temperature"] = json!(t);
+                }
+            }
+        }
         Protocol::Responses | Protocol::ChatGpt => {
             match thinking {
                 Thinking::Off => body["reasoning"] = json!({"effort": "minimal"}),
@@ -1066,6 +1113,28 @@ mod tests {
             serde_json::to_value(&m).unwrap()["images"][0],
             "iVBORw0KGgo"
         );
+    }
+
+    #[test]
+    fn gpt_six_oauth_uses_the_selected_reasoning_effort() {
+        assert!(reasoning_name("@chatgpt/gpt-6.2-sol"));
+        assert!(reasoning_name("@chatgpt/gpt-7-preview"));
+        let efforts = openai_efforts(Protocol::ChatGpt, "gpt-6.2-sol").unwrap();
+        assert_eq!(efforts.values, ["low", "medium", "high", "xhigh", "max"]);
+        let mut tuning = crate::state::Tuning {
+            think_value: Some("xhigh".into()), temperature: Some(0.2), ..Default::default()
+        };
+        let mut body = json!({"model":"gpt-6.2-sol"});
+        apply_tuning(Protocol::ChatGpt, &tuning, &mut body, 4096);
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert!(body.get("temperature").is_none());
+        tuning.think_value = None;
+        tuning.thinking = crate::state::Thinking::Off;
+        apply_tuning(Protocol::ChatGpt, &tuning, &mut body, 4096);
+        assert_eq!(body["reasoning"]["effort"], "low");
+        body["model"] = json!("gpt-6.1-terra");
+        apply_tuning(Protocol::ChatGpt, &tuning, &mut body, 4096);
+        assert_eq!(body["reasoning"]["effort"], "none");
     }
 
     #[test]

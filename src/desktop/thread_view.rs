@@ -77,10 +77,14 @@ pub(super) fn thread_button(
         size,
         egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min),
         |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(9., 5.);
+            let inactive = &mut ui.visuals_mut().widgets.inactive;
+            inactive.weak_bg_fill = Color::TRANSPARENT;
+            inactive.bg_stroke = egui::Stroke::NONE;
             ui.add(
                 egui::Button::new(title)
                     .truncate()
-                    .frame(false)
+                    .frame(true)
                     .corner_radius(8)
                     .selected(selected)
                     .min_size(size),
@@ -576,7 +580,7 @@ impl Desktop {
                                 let r = thread_button(
                                     ui,
                                     label,
-                                    egui::vec2(width, 27.),
+                                    egui::vec2(width, 32.),
                                     id == state.chat_id && self.page == Page::Chat,
                                 )
                                 .on_hover_text(&title);

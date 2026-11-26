@@ -316,7 +316,8 @@ impl ThinkInfo {
     }
     pub fn label(value: &str) -> String {
         match value {
-            "false" => "Off".into(),
+            "false" | "none" => "Off".into(),
+            "xhigh" => "Extra high".into(),
             "true" => "On".into(),
             v => {
                 let mut c = v.chars();

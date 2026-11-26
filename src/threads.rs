@@ -159,6 +159,7 @@ impl State {
             self.switch_chat(next)?;
         }
         self.chats.remove(&id);
+        self.placement.forget_chat(id);
         Ok(())
     }
 }

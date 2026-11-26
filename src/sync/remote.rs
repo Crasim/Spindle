@@ -5,6 +5,7 @@ use crate::{
     sync::{
         adapter::SyncState,
         core::{self, Kind},
+        placement::Kind as JobKind,
         space::Space,
     },
     tools::Call,
@@ -44,6 +45,18 @@ enum Operation {
     Apk { package: String, activity: String },
 }
 
+impl Operation {
+    fn job_kind(&self) -> Option<JobKind> {
+        match self {
+            Self::Inventory => None,
+            Self::Tool { .. } => Some(JobKind::Tool),
+            Self::Build => Some(JobKind::Build),
+            Self::Python => Some(JobKind::Python),
+            Self::Apk { .. } => Some(JobKind::Apk),
+        }
+    }
+}
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Receipt {
     ok: bool,
@@ -63,12 +76,98 @@ pub struct Remote {
     running: Option<String>,
     #[serde(skip)]
     pub running_peer: Option<String>,
+    #[serde(skip)]
+    running_kind: Option<JobKind>,
     received: BTreeMap<String, Receipt>,
     waiting: BTreeMap<String, (u64, String, u32, u64)>,
     #[serde(skip)]
     pending: BTreeMap<String, Request>,
     #[serde(skip)]
     pub platforms: BTreeMap<String, String>,
+    #[serde(skip)]
+    device_names: BTreeMap<String, String>,
+}
+
+impl Remote {
+    pub fn running_matches_rule(&self, peer: &str, rule: &str) -> bool {
+        self.running_peer.as_deref() == Some(peer)
+            && (rule == "sync" || self.running_kind.is_some_and(|kind|
+                rule.strip_prefix("job:") == Some(kind.key())))
+    }
+
+    pub fn host_label(&self, device: &str) -> String {
+        let name = self.device_names.get(device).cloned()
+            .unwrap_or_else(|| format!("Device {}", device.chars().take(8).collect::<String>()));
+        let platform = match self.platforms.get(device).map(String::as_str) {
+            Some("windows") => "Windows",
+            Some("linux") => "Linux",
+            Some("android") => "Android",
+            Some("macos") => "macOS",
+            _ => "Unavailable",
+        };
+        format!("{name} · {platform}")
+    }
+
+    pub fn jobs(&self) -> Vec<Job<'_>> {
+        let now = crate::automation::now();
+        let mut jobs: Vec<_> = self.sent.iter().map(|(id, request)| {
+            let result = self.received.get(id);
+            let status = match result {
+                Some(result) if result.ok => "Completed",
+                Some(_) => "Failed",
+                None if fresh(request, now) => "Waiting for host",
+                None => "Expired",
+            };
+            Job {
+                id, host: &request.to, created: request.created, status,
+                label: request.label(), detail: result.map(|r| r.text.as_str()),
+                output: result.is_some_and(|r| r.ok && !r.bytes.is_empty()),
+            }
+        }).collect();
+        jobs.sort_unstable_by_key(|job| std::cmp::Reverse((job.status == "Waiting for host", job.created, job.id)));
+        jobs
+    }
+}
+
+fn permission_denial(
+    allowed: &BTreeSet<String>,
+    rules: Option<&super::adapter::DeviceRules>,
+    request: &Request,
+) -> Option<String> {
+    if !allowed.contains(&request.from) {
+        Some("The host has not allowed jobs from this device. On the host, open Settings › Sync › Devices › Manage and enable Allow sandboxed jobs for the source device.".into())
+    } else {
+        let kind = request.operation.job_kind()?;
+        rules.filter(|rules| rules.blocked_jobs.contains(&kind)).map(|_| {
+            format!("The host has disabled {} for this device. Change the job permission in Settings › Sync › Devices › Manage on the host.", kind.label().to_lowercase())
+        })
+    }
+}
+
+pub struct Job<'a> {
+    pub id: &'a str,
+    pub host: &'a str,
+    created: i64,
+    pub status: &'static str,
+    pub label: String,
+    pub detail: Option<&'a str>,
+    pub output: bool,
+}
+
+impl Request {
+    pub fn destination(&self) -> &str {
+        &self.to
+    }
+
+    fn label(&self) -> String {
+        match &self.operation {
+            Operation::Inventory => "Check capabilities".into(),
+            Operation::Tool { command, .. } => format!("Run {command}"),
+            Operation::Build => format!("Build and test {}", self.entry),
+            Operation::Python => format!("Run {}", self.entry),
+            Operation::Apk { package, .. } => format!("Build APK for {package}"),
+        }
+    }
 }
 fn signature(r: &Request) -> Result<String> {
     Ok(core::hex(&core::sha256(&serde_json::to_vec(r)?)))
@@ -167,8 +266,11 @@ pub fn import(sync: &mut SyncState, space: &Space) -> Result<usize> {
     let remote = &mut sync.remote;
     remote.pending.clear();
     remote.platforms.clear();
+    remote.device_names = space.members().into_iter().filter(|member| member.removed.is_none())
+        .map(|member| (member.id, member.name)).collect();
     remote.allowed.retain(|id| space.is_member(id));
     let mut count = 0;
+    let mut rejected = 0;
     let now = crate::automation::now();
     for (_, e, b) in space.store.records.iter().filter_map(|(rid, e)| {
         if e.kind != Kind::Settings {
@@ -195,7 +297,6 @@ pub fn import(sync: &mut SyncState, space: &Space) -> Result<usize> {
             continue;
         } else if let Some(id) = key.strip_prefix("request/") {
             if !valid_id(id)
-                || !remote.allowed.contains(&e.device)
                 || remote.answers.contains_key(id)
                 || remote.pending.len() >= 8
             {
@@ -210,6 +311,16 @@ pub fn import(sync: &mut SyncState, space: &Space) -> Result<usize> {
                 && r.validate().is_ok()
                 && signature(&r)? == id
             {
+                if let Some(text) = permission_denial(&remote.allowed, rules.get(&e.device), &r) {
+                    if rejected < 8 && !remote.claims.contains_key(id) {
+                        remote.answers.insert(id.into(), Receipt {
+                            text,
+                            ..Default::default()
+                        });
+                        rejected += 1;
+                    }
+                    continue;
+                }
                 if remote.claims.contains_key(id) {
                     if remote.running.as_deref() != Some(id) {
                         remote.answers.insert(
@@ -350,7 +461,7 @@ pub fn command(state: &mut State, root: &Path, args: &str) -> Result<String> {
         sync.remote.pending.retain(|_, r| r.from != to);
         return Ok("Future jobs from this peer disabled".into());
     }
-    ensure!(!sync.paused, "Resume sync before sending a job");
+    ensure!(!sync.paused && !sync.source_paused(&to), "Resume sync with the destination before sending a job");
     let operation = match op {
         "inventory" => Operation::Inventory,
         "tool" => Operation::Tool {
@@ -391,6 +502,7 @@ pub fn command(state: &mut State, root: &Path, args: &str) -> Result<String> {
             .collect::<Vec<_>>(),
         operation,
         args,
+        None,
     )?;
     let id = signature(&r)?;
     sync.remote.sent.insert(id.clone(), r);
@@ -406,6 +518,7 @@ fn snapshot(
     inputs: &[String],
     operation: Operation,
     args: Vec<String>,
+    inline: Option<&str>,
 ) -> Result<Request> {
     let mut files = BTreeMap::new();
     let mut remaining = MAX_SOURCE;
@@ -417,15 +530,16 @@ fn snapshot(
             files.len() < 16 && crate::native::stage_path(name)? == name,
             "Select up to 16 relative source files"
         );
-        let (path, inside) = crate::tools::resolve(&origin, name)?;
-        ensure!(
-            inside && path.is_file(),
-            "Source must be inside this conversation's workspace"
-        );
-        let mut data = String::new();
-        fs::File::open(path)?
-            .take(remaining as u64 + 1)
-            .read_to_string(&mut data)?;
+        let data = if let Some(code) = inline.filter(|_| name == entry) {
+            code.to_owned()
+        } else {
+            let (path, inside) = crate::tools::resolve(origin, name)?;
+            ensure!(inside && path.is_file() && !crate::policy::protected(&path),
+                "Source must be a regular file inside the conversation's workspace");
+            let mut text = String::new();
+            fs::File::open(path)?.take(remaining as u64 + 1).read_to_string(&mut text)?;
+            text
+        };
         ensure!(data.len() <= remaining, "Remote source exceeds 256 KiB");
         remaining -= data.len();
         ensure!(
@@ -447,65 +561,78 @@ fn snapshot(
     Ok(r)
 }
 
-pub fn snapshot_call(state: &State, root: &Path, call: &Call) -> Result<(Request, String)> {
-    let Call::RemoteJob {
-        device,
-        operation,
-        path,
-        inputs,
-        args,
-        package,
-        activity,
-        tool,
-        command,
-    } = call
-    else {
-        bail!("Expected a remote job")
-    };
+pub fn selected_target(state: &State, chat: u64, call: &Call) -> Option<String> {
+    use super::placement::{Kind, Scope, Target};
+    if let Call::RemoteJob { device, .. } = call {
+        return Some(device.clone());
+    }
+    match state.placement.effective(state, &Scope::Chat(chat), Kind::for_call(call)?)? {
+        Target::Device(id) => Some(id.clone()),
+        Target::Local => None,
+    }
+}
+
+pub fn snapshot_call(state: &State, root: &Path, chat: u64, device: &str, call: &Call) -> Result<(Request, String)> {
+    use super::placement::{Kind, Scope, Target};
     let sync = state
         .space
         .as_ref()
         .context("Set up sync and pair a destination device in Settings › Sync before requesting remote work.")?;
     ensure!(!sync.paused, "Sync is paused. Resume it in Settings › Sync before requesting remote work.");
-    ensure!(
-        sync.remote.platforms.contains_key(device) && device != &sync.identity.device.id,
-        "Choose a different device from the paired destinations in Settings › Sync."
-    );
-    let op = match operation.as_str() {
-        "inventory" => Operation::Inventory,
-        "tool" => Operation::Tool {
-            id: tool.clone(),
-            command: command.clone(),
-        },
-        "build" => Operation::Build,
-        "run" => Operation::Python,
-        "apk" => Operation::Apk {
-            package: package.clone(),
-            activity: activity.clone(),
-        },
-        _ => bail!("Choose inventory, tool, build, run or apk"),
+    let host = sync.remote.host_label(device);
+    let os = sync.remote.platforms.get(device).filter(|_| device != sync.identity.device.id)
+        .with_context(|| format!("{host} is unavailable. Choose a paired destination in Run on."))?;
+    ensure!(!sync.source_paused(device), "Sync with {host} is paused. Resume it in Settings › Sync.");
+    if let Some(kind) = Kind::for_call(call) {
+        if let Some(target) = state.placement.effective(state, &Scope::Chat(chat), kind) {
+            ensure!(*target == Target::Device(device.to_owned()),
+                "{} is routed to {}. Change Run on before sending it to {host}.",
+                kind.label(), super::placement::target_label(state, Some(target)));
+        }
+        ensure!(kind.supports(os), "{host} does not support {}. Change its destination in Run on.", kind.label().to_lowercase());
+    }
+    let (op, path, inputs, args, inline) = match call {
+        Call::RemoteJob { operation, path, inputs, args, package, activity, tool, command, .. } => {
+            let op = match operation.as_str() {
+                "inventory" => Operation::Inventory,
+                "tool" => Operation::Tool { id: tool.clone(), command: command.clone() },
+                "build" => Operation::Build,
+                "run" => Operation::Python,
+                "apk" => Operation::Apk { package: package.clone(), activity: activity.clone() },
+                _ => bail!("Choose inventory, tool, build, run or apk"),
+            };
+            (op, path.as_str(), inputs.as_slice(), args.as_slice(), None)
+        }
+        Call::BuildBinary { path, inputs, args, .. } => (Operation::Build, path.as_str(), inputs.as_slice(), args.as_slice(), None),
+        Call::Python { file, args, code } => (Operation::Python, file.as_str(), &[][..], args.as_deref().unwrap_or(&[]), code.as_deref()),
+        Call::RunTool { id, command, args } => (Operation::Tool { id: id.clone(), command: command.clone() }, "", &[][..], args.as_slice(), None),
+        Call::BuildApk { package, activity, sources, .. } => {
+            let (first, rest) = sources.split_first().context("Select the Java source files for the APK")?;
+            (Operation::Apk { package: package.clone(), activity: activity.clone() }, first.as_str(), rest, &[][..], None)
+        }
+        Call::Test { .. } => bail!("The remote host requires an explicit Python script and input files. Use Python or choose This device for unittest discovery."),
+        Call::TestBinary { .. } => bail!("A remote native build already runs its smoke test. Choose This device to retest a binary built here."),
+        _ => bail!("This tool runs on this device"),
     };
     let req = snapshot(
         sync,
         root,
-        device.clone(),
-        path.clone(),
+        device.to_owned(),
+        path.to_owned(),
         inputs,
         op,
-        args.clone(),
+        args.to_vec(),
+        inline,
     )?;
+    let sources = if req.files.is_empty() { "No source files".into() } else { req.files.keys().cloned().collect::<Vec<_>>().join("\n") };
     let preview = format!(
-        "Send these source files to the encrypted sync pool for {} on {} ({}). Pool members can read the inputs and output.\n{}\nArguments: {}",
-        if operation == "tool" {
-            format!("tool {tool} command {command}")
-        } else {
-            operation.clone()
-        },
-        device,
-        &sync.remote.platforms[device],
-        req.files.keys().cloned().collect::<Vec<_>>().join("\n"),
+        "Run on {host}\n\n{}\n\n{sources}\nArguments: {}\n\nAll pool members can read the submitted files and returned output.",
+        req.label(),
         serde_json::to_string(args)?
     );
+    let preview = if let Some(code) = inline {
+        format!("{preview}\n\nInline script\n{}", code.chars().take(4_000).collect::<String>())
+    } else { preview };
     Ok((req, preview))
 }
 
@@ -520,6 +647,7 @@ pub fn submit_call(state: &mut State, p: &crate::state::Pending, req: Request) -
             && p.risk == crate::policy::Risk::Native
             && req.from == sync.identity.device.id
             && sync.remote.platforms.contains_key(&req.to)
+            && !sync.source_paused(&req.to)
             && fresh(&req, crate::automation::now()),
         "Remote approval expired or target unavailable"
     );
@@ -561,6 +689,7 @@ pub fn deliver(state: &mut State, sync: &mut SyncState) {
         })
         .collect();
     for (id, (ok, text)) in complete {
+        let host = sync.remote.host_label(&sync.remote.sent[&id].to);
         let Some((chat, model, steps, action)) = sync.remote.waiting.remove(&id) else {
             continue;
         };
@@ -569,7 +698,7 @@ pub fn deliver(state: &mut State, sync: &mut SyncState) {
             crate::engine::set_tool_note(
                 state,
                 chat,
-                "Remote sandbox".into(),
+                format!("Remote sandbox · {host}"),
                 if ok { "Completed" } else { "Failed" },
             );
             crate::engine::continue_with(
@@ -706,10 +835,15 @@ impl crate::engine::Engine {
         let Some((id, r)) = sync.remote.pending.pop_first() else {
             return Ok(());
         };
-        if sync.source_paused(&r.from) || !sync.remote.allowed.contains(&r.from)
+        if sync.source_paused(&r.from)
             || !fresh(&r, crate::automation::now())
             || sync.remote.answers.contains_key(&id)
         {
+            return Ok(());
+        }
+        if let Some(text) = permission_denial(&sync.remote.allowed, sync.device_rules.get(&r.from), &r) {
+            sync.remote.answers.insert(id, Receipt { text, ..Default::default() });
+            sync.wanted = Some(crate::sync::adapter::Want::Now);
             return Ok(());
         }
         let space = sync.identity.keys.space.clone();
@@ -717,6 +851,7 @@ impl crate::engine::Engine {
         sync.remote.claims.insert(id.clone(), r.created);
         sync.remote.running = Some(id.clone());
         sync.remote.running_peer = Some(r.from.clone());
+        sync.remote.running_kind = r.operation.job_kind();
         if let Some(store) = &self.store {
             store.save(&self.state)?;
         }
@@ -748,6 +883,7 @@ pub fn finish(state: &mut State, space: &str, id: String, result: Receipt) -> St
         );
         s.remote.running = None;
         s.remote.running_peer = None;
+        s.remote.running_kind = None;
         s.remote.answers.insert(id, result);
         s.wanted = Some(crate::sync::adapter::Want::Now);
         return notice;
@@ -764,6 +900,66 @@ mod tests {
         transport::{Transport, sync as exchange},
     };
     use std::path::PathBuf;
+    #[tokio::test]
+    async fn an_unapproved_host_explains_its_decision_without_running_the_job() -> Result<()> {
+        use crate::sync::transport::Hub;
+        let work = tempfile::tempdir()?;
+        let mut sender = Space::create("Sender", None)?;
+        let mut host = Space::open(Identity {
+            keys: sender.keys_for(false), device: Device::generate("Receiver")?, secrets: false,
+        }, None)?;
+        sender.add_member(host.member_entry()?)?;
+        let mut outbound = SyncState::new(sender.id.clone());
+        let mut inbound = SyncState::new(host.id.clone());
+        let job = snapshot(&outbound, work.path(), host.id.device.id.clone(), String::new(), &[], Operation::Inventory, vec![], None)?;
+        let id = signature(&job)?;
+        outbound.remote.sent.insert(id.clone(), job);
+        let relay = Transport::Memory(Hub::default());
+        export(&outbound, &mut sender)?;
+        exchange(&mut sender, &relay, &mut Default::default()).await?;
+        exchange(&mut host, &relay, &mut Default::default()).await?;
+        import(&mut inbound, &host)?;
+        assert!(inbound.remote.pending.is_empty());
+        assert!(inbound.remote.answers[&id].text.contains("Allow sandboxed jobs"));
+        export(&inbound, &mut host)?;
+        exchange(&mut host, &relay, &mut Default::default()).await?;
+        exchange(&mut sender, &relay, &mut Default::default()).await?;
+        assert_eq!(import(&mut outbound, &sender)?, 1);
+        assert_eq!(outbound.remote.jobs()[0].status, "Failed");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_blocked_job_type_is_rejected_without_blocking_inventory() -> Result<()> {
+        use crate::sync::transport::Hub;
+        let work = tempfile::tempdir()?;
+        let mut sender = Space::create("Sender", None)?;
+        let mut host = Space::open(Identity {
+            keys: sender.keys_for(false), device: Device::generate("Receiver")?, secrets: false,
+        }, None)?;
+        sender.add_member(host.member_entry()?)?;
+        let mut outbound = SyncState::new(sender.id.clone());
+        let mut inbound = SyncState::new(host.id.clone());
+        let requester = &sender.id.device.id;
+        inbound.remote.allowed.insert(requester.clone());
+        inbound.set_device_rule(requester, "job:python", false, Default::default())?;
+        let python = snapshot(&outbound, work.path(), host.id.device.id.clone(), "test.py".into(),
+            &[], Operation::Python, vec![], Some("print('test')"))?;
+        let check = snapshot(&outbound, work.path(), host.id.device.id.clone(), String::new(),
+            &[], Operation::Inventory, vec![], None)?;
+        let denied = signature(&python)?;
+        let allowed = signature(&check)?;
+        outbound.remote.sent.extend([(denied.clone(), python), (allowed.clone(), check)]);
+        let relay = Transport::Memory(Hub::default());
+        export(&outbound, &mut sender)?;
+        exchange(&mut sender, &relay, &mut Default::default()).await?;
+        exchange(&mut host, &relay, &mut Default::default()).await?;
+        import(&mut inbound, &host)?;
+        assert_eq!(inbound.remote.pending.keys().collect::<Vec<_>>(), vec![&allowed]);
+        assert!(inbound.remote.answers[&denied].text.contains("disabled python scripts"));
+        Ok(())
+    }
+
     #[test]
     fn remote_inventory_and_installed_commands_need_no_entry_file() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -777,6 +973,7 @@ mod tests {
             &[],
             Operation::Inventory,
             vec![],
+            None,
         )?;
         let receipt = perform(&request, dir.path(), false, &Default::default())?;
         assert!(receipt.ok && receipt.text.contains(std::env::consts::OS));
@@ -823,6 +1020,7 @@ mod tests {
                 &[],
                 Operation::Build,
                 vec![],
+                None,
             )?;
             state.remote.sent.insert(signature(&req)?, req);
             export(&state, &mut local)?;

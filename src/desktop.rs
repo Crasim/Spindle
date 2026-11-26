@@ -20,6 +20,7 @@ mod submission;
 mod android_ime;
 mod project_view;
 mod reader;
+mod remote_work;
 mod settings;
 mod side_tabs;
 mod sync_view;
@@ -320,6 +321,7 @@ pub struct Desktop {
     select_focus: bool,
     /// Open the model picker on the next frame (from /model).
     controls_panel: Option<settings::ControlsPanel>,
+    execution_panel: Option<crate::sync::placement::Scope>,
     /// Images waiting to go with the next message: name, bytes and a thumbnail.
     image_drafts: Vec<submission::ImageDraft>,
     images_by_thread: std::collections::BTreeMap<u64, Vec<submission::ImageDraft>>,
@@ -888,6 +890,7 @@ impl Desktop {
             favorites_only: false,
             select_focus: false,
             controls_panel: None,
+            execution_panel: None,
             image_drafts: vec![],
             images_by_thread: Default::default(),
             share_pending: false,
@@ -1026,6 +1029,10 @@ impl Desktop {
             return Dispatch::Handled;
         }
         match text.trim() {
+            "/run-on" => {
+                self.execution_panel = Some(crate::sync::placement::Scope::Chat(self.view.state.chat_id));
+                return Dispatch::Handled;
+            }
             "/model" => {
                 self.show_models();
                 self.page = Page::Chat;
@@ -1411,20 +1418,7 @@ impl Desktop {
 
     fn composer(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("composer")
-            .min_height(
-                (if self.paste_drafts.files.contains_key(&self.view.state.chat_id) {46.} else {0.}) +
-                // Image chips (one row; they wrap only in a very narrow window) and the note
-                // shown when the model can't see images.
-                (if self.image_drafts.is_empty() {0.} else {
-                    (if self.view.vision.contains(&self.view.state.model) {0.} else {20.}) +
-                    60. * (1. + ((self.image_drafts.len() as f32 * 210.) / (ctx.screen_rect().width() - 320.).max(400.)).floor()).min(2.)
-                }) +
-                if self.view.state.pending.is_some() || self.view.state.attachment.is_some() {
-                    248.
-                } else {
-                    202.
-                } - if self.view.state.thread.cowork { 42. } else { 16. },
-            )
+            .min_height(0.)
             .frame(egui::Frame::new().fill(surface()).inner_margin(16))
             .show(ctx, |ui| {
                 if let Some(file) = &self.view.state.pending {
@@ -1596,6 +1590,7 @@ impl Desktop {
                             if !compact && small(ui, Icon::Swarm, "Choose swarm workers") {
                                 self.show_swarm();
                             }
+                            self.run_on_button(ui, compact || ui.available_width() < 280.);
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
@@ -1731,14 +1726,14 @@ impl Desktop {
                 if (submit || steer) && (!self.draft.trim().is_empty() || has_pastes || !self.image_drafts.is_empty()) {
                     self.submit_chat(steer);
                 }
-                ui.add_space(5.);
-                ui.horizontal(|ui| {
+                if self.view.state.preferences.nerd_stats {
+                    ui.add_space(5.);
+                    ui.horizontal(|ui| {
                     let first = self.notice.lines().next().unwrap_or("Ready");
                     if self.view.busy {
                         ui.spinner();
                     }
                     let state=&self.view.state;
-                    if state.preferences.nerd_stats {
                     let last=state.thread.turns.values().rev().find(|t|t.model==state.model);
                     let cap=self.view.context.or_else(||last.and_then(|t|t.window));
                     let usage=last.filter(|t|t.input>0).map(|t|(t.input+t.output).to_string()).unwrap_or_else(||"—".into());
@@ -1755,10 +1750,9 @@ impl Desktop {
                     } else if let Some(rate)=last.and_then(|t|t.tokens_per_second) {ui.weak(format!("{rate:.1} tok/s")).on_hover_text("Provider generation timing when available, otherwise output tokens per elapsed request second");}
                     else {ui.weak("— tok/s");}
                     ui.separator();
-                    }
                     ui.add(egui::Label::new(Text::new(first).color(muted()).size(12.)).truncate());
-                });
-                ui.add_space(4.);
+                    });
+                }
             });
     }
 
@@ -2242,6 +2236,7 @@ impl Desktop {
                 });
             });
         }
+        self.remote_jobs(ui);
     }
 
     fn skills(&mut self, ui: &mut egui::Ui) {
@@ -2454,6 +2449,7 @@ impl Desktop {
             || self.builder
             || self.swarm
             || self.controls_panel.is_some()
+            || self.execution_panel.is_some()
             || self.tuning_editor.is_some()
             || self.threads.has_editor()
             || self.projects.has_dialog()
@@ -2475,6 +2471,8 @@ impl Desktop {
             self.thread_windows(ui);
         } else if let Some(panel) = self.controls_panel {
             self.controls_panel(ui, panel);
+        } else if let Some(scope) = self.execution_panel.clone() {
+            self.render_execution_panel(ui, scope);
         } else if self.tuning_editor.is_some() {
             self.tuning_panel(ui);
         } else if self.builder {
@@ -2548,6 +2546,12 @@ impl eframe::App for Desktop {
                 self.reader_files_at = None;
             }
             self.observe_submission(&v);
+            if self.page == Page::Chat && let Some((chat, url, text)) = v.browser_panel.clone()
+                && chat == v.state.chat_id {
+                self.reader.open = true;
+                self.reader.tab = side_tabs::Tab::Browser;
+                self.reader.browser.present(url, text);
+            }
             if self.plan.submitted && v.notice == "Plan revision queued" && v.state.chat_id == self.view.state.chat_id {
                 self.plan.revision_accepted();
             }
@@ -2616,6 +2620,9 @@ impl eframe::App for Desktop {
                 });
             }
             if v.state.chat_id != self.view.state.chat_id {
+                if matches!(self.execution_panel, Some(crate::sync::placement::Scope::Chat(_))) {
+                    self.execution_panel = None;
+                }
                 self.chat_selection = Default::default();
                 self.plan = Default::default();
                 if self.reader.preview.active() {
@@ -3301,6 +3308,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/goal ", "Set a continuing goal for this chat"),
     ("/plan revise ", "Revise the current plan while working"),
     ("/remote ", "Build or run a script on a paired device"),
+    ("/run-on", "Choose where this conversation’s tools run"),
     ("/image ", "Generate an image with ComfyUI"),
     ("/image edit ", "Edit an attached image or a workspace file"),
     ("/image server ", "Set the local ComfyUI address"),

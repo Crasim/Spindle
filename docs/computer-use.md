@@ -4,11 +4,13 @@
 
 ## Side panel
 
-The Panel button opens the right-hand panel: **Viewer** (documents and previews), **Files** (what you attached to this chat and what it made), **Library** (every file in the chat's project or the workspace) and **Browser** (a web page beside the chat on Windows; other systems open your own browser).
+The Panel button opens **Viewer** for documents and previews, **Files** for chat attachments and outputs, **Library** for workspace files, and **Browser** for web pages beside the chat.
 
 ### Web browsing in Cowork
 
-Browser Link uses the Edge or Chrome profile you already use, with its open tabs and sign-ins. The built-in browser in Spindle is isolated. Choose your browser in the chat or in **Settings › Computer use**. Edge and Chrome have separate setup cards and access toggles. From a connected browser's **Manage** panel, you can disconnect its active tab or run setup again. Spindle verifies and unpacks the extension, registers its local connection, and opens the install guide. On Windows, the extension is under **Downloads**. In your browser’s **Manage extensions** page, turn on **Developer mode**, choose **Load unpacked**, and select the Browser Link folder. Spindle continues the chat when the extension connects. A bundled copy is available offline. [Extension guide](../browser-extension/README.md)
+Ask for **Spindle’s built-in Browser panel** to open a public page beside the conversation on Windows. On Linux, the panel shows the page snapshot the model read. Browser Link uses the Edge or Chrome profile you already use, with its open tabs and sign-ins.
+
+Open **Settings › Computer use** and choose **Manage** on a browser card to change website access, review saved model permissions, or disconnect its active tab. The panel shows the installed Browser Link version and the version available with Spindle. **Update Browser Link** prepares a matching folder when the connected extension is older. Spindle verifies and unpacks the extension and opens the install guide. Use your browser’s **Manage extensions** page to load the prepared folder. A bundled copy is available offline. [Extension guide](../browser-extension/README.md)
 
 For a named page, Spindle reuses a matching tab or opens the requested address after website approval. For a request about the current tab, it uses the active webpage. If there is no webpage and the request does not name one, enter its address directly in chat. The extension sends requests and results through Native Messaging. Its local host talks to Spindle over a private account-only connection. Both Chat and Cowork can request a read. Use Cowork for clicks and text entry.
 
@@ -44,7 +46,13 @@ When work needs permission, the model can request it in the chat. If you deny an
 
 When a tool is missing, Spindle can explain its choice and show an approval card with the source, pinned version or release asset, and purpose. On Windows and Linux it can load npm CLIs with a compatible Node installation and registry-only npm controls (npm 11.16 or newer), or portable GitHub executables and ZIPs with a published SHA-256 digest. Python wheels use the existing package installer. Loaded CLIs run in the checked sandbox. Packages needing install scripts, system SDK installation, or an unsupported archive format require another setup method.
 
-Paired hosts accept remote jobs after you enable **Allow sandbox jobs from this device** in their Sync settings. Use `/remote devices`, then `/remote inventory DEVICE` to inspect a target. Use `/remote tool DEVICE TOOL_ID COMMAND [INPUT_FILES] -- [ARGS]` for an installed CLI, or `/remote build DEVICE main.rs` to compile and test sources. The sync pool carries the selected text files and result. Use `/remote status` to see jobs and `/remote save JOB_ID` to export a returned executable. Every pool member can read submitted files and results.
+Open **Run on** under the chat box to choose an execution device for Cowork. Set a default, or choose separate devices for native builds, Python scripts, installed tools, and Android APKs. For example, run native builds on Windows, Python on Linux, and Java APK builds on Android. In the project page, **Where work runs** sets the defaults for its conversations on this device. A conversation can override those settings.
+
+On the destination, open **Settings › Sync › Devices › Manage** for the source device and enable **Allow sandboxed jobs from this device**. Select the kinds of jobs that device can run. **Check capabilities** in Run on asks the host what it can execute. The response appears in **Work queue › Remote jobs**, alongside other job statuses and **Save output** for completed builds.
+
+Spindle shows the destination and files in an approval card before sending a model-requested job. File edits and model selection stay with the conversation. Pool members can read submitted files and results. Changes to Run on apply to new tool requests. Requests already approved retain their destination. If a selected host is unavailable, Spindle reports the problem so you can change the route.
+
+For an explicit one-off job, `/remote inventory DEVICE` checks available tools, `/remote tool DEVICE TOOL_ID COMMAND [INPUT_FILES] -- [ARGS]` runs an installed CLI, and `/remote build DEVICE main.rs` compiles and tests selected source files. `/remote status` lists jobs and `/remote save JOB_ID` exports a returned executable. Use an explicit Python entry script for remote tests. Unittest discovery and retesting a locally built executable use the local device.
 
 On Windows x64 and Linux x64 or ARM64, set up Python and pass the sandbox check in **Settings → Sandbox**, then install Zig under **Native builds** for C/C++. Rust source builds use an installed stable host Rust toolchain and its standard library. Spindle verifies the pinned toolchain before installing it in its own data folder.
 

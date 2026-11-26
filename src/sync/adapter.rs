@@ -203,6 +203,8 @@ pub struct DeviceRules {
     pub paused: bool,
     pub blocked: BTreeSet<String>,
     pub blocked_projects: BTreeSet<String>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    pub blocked_jobs: BTreeSet<super::placement::Kind>,
 }
 
 impl DeviceRules {
@@ -355,6 +357,11 @@ impl SyncState {
         let mut rules = self.device_rules.get(device).cloned().unwrap_or_default();
         if key == "sync" {
             rules.paused = !on;
+        } else if let Some(key) = key.strip_prefix("job:") {
+            let job = super::placement::Kind::OPERATIONS.into_iter()
+                .find(|job| job.key() == key)
+                .context("Unknown remote job category")?;
+            if on { rules.blocked_jobs.remove(&job); } else { rules.blocked_jobs.insert(job); }
         } else {
             let (items, label) = if let Some(id) = key.strip_prefix("project:") {
                 anyhow::ensure!(crate::projects::valid_sync_id(id), "Use a valid project ID");

@@ -484,7 +484,7 @@ impl Desktop {
                     super::thread_view::unread_dot(ui, self.view.state.unread.contains(id));
                     let width = ui.available_width();
                     if super::thread_view::thread_button(
-                        ui, Text::new(title).size(15.), egui::vec2(width, 30.), false,
+                        ui, Text::new(title).size(15.), egui::vec2(width, 32.), false,
                     ).clicked() {
                         open = Some(*id);
                     }
@@ -505,6 +505,9 @@ impl Desktop {
                 .inner
             };
             let has = !project.instructions.is_empty();
+            if row(ui, Icon::Chip, "Where work runs", "Configure") {
+                action = Some("execution");
+            }
             if row(
                 ui,
                 Icon::Reader,
@@ -597,6 +600,10 @@ impl Desktop {
             self.send(cmd);
         }
         let saved = match action {
+            Some("execution") => {
+                self.execution_panel = Some(crate::sync::placement::Scope::Project(project.path.clone()));
+                None
+            }
             Some("instructions") => {
                 let text = self.projects.instructions.take().unwrap_or_default();
                 Some(projects::update(

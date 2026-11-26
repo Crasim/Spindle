@@ -1750,6 +1750,7 @@ mod tests {
         app.view.browser_clients.push(crate::browser_native::BrowserClient {
             id: "sample".into(),
             browser: crate::browser::LinkBrowser::Edge,
+            version: Some("0.5.4".into()),
             ready: true,
             has_tab: true,
             guided: true,
@@ -1760,9 +1761,13 @@ mod tests {
         let labels = run(&mut app, &ctx, vec![]);
         assert!(labels.contains_key("Microsoft Edge") && labels.contains_key("Google Chrome"));
         let labels = click(&mut app, &ctx, labels["Manage"]);
-        assert!(labels.contains_key("Set up again"));
+        assert!(labels.contains_key("Update Browser Link"));
         assert!(labels.contains_key("Back"));
-        assert!(!labels.contains_key("Google Chrome"));
+        for text in ["Allow all", "Allowlist", "Blocklist", "Block all", "Saved model permissions"] {
+            assert!(labels.contains_key(text), "missing {text}");
+        }
+        let labels = click(&mut app, &ctx, labels["Blocklist"]);
+        assert!(commands.try_recv().is_ok_and(|command| command == "/browser-mode \"blocklist\""));
         click(&mut app, &ctx, labels["On"]);
         assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|sent| sent == "/browser-control edge off"));
     }
@@ -1785,7 +1790,7 @@ mod tests {
             call: crate::tools::extract(crate::engine::BROWSER_TOOL_EXAMPLE).1.unwrap().unwrap(),
         });
         app.view.browser_clients.push(crate::browser_native::BrowserClient {
-            id: "sample".into(), browser: crate::browser::LinkBrowser::Edge, ready: true, guided: true, has_tab: false, managed: false, located: None,
+            id: "sample".into(), browser: crate::browser::LinkBrowser::Edge, version: None, ready: true, guided: true, has_tab: false, managed: false, located: None,
         });
         run(&mut app, &ctx, vec![]);
         let labels = run(&mut app, &ctx, vec![]);
@@ -2004,6 +2009,49 @@ mod tests {
         assert!(!labels.contains_key("Make image"));
         click(&mut app, &ctx, labels["Chat"]);
         assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|s| s == "/mode chat"));
+    }
+
+    #[test]
+    fn turning_off_nerd_stats_reclaims_the_composer_footer() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = std::sync::mpsc::channel();
+        let (_, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        app.draft = "Composer layout test".into();
+        app.view.state.preferences.nerd_stats = true;
+        run(&mut app, &ctx, vec![]);
+        let with_stats = run(&mut app, &ctx, vec![]);
+        assert!(with_stats.keys().any(|label| label.starts_with("Context ")));
+        app.view.state.preferences.nerd_stats = false;
+        run(&mut app, &ctx, vec![]);
+        let compact = run(&mut app, &ctx, vec![]);
+        assert!(!compact.keys().any(|label| label.starts_with("Context ")));
+        assert!(compact["Composer layout test"].y > with_stats["Composer layout test"].y);
+    }
+
+    #[test]
+    fn run_on_opens_a_panel_and_keeps_the_draft() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_views, rx) = std::sync::mpsc::channel();
+        let (_stream, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        app.draft = "Build a release".into();
+        run(&mut app, &ctx, vec![]);
+        let labels = run(&mut app, &ctx, vec![]);
+        let panel = click(&mut app, &ctx, labels["Run on · This device"]);
+        for text in ["Default device", "Native builds and smoke tests", "Python scripts", "Installed tools", "Android APK builds"] {
+            assert!(panel.contains_key(text), "missing execution control {text}");
+        }
+        click(&mut app, &ctx, panel["Back"]);
+        assert!(app.execution_panel.is_none());
+        assert_eq!(app.draft, "Build a release");
     }
 
     #[test]
