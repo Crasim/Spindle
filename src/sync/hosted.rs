@@ -1110,8 +1110,17 @@ mod tests {
 
     async fn start(mode: Mode, mailbox: Duration) -> (String, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
+        let (url, _) = start_in(dir.path(), mode, mailbox).await;
+        (url, dir)
+    }
+
+    async fn start_in(
+        dir: &std::path::Path,
+        mode: Mode,
+        mailbox: Duration,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let server = Server::new(Config {
-            data: dir.path().into(),
+            data: dir.into(),
             mode,
             mailbox,
             admin: "admin-token".into(),
@@ -1119,8 +1128,8 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, router(server)).await.unwrap() });
-        (format!("http://{addr}"), dir)
+        let task = tokio::spawn(async move { axum::serve(listener, router(server)).await.unwrap() });
+        (format!("http://{addr}"), task)
     }
 
     fn joined(founder: &mut Space, name: &str) -> Space {
@@ -1162,6 +1171,38 @@ mod tests {
         let stranger = Device::generate("Stranger").unwrap();
         let cs = Client::new(&url, &a.id.keys.space, &stranger).unwrap();
         assert!(cs.list("").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn store_survives_restart_without_writing_plaintext() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (first, task) = start_in(dir.path(), Mode::Store, Duration::ZERO).await;
+        let mut desktop = Space::create("Desktop", None)?;
+        let client = Client::new(&first, &desktop.id.keys.space, &desktop.id.device)?;
+        client.create_space("admin-token").await?;
+        let mut laptop = joined(&mut desktop, "Laptop");
+        client.add_device(&laptop.id.device.id).await?;
+        let marker = "workspace-content-known-only-to-the-paired-devices";
+        desktop.put(Kind::Settings, "fixture", json!({"text": marker}))?;
+        sync(&mut desktop, &Transport::Hosted(client), &mut Progress::default()).await?;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let files = dir.path().join(&desktop.id.keys.space).join("records");
+        let mut count = 0;
+        for bucket in std::fs::read_dir(files)? {
+            for entry in std::fs::read_dir(bucket?.path())? {
+                count += 1;
+                let bytes = std::fs::read(entry?.path())?;
+                assert!(!bytes.windows(marker.len()).any(|window| window == marker.as_bytes()));
+            }
+        }
+        assert!(count > 0);
+        let (second, task) = start_in(dir.path(), Mode::Store, Duration::ZERO).await;
+        let client = Client::new(&second, &laptop.id.keys.space, &laptop.id.device)?;
+        sync(&mut laptop, &Transport::Hosted(client), &mut Progress::default()).await?;
+        assert_eq!(laptop.value(Kind::Settings, "fixture").unwrap()["text"], marker);
+        task.abort();
+        Ok(())
     }
 
     #[tokio::test]

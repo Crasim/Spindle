@@ -1,0 +1,27 @@
+[Unit]
+Description=Spindle encrypted sync
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=spindle-sync
+StateDirectoryMode=0700
+UMask=0077
+EnvironmentFile=/etc/spindle-sync.env
+ExecStart=/usr/local/bin/spindle sync-server --data ${STATE_DIRECTORY} --listen 127.0.0.1:8443 --mode store
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

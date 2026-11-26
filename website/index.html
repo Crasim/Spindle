@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Download Spindle, a local-first workspace for AI chats and projects, for Windows, Android, or Linux.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <meta name="color-scheme" content="dark">
+  <title>Spindle · AI chats and projects</title>
+  <link rel="icon" href="spindle-256.png" type="image/png">
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 1rem/1.55 system-ui, sans-serif;
+      background: #10131b;
+      color: #f4f6ff;
+      --muted: #afb9d1;
+      --line: #30394d;
+      --blue: #a9c4ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: radial-gradient(ellipse at 79% 12%, #202d51 0, transparent 45%); }
+    a { color: var(--blue); text-underline-offset: .2em; }
+    a:hover { color: #fff; }
+    a:focus-visible { outline: 2px solid #c1d5ff; outline-offset: 5px; }
+    .wrap { width: min(100% - 2.5rem, 69rem); margin-inline: auto; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-block: 1.4rem; border-bottom: 1px solid var(--line); }
+    .brand { display: inline-flex; gap: .7rem; align-items: center; color: inherit; font-weight: 700; text-decoration: none; }
+    .brand img { border-radius: .6rem; }
+    nav { display: flex; gap: clamp(.65rem, 3vw, 1.6rem); flex-wrap: wrap; font-size: .9rem; }
+    .hero { display: grid; grid-template-columns: minmax(0, 1.65fr) minmax(0, 1fr); align-items: center; gap: 2rem; padding-block: clamp(3rem, 8vw, 7rem); }
+    .hero p { max-width: 34rem; margin: 1.15rem 0 1.75rem; font-size: clamp(1rem, 2.25vw, 1.25rem); }
+    .hero img { width: clamp(9rem, 23vw, 15rem); height: auto; justify-self: center; border-radius: 23%; box-shadow: 0 20px 80px #06091490; }
+    h1 { margin: 0; font-size: clamp(2.65rem, 7.75vw, 5.65rem); line-height: .99; font-weight: 700; letter-spacing: -.058em; }
+    h2 { margin: 0; font-size: clamp(1.65rem, 4vw, 2.2rem); letter-spacing: -.035em; }
+    h3 { font-size: 1.12rem; margin: 0; }
+    p { color: var(--muted); }
+    .button { display: inline-block; padding: .7rem 1.08rem; border-radius: .65rem; background: #a9c4ff; color: #101932; font-weight: 750; text-decoration: none; }
+    .button:hover { background: #d1defe; color: #101932; }
+    section { padding-block: 1.5rem 3rem; }
+    .section-head { display: flex; align-items: baseline; flex-wrap: wrap; justify-content: space-between; gap: .5rem; margin-bottom: 1.1rem; }
+    .section-head p { margin: 0; }
+    .downloads { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .9rem; }
+    article { padding: 1.3rem; border: 1px solid var(--line); background: #171d2b; border-radius: .95rem; }
+    article p { margin: .35rem 0 1rem; font-size: .92rem; }
+    article a { display: inline-block; margin-block: .2rem; }
+    .linux { display: flex; flex-wrap: wrap; gap: .25rem 1rem; }
+    .links { display: flex; flex-wrap: wrap; gap: .6rem 1.4rem; padding: 0; list-style: none; }
+    .more { border-top: 1px solid var(--line); }
+    footer { padding-block: 1.25rem 2rem; border-top: 1px solid var(--line); color: var(--muted); font-size: .9rem; }
+    @media (max-width: 43rem) {
+      .hero { grid-template-columns: 1fr; }
+      .hero img { grid-row: 1; justify-self: start; width: 5rem; border-radius: 22%; }
+      .downloads { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <header class="wrap">
+    <a class="brand" href="./"><img src="spindle-256.png" width="32" height="32" alt="">Spindle</a>
+    <nav aria-label="Main navigation">
+      <a href="#downloads">Downloads</a>
+      <a href="#guides">Guides</a>
+      <a href="https://github.com/Crasim/Spindle">GitHub</a>
+    </nav>
+  </header>
+  <main class="wrap">
+    <div class="hero">
+      <div>
+        <h1>AI chats and<br>projects in one place</h1>
+        <p>Choose your models, keep files alongside the conversation, and pick up your work on a paired device. Use local Ollama or connect a hosted provider.</p>
+        <a class="button" href="#downloads">Download Spindle</a>
+      </div>
+      <img src="spindle-256.png" width="256" height="256" alt="">
+    </div>
+    <section id="downloads" aria-labelledby="download-heading">
+      <div class="section-head">
+        <h2 id="download-heading">Downloads</h2>
+        <p>Version @RELEASE_LABEL@</p>
+      </div>
+      <div class="downloads">
+        <article>
+          <h3>Windows</h3>
+          <p>x64 desktop executable</p>
+          <a href="https://github.com/Crasim/Spindle/releases/download/v@RELEASE_VERSION@/spindle-windows-x86_64.exe">Download for Windows</a>
+        </article>
+        <article>
+          <h3>Android</h3>
+          <p>ARM64 · Android 8 or later</p>
+          <a href="https://github.com/Crasim/Spindle/releases/download/v@RELEASE_VERSION@/Spindle.apk">Download the APK</a>
+        </article>
+        <article>
+          <h3>Linux</h3>
+          <p>Desktop executables</p>
+          <div class="linux">
+            <a href="https://github.com/Crasim/Spindle/releases/download/v@RELEASE_VERSION@/spindle-linux-x86_64">Linux x64</a>
+            <a href="https://github.com/Crasim/Spindle/releases/download/v@RELEASE_VERSION@/spindle-linux-aarch64">Linux ARM64</a>
+          </div>
+        </article>
+      </div>
+      <p><a href="https://github.com/Crasim/Spindle/releases/tag/v@RELEASE_VERSION@">Release notes and checksums</a></p>
+    </section>
+    <section class="more" id="guides" aria-labelledby="guides-heading">
+      <h2 id="guides-heading">Get started</h2>
+      <p>Spindle keeps workspace data on your device. You can pair devices for encrypted sync or connect a model provider from Settings.</p>
+      <ul class="links">
+        <li><a href="https://github.com/Crasim/Spindle/blob/main/docs/build-and-install.md">Install Spindle</a></li>
+        <li><a href="https://github.com/Crasim/Spindle/blob/main/docs/projects-and-sync.md">Set up encrypted sync</a></li>
+        <li><a href="https://github.com/Crasim/Spindle/releases/tag/browser-link-v0.5.3">Browser Link for Edge and Chrome</a></li>
+      </ul>
+    </section>
+  </main>
+  <footer class="wrap">Spindle releases and source code are available on <a href="https://github.com/Crasim/Spindle">GitHub</a>.</footer>
+</body>
+</html>
