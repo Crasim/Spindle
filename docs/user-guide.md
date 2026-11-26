@@ -1,0 +1,107 @@
+# Using Spindle
+
+[Spindle](../README.md)
+
+## Working in the desktop app
+
+- Start a conversation, select a model, and type a message. Enter sends it and Shift+Enter inserts a line break. Responses appear as Ollama generates them. Recent chats reopen from the sidebar.
+- Choose **Draft a plan** or enter `/plan <task>`. Use `/plan revise <change>` and `/plan accept <revision>` to work from a specific draft. `/goal <objective>` sets a continuing objective for the chat.
+- While a response is running, **Queue** adds a follow-up and **Steer** applies a correction to the active request. **Stop** cancels inference and holds remaining work. The Work queue lets you remove or promote a waiting message. After an interrupted session, **Resume** releases the saved queue.
+- **Ask two models** lets you choose each worker's role and model. Workers run sequentially and the coordinator synthesizes their findings. From any chat, use `/swarm Check boundary conditions --worker reviewer=qwen3.5:9b` for one worker or append a second `--worker role=model`. Use `/steer --worker reviewer <correction>` for one role.
+- **Attach file** previews a workspace file for approval. The harness sends the approved snapshot with the next submitted task. The native picker supports UTF-8 text files up to 6,000 bytes. You can ask for analysis or a proposed patch.
+- In **Skills**, create a named draft from a brief, inspect its Markdown, try an example, and install it. Invoke it as `/<name> <task>`. The first-pass package format is one UTF-8 `SKILL.md` with simple front matter containing `name` and `description`, followed by its instructions. Installing from the workspace copies that definition into the local registry. Reinstall to update.
+
+## Threads and generated files
+
+Sending the first message adds **New chat** to the sidebar immediately. The first completed reply supplies its title. A name you choose while the model is working takes precedence.
+
+Click **…** beside any thread, or right-click it, to expand its options in the sidebar. You can rename, pin, mark unread, move to a project, branch, read, copy, archive, or delete a conversation. **Conversation settings** opens a panel for its title, next model, section, project, and compaction. **Back** or **Close** returns you to what you were viewing. **Branch** starts an independent conversation with the same history. Archived threads are available through **Archive** in the sidebar. Moving a chat changes where its new files are saved. Files already generated stay where they are.
+
+**Delete conversation** asks for confirmation, removes the thread and its queued work and schedules, and propagates the deletion when project sync runs. Earlier encrypted revision files, independent branches, generated files and backups have their own retention. Re-export the phone companion from Projects to use the updated thread list.
+
+The composer shows the latest reported context usage, the active model’s context window when available, and generation speed. Streaming speed uses a visible-text estimate. Final speed uses provider timing when available or reported output tokens divided by elapsed request time. The model answering a new chat supplies its title in the same response. For models that omit a title, Spindle uses the first line of the prompt. Each thread remembers the selected model, and individual responses retain their actual answering model.
+
+Spindle checks the selected model's published output and context limits when available. Ollama and Claude requests start with up to 16,384 output tokens, with room reserved for the prompt in a known shared context. Ollama Cloud uses the hosted context window. Other providers can manage their own output budget. When a model reaches its output limit, Spindle saves the partial reply in the encrypted local queue and requests the missing text. Every continuation passes the same usage and fallback checks. Generated files are saved after the reply finishes. Repeated cutoffs can still pause a long task, and **Resume** continues from the saved text.
+
+Your prompts appear on the right and model replies on the left. For file deliverables, ask for a file such as “Create a Snake game in snake.html”, or name a format (“as a .csv”). Spindle saves the output in the project's **artifacts** folder or the thread's scratch folder in Windows Temp. Each file appears as a card where the reply placed it, with its name, type and size, a primary **Open** (or **Preview** for HTML), and **More** for View source, Edit, Download, Show in folder, Copy path and Save a copy. A file name mentioned in the reply is a link that opens it. Markdown, spreadsheets, Word, RTF and PDF open in the reader. HTML runs in a sandboxed WebView2 in the resizable right panel. Code blocks that stay in the message have Copy and Save file. **/preview <file>** opens a workspace file in the same panel.
+
+### Revising work in progress
+
+Switch between **Chat** and **Cowork** in the sidebar. The sync indicator sits beside Settings. Open **Panel → Plan** to edit the current conversation's checklist. Choose **Revise plan…** to describe a change while the model is working. Check **Replace the current objective** when the deliverable itself has changed. For example, `/goal replace Build and test a Windows Rust executable` replaces an HTML goal. Use `/plan revise Include an empty-input test` to keep the objective and amend the plan. Steering an active plan also carries your correction into subsequent tool turns.
+
+In a project chat, ask about a previous discussion or name a distinctive topic from it. For example, “What build flags did we agree on in the previous thread?” Chat and Cowork can draw on short excerpts from other chats in the same project and cite the source chat. This works with Project Memory off and includes project chats already synced to this device.
+
+## Providers and settings
+
+Use **Settings → Model providers → Add provider** to test and save an LM Studio, OpenAI, OpenRouter, Anthropic, or custom Chat Completions connection. Enter the provider's API base URL, including its API version path, and supply a key if required. Spindle fetches the model list. Windows Credential Manager stores keys. Selecting a hosted model sends its request context to that provider. Accounts and billing are managed with the provider.
+
+Click the model control beside the message box or press **Ctrl+K**. Search by model or provider, star favorites, and select a result. Icons beside each model show what it accepts beyond text: an eye for images and sound waves for audio. A brain marks models that can reason. Spindle reads these from Ollama's reported capabilities and provider catalogs, and otherwise from known model families. They describe the model; Spindle does not yet send images or audio.
+
+**Settings → Preferences** controls the accent color (Red, Orange, Yellow, Green, Blue, Indigo, Violet or Magenta), conversation text size, the send shortcut, context compaction and the council roster. The native Windows caption follows the charcoal application theme.
+
+The sidebar, welcome screen and window icons follow the workspace accent. The Windows executable uses the default blue ribbon. [View all eight icons](../assets/accents/palette.png)
+
+### Choosing which models appear
+
+**Settings → Models** lists every connected model with a search box and a provider filter. Clear a model's checkbox to hide it from the picker. **Show all listed** and **Hide all listed** act on the current search and filter, so you can hide a provider's whole catalog and keep a few. Hidden models stay connected, and work already using them continues.
+
+### Thinking
+
+For models that can reason, a brain button beside the model picker shows the thinking level, for example **Auto** or **High**. Click it to open a stepped slider. When Ollama reports a model's own levels through `/api/show`, the slider uses exactly those. Otherwise it offers Off, Low, Medium and High. **Reset** returns to the model's default. The level applies to that model in every chat.
+
+### Advanced model settings
+
+Each row in **Settings → Models** has an **Advanced…** button. It sets compaction, thinking, temperature and, for local Ollama models, the context window for that one model. These change how the model behaves everywhere and are meant to be sought out deliberately. **Reset to defaults** clears them. A model with custom settings is tagged in the list.
+
+### Model connections
+
+The picker groups **Ollama** and **Ollama Cloud** separately. Both use the local server on port 11434. Cloud tags and remote aliases use the account already signed in to Ollama. **Maya** uses its OpenAI-compatible model catalog. Its preset points to `http://127.0.0.1:18081/v1`. Refresh that provider after switching Maya profiles.
+
+In **Settings › Model providers › Find local AI servers**, leave the host blank to check this computer or enter the name or IP of a LAN host. Spindle checks standard API ports for Ollama, LM Studio, Maya, ComfyUI, Stable Diffusion WebUI, and OpenAI-compatible services such as llama.cpp, LocalAI and vLLM. Choose **Connect** for a model server or **Use for images** for an image server. Use **Add provider** for other ports or API credentials. From a terminal, `spindle --discover [HOST]` lists available servers.
+
+In **Settings → Model providers → Add provider**, choose **OpenAI · Sign in with ChatGPT** on Windows or Android for eligible ChatGPT plan models. The alphabetical provider list and connection form open in Settings, with **Back** to return. Spindle opens the system browser, uses PKCE, validates the signed identity token, and stores renewable credentials using Windows account protection or Android Keystore. **OpenAI API** connects to the Responses API with an API key. [OpenAI sign-in and plan usage](https://developers.openai.com/siwc/token-sharing-open-source)
+
+On Windows or Linux, choose **Claude · Console OAuth**, select the official Anthropic `ant` executable, and choose **Continue with Claude Console**. The CLI manages its own local login profile, and API usage is billed to the Console workspace you authorize. **Claude · Anthropic API** accepts a Console API key on Windows and Android. Anthropic limits Claude subscription sign-in to Anthropic apps. [Claude Console CLI authentication](https://platform.claude.com/docs/en/cli-sdks-libraries/cli/authentication) · [Claude subscription credentials](https://code.claude.com/docs/en/legal-and-compliance)
+
+## Schedules, fallback and usage
+
+Under **Automations → Model fallback**, enable **Also use fallbacks when the provider disconnects or times out** to try the next eligible model on a connection failure. This is off by default. Each queued request uses its approved fallback list and skips models that already disconnected on that request. If a goal stops after planning, choose a model in the composer and select **Continue goal** on the failure message to use the saved plan. The equivalent commands are `/fallback disconnects on` and `/goal continue`.
+
+Use **Automations → Usage limits** or `/usage` to view Ollama Cloud’s seven-day account requests, included and purchased balances when supplied, and quota windows with reset times. Spindle queries the signed-in local Ollama service on startup, every five minutes, and on refresh. The hold percentage applies to cloud windows across devices. OpenAI and Anthropic connections show limits returned in response headers and model-level token counts for work sent through this workspace. [Ollama API specification](https://github.com/ollama/ollama/blob/main/docs/openapi.yaml)
+
+Open **Automations → Schedules** to give a task a prompt, destination chat, model, first local run time and optional repeat interval. An overdue repeat runs once and advances to its next interval. The answer goes back to the original chat even if another chat is open. Use **Defer current task** or `/defer YYYY-MM-DD HH:MM` to stop the current attempt and resume the task later with its prompt and steering intact.
+
+For a recurring skill, enter `/skill-name assignment` as the prompt. Spindle captures the skill definition and holds the run for review if the skill changes.
+
+**Run due tasks while Spindle is closed** registers a per-user Windows Task Scheduler entry for this workspace. Windows checks once a minute while the user is signed in and the computer is awake. The desktop handles due work while it holds the workspace session lock. A process interruption leaves in-flight work held for review. Each collaborator configures their own schedules.
+
+In **Model fallback**, add models in the order in which they may receive your prompt and chat history. New tasks and schedules capture that order. **Usage limits** supports a five-hour and a weekly request budget for a provider or model. Enter the allowance, current use, threshold percentage and next reset. Choose **Try fallback** or **Pause until reset** for each budget. If every eligible route is limited, Spindle holds the task and retries at the earliest eligible reset. An unknown provider reset stays held until cleared, or uses a matching configured budget reset for the next check. The activity tab records switches and holds. Explicitly selected reviewers and workers keep their models, and attachment approval stays within its provider.
+
+Spindle counts dispatches made in this workspace. It displays token counts returned by providers and acts on supported quota headers and HTTP 429 responses. Other apps can consume the same account allowance. Ollama Cloud may return token counts without reporting a remaining account percentage or reset.
+
+## Document reader
+
+Select an excerpt directly in the conversation by dragging across messages, then press **Ctrl+C**. On a touch screen, hold a word, drag to the end of the passage, and tap **Copy selection**. Hold near the top or bottom edge to keep scrolling.
+
+Press **Ctrl+B** to collapse or expand the sidebar. Open **Reader**, press **Ctrl+O**, or drop a document into the window. Drag the reader's left edge to resize it. The reader supports Markdown (rendered, with tables), Word DOC/DOCX, RTF, CSV/TSV, Excel XLS/XLSX/XLSM/XLSB, PDF, HTML and plain text. Workbooks are organized by sheet and row range. PDFs offer page images and extracted text where available. HTML offers extracted text and an interactive preview. Legacy DOC uses `antiword` and PDF text uses `pdftotext` when installed. Windows renders PDF page images directly.
+
+Opening a document previews it locally. **Excerpt to chat** attaches up to 6,000 UTF-8 bytes of a workspace file to the next request after you approve it. The reader accepts files up to 32 MiB and bounds extracted content for the desktop preview.
+
+**Edit** opens Markdown, text, CSV/TSV, Word, Excel (XLSX) and RTF files for editing in the side panel. Markdown has Edit and Preview tabs, a formatting toolbar and word and line counts. Spreadsheets open as a grid with sheet tabs. Right-click a row number or column letter to insert or delete rows and columns. **Save** writes over the original and refuses if the file changed on disk since you opened it. **Save as** always writes a new file. Spindle's Word and Excel writer keeps text and cell values only, so saving over a .docx or .xlsx first warns that fonts, styles, formulas, charts and images will be lost. RTF, XLS, XLSM, XLSB and DOC save only as a new file.
+
+## Review council
+
+Use `/council` to get independent feedback on the latest response, or `/council <question or material>` to focus the review. An approved attachment can supply the material. The council calls its saved reviewers sequentially, with no execution tools, and returns each model's feedback under its own heading. Use `/council roster` to inspect the panel and **Settings → Preferences** to change it. The initial roster prefers local `qwen3.5:9b` and `Maternion/spark-x2.6:4b` when installed.
+
+## Images (ComfyUI)
+
+Set the ComfyUI address in **Settings › Models › Image generation**, or use `/image server http://model-host.local:8188`. Use **Test** to list checkpoints from the server.
+
+- `/image a red fox in the snow` generates a PNG. Models can also generate pictures with the `image` tool.
+- Attach a PNG or JPEG and send `/image edit make the sky violet`, or use `/image edit "red fox.png" -- make the sky violet` with a workspace file or an image created in this chat. The edit saves a separate file.
+
+Both commands have built-in SDXL workflows in ComfyUI. To customize one, use **Workflow › Export (API)** in ComfyUI and set the corresponding workflow path in Spindle. Templates accept `{{prompt}}`, `{{negative}}`, `{{seed}}`, `{{width}}` and `{{height}}`. An edit workflow also needs `{{image}}` as an input value, such as the **Load Image** node's image field. You can also select Stable Diffusion WebUI with its API enabled. That backend uses its currently loaded checkpoint. The selected image server receives prompts and edit source files.
+
+## Audio
+
+Spindle talks and listens through Ollama when you have a model that can (for example `ollama pull lfm3-omni`). Use the microphone button in the message box to dictate, or the speaker button on a reply to hear it. Attach a recording (.wav, .mp3, .m4a, …) and Spindle writes down what is said and attaches the transcript. `/speak some text` saves a WAV in the chat, and models can use `speak` and `transcribe` when you ask. Settings › Models › Audio picks the models and voice, turns on reading every reply aloud, or points Spindle at another server with the OpenAI audio API. You can also use Fish Audio (paid, many voices) for speaking, transcribing or both: choose it there and add your API key.

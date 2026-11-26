@@ -1,6 +1,7 @@
 name: Publish Browser Link
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - "browser-link-v*"

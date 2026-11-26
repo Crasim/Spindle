@@ -26,7 +26,7 @@ export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TC/aarch64-linux-android26-cl
 
 # Each APK gets the next build number: shown in Spindle (Settings, at the bottom) and as
 # the app's version in Android's app info, so you can tell an update arrived.
-BUILD=$(( $(cat build-number 2>/dev/null || echo 9) + 1 ))
+BUILD=$(( $(tr -d '\r' 2>/dev/null < build-number || echo 9) + 1 ))
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -1)
 # The app reports the desktop's version: keep android/Cargo.toml's the same.
 sed -i "0,/^version = .*/s//version = \"$VERSION\"/" Cargo.toml
