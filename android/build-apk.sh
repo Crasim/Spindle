@@ -36,7 +36,7 @@ echo "Spindle $VERSION, Android build $BUILD"
 cargo build --locked --release --target aarch64-linux-android
 
 OUT=target/apk
-rm -rf "$OUT" && mkdir -p "$OUT/compiled" "$OUT/classes" "$OUT/lib/arm64-v8a" "$OUT/assets/apk-builder"
+rm -rf "$OUT" && mkdir -p "$OUT/compiled" "$OUT/classes" "$OUT/generated" "$OUT/lib/arm64-v8a" "$OUT/assets/apk-builder"
 "$BT/aapt2" compile --dir res -o "$OUT/compiled"
 "$BUILDER_BT/aapt2" link -o "$OUT/template.apk" -I "$PLATFORM" --manifest builder/ProjectManifest.xml
 unzip -p "$OUT/template.apk" AndroidManifest.xml > "$OUT/assets/apk-builder/manifest.bin"
@@ -53,10 +53,12 @@ with ZipFile(sys.argv[1], "w", ZIP_DEFLATED) as out:
                     written.add(name)
 PY
 "$BT/aapt2" link -o "$OUT/base.apk" -I "$PLATFORM" -A "$OUT/assets" --manifest AndroidManifest.xml \
+    --java "$OUT/generated" \
     --version-code "$BUILD" --version-name "$VERSION (build $BUILD)" --replace-version \
     "$OUT"/compiled/*.flat
 cp target/aarch64-linux-android/release/libspindle.so "$OUT/lib/arm64-v8a/"
 javac --release 8 -classpath "$PLATFORM:$ECJ:$D8:$APKSIG" -d "$OUT/classes" \
+    "$OUT/generated/org/spindleapp/spindle/R.java" \
     java/org/spindleapp/spindle/*.java java/org/spindleapp/spindle/builder/*.java \
     builder/src/org/spindleapp/spindle/builder/JavaDex.java
 jar cf "$OUT/classes.jar" -C "$OUT/classes" .
