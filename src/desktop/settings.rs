@@ -988,13 +988,15 @@ impl Desktop {
             client.browser == browser && client.regular_profile()).peekable();
         let has_client = live.peek().is_some();
         let installed = has_client || browser.installed();
-        let ready = live.any(|client| client.ready);
+        let outdated = live.clone().any(|client| !client.up_to_date());
+        let ready = live.any(|client| client.ready && client.up_to_date());
         let known = has_client || crate::browser_native::connected_before(browser);
         let prepared = crate::browser_native::setup_started(browser);
         let disabled = self.view.state.preferences.disabled_browsers.contains(&browser);
         let status = if !installed { "Browser is not installed" }
             else if disabled { "Access is off" }
             else if ready { "Browser Link connected" }
+            else if outdated { "Browser Link update required" }
             else if has_client { "Browser Link needs attention" }
             else if known { "Open this browser to connect" }
             else if prepared { "Finish Browser Link setup" }
@@ -1019,10 +1021,10 @@ impl Desktop {
                     }
                     if installed && !ready && !disabled {
                         if ui.add_enabled(self.browser_setup.install.is_none(),
-                            egui::Button::new(if prepared || known { "Set up again" } else { "Install" })).clicked()
+                            egui::Button::new(if outdated { "Update" } else if prepared || known { "Set up again" } else { "Install" })).clicked()
                         {
                             self.browser_setup.manage = Some(browser);
-                            self.launch_browser_link(browser);
+                            self.launch_browser_link(browser, outdated);
                         }
                     }
                     if !installed {
@@ -1070,19 +1072,15 @@ impl Desktop {
         let versions: std::collections::BTreeSet<_> = self.view.browser_clients.iter()
             .filter(|client| client.browser == browser && client.regular_profile())
             .map(|client| client.version.as_deref().unwrap_or("Unknown")).collect();
-        let version_parts = |version: &str| version.split('.').map(str::parse::<u16>)
-            .collect::<Result<Vec<_>, _>>();
-        let latest = version_parts(available).expect("Bundled extension version is numeric");
-        let needs_update = versions.iter()
-            .any(|version| version_parts(version).map_or(true, |installed| installed < latest));
+        let needs_update = self.view.browser_clients.iter().any(|client|
+            client.browser == browser && client.regular_profile() && !client.up_to_date());
         if !versions.is_empty() {
             ui.label(format!("Installed · {}", versions.into_iter().collect::<Vec<_>>().join(", ")));
         }
         ui.weak(format!("Available with this build · {available}"));
         if ui.add_enabled(self.browser_setup.install.is_none(),
             egui::Button::new(if needs_update { "Update Browser Link" } else { "Set up again" })).clicked() {
-            self.launch_browser_link(browser);
-            self.browser_setup.updating = needs_update;
+            self.launch_browser_link(browser, needs_update);
         }
         ui.separator();
         self.browser_policy(ui);
@@ -1108,6 +1106,23 @@ impl Desktop {
         let read = self.view.state.browser_reads.get(&chat).cloned();
         let requested = selected.is_some() && self.view.browser_site_request == selected;
         if read.is_none() && !requested {
+            if let Some((id, address)) = self.view.browser_fallback.clone()
+                && let Ok(page) = crate::browser::public_page(&address) {
+                ui.group(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.strong(format!("Spindle couldn’t read {}", page.host_str().unwrap_or("this site")));
+                    if let Some(reason) = crate::engine::browser_access_blocker(&self.view.state) {
+                        ui.label(reason);
+                    } else {
+                        ui.label("Continue in your regular browser. Spindle will request access to that tab.");
+                        let ready = !self.view.busy && self.view.job.is_none();
+                        if ui.add_enabled(ready, egui::Button::new("Use regular browser")).clicked() {
+                            self.send(format!("/browser-link fallback {id}"));
+                        }
+                    }
+                });
+                return true;
+            }
             if crate::engine::interrupted_browser_read(&self.view.state).is_none() { return false; }
             if ui.button("Continue browser request").clicked() { self.send("/browser-link retry"); }
             return true;
@@ -1119,8 +1134,16 @@ impl Desktop {
         let clients: Vec<_> = self.view.browser_clients.iter()
             .filter(|client| client.can_connect(destination) && !disabled.contains(&client.browser))
             .cloned().collect();
+        let update_browsers: Vec<_> = crate::browser::LinkBrowser::ALL.into_iter()
+            .filter(|browser| !disabled.contains(browser)
+                && self.view.browser_clients.iter().any(|client| client.browser == *browser
+                    && client.regular_profile() && !client.up_to_date()))
+            .collect();
+        let updating = self.browser_setup.updating
+            && (self.browser_setup.install.is_some() || self.browser_setup.folder.is_some());
         let needs_setup = read.is_some() && clients.is_empty()
-            && !self.view.browser_clients.iter().any(|c| c.ready && c.regular_profile() && !disabled.contains(&c.browser))
+            && !self.view.browser_clients.iter().any(|c| c.ready && c.regular_profile()
+                && c.up_to_date() && !disabled.contains(&c.browser))
             && !(selected.is_some() && destination.is_none());
         let site = if let Some(page) = destination {
             policy.rule_for(page).is_none().then(|| page.origin().ascii_serialization())
@@ -1130,7 +1153,21 @@ impl Desktop {
         ui.add_space(8.);
         ui.group(|ui| {
             ui.set_width(ui.available_width());
-            if needs_setup {
+            if read.is_some() && clients.is_empty() && (updating || !update_browsers.is_empty()) {
+                ui.strong("Update Browser Link to continue");
+                ui.label(format!("This request waits for Browser Link {} or later.",
+                    crate::browser_link::extension_version()));
+                self.browser_setup_details(ui);
+                if self.browser_setup.install.is_none() {
+                    ui.horizontal_wrapped(|ui| {
+                        for browser in update_browsers {
+                            if ui.button(format!("Update Browser Link for {}", browser.label())).clicked() {
+                                self.launch_browser_link(browser, true);
+                            }
+                        }
+                    });
+                }
+            } else if needs_setup {
                 ui.strong("Connect your regular browser");
                 ui.label("Set up Browser Link in the profile with your tabs and sign-ins. This chat will continue when the extension connects.");
                 self.browser_setup_controls(ui);
@@ -1211,13 +1248,13 @@ impl Desktop {
         }
     }
 
-    fn launch_browser_link(&mut self, browser: crate::browser::LinkBrowser) {
+    fn launch_browser_link(&mut self, browser: crate::browser::LinkBrowser, updating: bool) {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(browser.prepare_existing_profile());
         });
         self.browser_setup.browser = browser;
-        self.browser_setup.updating = false;
+        self.browser_setup.updating = updating;
         self.browser_setup.existing_clients = self.view.browser_clients.iter()
             .filter(|client| client.browser == browser && client.regular_profile())
             .map(|client| client.id.clone()).collect();
@@ -1239,7 +1276,7 @@ impl Desktop {
             let connected = self.view.browser_clients.iter().any(|client|
                 client.regular_profile() && client.browser == setup.browser
                     && !setup.existing_clients.contains(&client.id)
-                    && (!setup.updating || client.version.as_deref() == Some(crate::browser_link::extension_version())));
+                    && client.up_to_date());
             if connected {
                 ui.strong(format!("Browser Link connected · {}", setup.browser.label()));
             } else {
@@ -1300,7 +1337,7 @@ impl Desktop {
                     format!("Set up {}", browser.label())
                 };
                 if ui.button(label).clicked() {
-                    self.launch_browser_link(browser);
+                    self.launch_browser_link(browser, false);
                 }
             }
         });

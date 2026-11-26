@@ -6,7 +6,7 @@ In the browser profile with your tabs, open **Extensions → Manage extensions**
 
 Use the chat’s **Allow this site**, **Allow all**, or **Deny** choices when it asks for website access. Browser Link is separate from the isolated browser inside Spindle.
 
-Browser Link groups eligible tabs under **Spindle**. A border and status badge identify the connected page. A pointer marks controls during click and fill actions. Press **Esc** in the page to revoke access to that tab, or disconnect from the extension popup. Choose **Allow this tab again** in the popup if you want to restore access.
+Browser Link groups eligible tabs under **Spindle**. A brighter border, status badge, and Spindle pointer show when an approved read, click, or fill is in progress. The badge and outline remain while access is active. Press **Esc** in the page to revoke access to that tab, or disconnect from the extension popup. Choose **Allow this tab again** in the popup to restore access.
 
 ## Publishing
 

@@ -269,6 +269,7 @@ pub(super) struct BrowserPane {
     address: String,
     error: String,
     model_page: Option<(String, String)>,
+    activity: Option<crate::execution::BrowserActivity>,
     #[cfg(windows)]
     web: Option<wry::WebView>,
     #[cfg(windows)]
@@ -314,10 +315,25 @@ pub(super) fn to_url(typed: &str) -> String {
 }
 
 impl BrowserPane {
-    pub fn present(&mut self, url: String, text: String) {
-        self.address = url.clone();
+    pub fn present(&mut self, page: crate::execution::BrowserPanel) {
+        use crate::execution::BrowserActivity;
+        self.address = page.address;
         self.error.clear();
-        self.model_page = Some((url, text));
+        self.model_page = None;
+        self.activity = None;
+        match page.activity {
+            BrowserActivity::Loaded(text) => self.model_page = Some((self.address.clone(), text)),
+            activity => {
+                self.hide();
+                self.activity = Some(activity);
+            }
+        }
+    }
+
+    pub fn disconnected(&mut self) {
+        if matches!(self.activity, Some(crate::execution::BrowserActivity::Linked)) {
+            self.activity = Some(crate::execution::BrowserActivity::Unavailable("Browser Link disconnected.".into()));
+        }
     }
 
     pub fn hide(&mut self) {
@@ -336,7 +352,7 @@ impl BrowserPane {
         let mut typing = false;
         ui.horizontal(|ui| {
             #[cfg(windows)]
-            if let Some(web) = &self.web {
+            if self.activity.is_none() && let Some(web) = &self.web {
                 if ui.small_button("‹").on_hover_text("Back").clicked() {
                     let _ = web.evaluate_script("history.back()");
                 }
@@ -358,6 +374,29 @@ impl BrowserPane {
                 go = Some(to_url(&self.address));
             }
         });
+        if go.is_some() {
+            self.activity = None;
+        } else if let Some(activity) = &self.activity {
+            use crate::execution::BrowserActivity;
+            ui.add_space(8.);
+            match activity {
+                BrowserActivity::Opening => {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spinner();
+                        ui.label("Spindle is opening this page…");
+                    });
+                }
+                BrowserActivity::Unavailable(reason) => {
+                    ui.label(reason);
+                }
+                BrowserActivity::Linked => {
+                    ui.strong("Browser Link");
+                    ui.label("Spindle is using the tab in your regular browser. Press Esc in that tab to revoke access.");
+                }
+                BrowserActivity::Loaded(_) => {}
+            }
+            return;
+        }
         #[cfg(windows)]
         let automatic = automatic.filter(|_| go.is_none());
         #[cfg(windows)]

@@ -14,6 +14,45 @@ use std::time::{Duration, Instant};
 pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 const SETTINGS: &str = "Settings → Sandbox → Model browser";
 
+pub(crate) fn public_page(address: &str) -> Result<reqwest::Url> {
+    #[cfg(any(windows, target_os = "linux"))]
+    { crate::public_web::url(address) }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = address;
+        bail!("Public Chromium browsing is available on Windows and Linux")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum PageAccess {
+    Http(u16),
+    Challenge,
+}
+
+impl std::fmt::Display for PageAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(status) => write!(f, "The site returned HTTP {status}"),
+            Self::Challenge => f.write_str("The site showed a verification page instead of the requested content"),
+        }
+    }
+}
+
+impl std::error::Error for PageAccess {}
+
+pub(crate) fn verification_page(title: &str, body: &str) -> bool {
+    let title = title.trim().to_ascii_lowercase();
+    let body: String = body.chars().take(1800).collect::<String>().to_ascii_lowercase();
+    ["just a moment", "verify you are human", "attention required", "access denied",
+        "robot check", "security check"]
+        .iter().any(|phrase| title.starts_with(phrase))
+        || (body.lines().count() < 25
+            && ["verify that you are human", "complete the security check", "confirm you're not a robot",
+                "unfortunately, bots use duckduckgo too", "our systems have detected unusual traffic"]
+                .iter().any(|phrase| body.contains(phrase)))
+}
+
 /// The saved executable overrides the environment and system discovery.
 pub fn resolve(configured: &str) -> Result<PathBuf> {
     ensure!(SUPPORTED, "The model browser is available on Windows and Linux");
@@ -943,6 +982,9 @@ fn open_public_tab(
                     Ok(response) => {
                         if main {
                             status = Some(response.status);
+                            if !diagnostics && matches!(response.status, 401 | 403 | 429) {
+                                return Err(PageAccess::Http(response.status).into());
+                            }
                             if response.status >= 400 && !diagnostics {
                                 bail!("The site returned HTTP {}", response.status);
                             }
@@ -1004,6 +1046,9 @@ fn open_public_tab(
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
+    if verification_page(page["title"].as_str().unwrap_or_default(), &body) {
+        return Err(PageAccess::Challenge.into());
+    }
     let (visible, more) = {
         let mut chars = body.chars().skip(start);
         let content: String = chars.by_ref().take(6000).collect();
@@ -1038,6 +1083,9 @@ fn open_public_tab(
             6,
         );
         add_diagnostics(&mut output, "Network requests", &traffic, 16);
+    }
+    if let Some(status @ (401 | 403 | 429)) = status {
+        return Err(anyhow::Error::new(PageAccess::Http(status)).context(output));
     }
     if let Some(links) = page["links"].as_array() {
         let mut seen = std::collections::HashSet::new();
@@ -1079,6 +1127,13 @@ fn add_diagnostics(output: &mut String, heading: &str, items: &[String], limit: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognizes_verification_pages() {
+        assert!(verification_page("Just a moment…", "Hold on"));
+        assert!(verification_page("Search", "Unfortunately, bots use DuckDuckGo too."));
+        assert!(!verification_page("Radeon RX 6800 XT search results", "Used graphics cards with shipping."));
+    }
 
     #[test]
     fn install_guide_is_local_browser_specific_and_outside_the_extension() {

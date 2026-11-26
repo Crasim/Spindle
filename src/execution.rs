@@ -90,7 +90,32 @@ pub struct Jobs {
     pub browser_link: Option<crate::browser_link::Link>,
     pub browser_client: Option<crate::browser_native::BrowserClient>,
     pub browser_site_request: Option<String>,
-    pub browser_panel: Option<(u64, String, String)>,
+    pub browser_panel: Option<BrowserPanel>,
+    pub browser_retry: Option<BrowserRetry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrowserPanel {
+    pub chat: u64,
+    pub address: String,
+    pub activity: BrowserActivity,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum BrowserActivity {
+    Opening,
+    Loaded(String),
+    Unavailable(String),
+    Linked,
+}
+
+pub struct BrowserRetry {
+    pub chat: u64,
+    pub message: usize,
+    pub id: u64,
+    pub address: String,
+    pub model: String,
+    pub read_only: bool,
 }
 
 /// What setting up the sandbox involves, for the approval card.
@@ -560,6 +585,19 @@ impl Engine {
         let cancel = self.jobs.cancel.clone();
         self.jobs.running = Some(pending.call.call.summary());
         let block_web = self.state.preferences.block_web;
+        if !block_web && let Call::WebOpen { url, start: 0, .. } = &pending.call.call
+            && let Ok(address) = crate::browser::public_page(url) {
+            self.jobs.browser_panel = Some(BrowserPanel {
+                chat: pending.chat, address: address.to_string(), activity: BrowserActivity::Opening,
+            });
+        }
+        if pending.approved && let Call::BrowserTab(_) = &pending.call.call {
+            self.jobs.browser_panel = Some(BrowserPanel {
+                chat: pending.chat,
+                address: self.state.browser_session.as_ref().map(|p| p.origin()).unwrap_or_default(),
+                activity: BrowserActivity::Linked,
+            });
+        }
         let policy = crate::browser_link::Policy::from_preferences(&self.state.preferences);
         let tab_block = crate::engine::browser_access_blocker(&self.state).or_else(|| {
             self.jobs.browser_link.as_ref().filter(|link| {
@@ -570,6 +608,7 @@ impl Engine {
         let tab = self.jobs.browser_link.as_ref()
             .filter(|link| match (&pending.call.call, link.paired()) {
                 (Call::BrowserTab(action), Some(paired)) => paired.chat == pending.chat
+                    && self.jobs.browser_client.as_ref().is_some_and(|client| client.up_to_date())
                     && paired.target(&pending.model, action) == pending.target
                     && paired.allowed_by(&policy),
                 _ => false,
@@ -676,15 +715,34 @@ impl Engine {
         match done {
             JobDone::Catalog{pending:p,result}=>{
                 if self.jobs.cancel.load(Ordering::Relaxed) {
+                    if let Call::WebOpen { url, start: 0, .. } = &p.call.call {
+                        self.jobs.browser_panel = Some(BrowserPanel { chat: p.chat,
+                            address: url.clone(), activity: BrowserActivity::Unavailable("Browsing stopped".into()) });
+                    }
                     crate::engine::record_outcome(&mut self.state,p.id,"Stopped by user",false);
                     crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),"Stopped by user");
                     return "Stopped by user".into();
                 }
-                let ok=result.is_ok(); let text=result.unwrap_or_else(|e|format!("Tool failed: {e:#}"));
-                if ok && crate::engine::builtin_browser_request(&self.state, p.chat)
-                    && let Call::WebOpen { url, start: 0, .. } = &p.call.call
-                {
-                    self.jobs.browser_panel = Some((p.chat, url.clone(), text.clone()));
+                let ok = result.is_ok();
+                let restricted = result.as_ref().err()
+                    .is_some_and(|error| error.is::<crate::browser::PageAccess>());
+                let mut text = result.unwrap_or_else(|e|format!("Tool failed: {e:#}"));
+                if let Call::WebOpen { url, start: 0, .. } = &p.call.call {
+                    self.jobs.browser_panel = Some(BrowserPanel {
+                        chat: p.chat, address: url.clone(),
+                        activity: if ok { BrowserActivity::Loaded(text.clone()) }
+                            else { BrowserActivity::Unavailable(text.clone()) },
+                    });
+                    if restricted && let Some(index) = crate::engine::latest_user_turn(&self.state, p.chat)
+                        && self.jobs.browser_retry.as_ref().is_none_or(|old| (old.chat, old.message) != (p.chat, index))
+                    {
+                        self.jobs.browser_retry = Some(BrowserRetry { chat: p.chat, message: index,
+                            id: p.id, address: url.clone(), model: p.model.clone(), read_only: p.chat_read_only });
+                        text.push_str("\nSpindle offers Use regular browser in this chat. It will request permission for the tab and continue this task. Use that option if this site is needed; do not ask the user to paste page content.");
+                    } else if ok && self.jobs.browser_retry.as_ref()
+                        .is_some_and(|retry| retry.chat == p.chat && retry.address == *url) {
+                        self.jobs.browser_retry = None;
+                    }
                 }
                 crate::engine::record_outcome(&mut self.state,p.id,&text,ok);
                 crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),if ok{"Finished"}else{"Failed"});

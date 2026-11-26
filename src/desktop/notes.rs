@@ -1794,6 +1794,11 @@ mod tests {
         });
         run(&mut app, &ctx, vec![]);
         let labels = run(&mut app, &ctx, vec![]);
+        assert!(labels.contains_key("Update Browser Link to continue"));
+        assert!(labels.contains_key("Update Browser Link for Microsoft Edge"));
+        assert!(!labels.contains_key("Allow this site"));
+        app.view.browser_clients[0].version = Some(crate::browser_link::extension_version().into());
+        let labels = run(&mut app, &ctx, vec![]);
         assert!(labels.contains_key("https://example.com"));
         assert!(!labels.contains_key("Set up Browser Link"));
         click(&mut app, &ctx, labels["Allow this site"]);
@@ -2009,6 +2014,28 @@ mod tests {
         assert!(!labels.contains_key("Make image"));
         click(&mut app, &ctx, labels["Chat"]);
         assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|s| s == "/mode chat"));
+    }
+
+    #[test]
+    fn public_browser_opens_the_side_panel_while_loading() {
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (views, rx) = std::sync::mpsc::channel();
+        let (_, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        let mut view = app.view.clone();
+        view.browser_panel = Some(crate::execution::BrowserPanel {
+            chat: view.state.chat_id,
+            address: "https://example.com/".into(),
+            activity: crate::execution::BrowserActivity::Opening,
+        });
+        views.send(view).unwrap();
+        let labels = run(&mut app, &ctx, vec![]);
+        assert!(app.reader.open);
+        assert!(app.reader.tab == side_tabs::Tab::Browser);
+        assert!(labels.contains_key("Spindle is opening this page…"));
     }
 
     #[test]

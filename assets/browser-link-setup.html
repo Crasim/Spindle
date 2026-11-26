@@ -22,7 +22,7 @@
     <li>Open <strong>Manage extensions</strong> from your browser’s Extensions menu, or paste this address into a new tab.
       <div class="field"><code id="address">{{address}}</code><button data-copy="address">Copy Extensions address</button></div>
     </li>
-    <li>Turn on <strong>Developer mode</strong>, then click <strong>Load unpacked</strong>.</li>
+    <li>If you’re updating Browser Link, remove its old entry first. Turn on <strong>Developer mode</strong>, then click <strong>Load unpacked</strong>.</li>
     <li>Select the extracted Browser Link folder. You can also paste this path into the folder chooser and choose <strong>Select Folder</strong>.
       <div class="field"><code id="folder">{{folder}}</code><button data-copy="folder">Copy folder path</button></div>
     </li>
@@ -30,7 +30,7 @@
   <details {{download_visibility}}><summary>Need a fresh copy of Browser Link?</summary>
     <p><a href="{{download}}">Download Browser Link ZIP</a>. Extract it in Downloads and select the folder containing <code>manifest.json</code> in <strong>Load unpacked</strong>.</p>
   </details>
-  <p>If Browser Link is already installed and enabled, return to Spindle to check the connection.</p>
+  <p>Return to Spindle once Browser Link is enabled. A waiting browser request continues when the current extension connects.</p>
   <p id="status" role="status"></p>
 </main>
 <script>

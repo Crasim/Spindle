@@ -48,8 +48,27 @@ impl BrowserClient {
     }
 
     pub fn can_connect(&self, destination: Option<&reqwest::Url>) -> bool {
-        self.regular_profile() && self.ready && (destination.is_some() || self.has_tab)
+        self.regular_profile() && self.ready && self.up_to_date()
+            && (destination.is_some() || self.has_tab)
     }
+
+    pub fn up_to_date(&self) -> bool {
+        let required = extension_version_parts(crate::browser_link::extension_version())
+            .expect("Bundled Browser Link version is valid");
+        self.version.as_deref().and_then(extension_version_parts)
+            .is_some_and(|version| version >= required)
+    }
+}
+
+fn extension_version_parts(value: &str) -> Option<[u16; 4]> {
+    let mut parts = [0; 4];
+    for (index, value) in value.split('.').enumerate() {
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        *parts.get_mut(index)? = value.parse().ok()?;
+    }
+    Some(parts)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -149,6 +168,7 @@ pub fn find_profile<'a>(ready: &[&'a BrowserClient], page: &reqwest::Url, reques
     let key = crate::tools::hash(format!("{}:{request}:{page}", std::process::id()).as_bytes());
     let mut missing = false;
     for client in ready {
+        ensure!(client.up_to_date(), "Update Browser Link before looking up tabs");
         if client.located.as_ref().is_some_and(|result| result.key == key) { continue; }
         missing = true;
         let path = lookup_path(&client.id);
@@ -194,7 +214,9 @@ pub fn clients() -> Vec<BrowserClient> {
     result
 }
 
-pub fn offer(client: &str, link: &crate::browser_link::Link) -> Result<()> {
+pub fn offer(browser: &BrowserClient, link: &crate::browser_link::Link) -> Result<()> {
+    ensure!(browser.can_connect(link.destination.as_ref()), "Browser Link is unavailable or needs an update");
+    let client = &browser.id;
     ensure!(valid_id(client), "Invalid browser client");
     let path = offer_path(client);
     if let Some(current) = read_file::<Offer>(&path)
@@ -234,7 +256,7 @@ fn exchange(client: BrowserClient) -> Result<Option<Offer>> {
         let receipt = setup_marker(client.browser, SetupMarker::Connected);
         if !receipt.is_file() { let _ = write_file(&receipt, &true); }
     }
-    let offer = client.ready
+    let offer = (client.regular_profile() && client.ready && client.up_to_date())
         .then(|| read_file::<Offer>(&offer_path(&client.id)))
         .flatten()
         .filter(|offer| offer.client == client.id && fresh(offer.updated)
@@ -331,7 +353,12 @@ async fn relay(
                 if let Some(client) = event.get("browser") {
                     let client: BrowserClient = serde_json::from_value(client.clone())?;
                     ensure!(valid_id(&client.id), "Invalid browser client");
-                    if client.guided && let Some(lookup) = read_file::<Lookup>(&lookup_path(&client.id)) {
+                    let current = client.regular_profile() && client.up_to_date();
+                    if !current && (requested.take().is_some() || bound.is_some()) {
+                        bound = None;
+                        native_write(output, &json!({"disconnected":true}))?;
+                    }
+                    if current && let Some(lookup) = read_file::<Lookup>(&lookup_path(&client.id)) {
                         if fresh(lookup.updated) && !client.located.as_ref().is_some_and(|result| result.key == lookup.key) {
                             native_write(output, &json!({"locate": lookup.page, "key": lookup.key}))?;
                         } else {

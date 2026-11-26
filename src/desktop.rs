@@ -2546,11 +2546,14 @@ impl eframe::App for Desktop {
                 self.reader_files_at = None;
             }
             self.observe_submission(&v);
-            if self.page == Page::Chat && let Some((chat, url, text)) = v.browser_panel.clone()
-                && chat == v.state.chat_id {
+            if self.page == Page::Chat && let Some(page) = v.browser_panel.clone()
+                && page.chat == v.state.chat_id {
                 self.reader.open = true;
                 self.reader.tab = side_tabs::Tab::Browser;
-                self.reader.browser.present(url, text);
+                self.reader.browser.present(page);
+            }
+            if v.browser_pairing.is_none() && self.view.browser_pairing.is_some() {
+                self.reader.browser.disconnected();
             }
             if self.plan.submitted && v.notice == "Plan revision queued" && v.state.chat_id == self.view.state.chat_id {
                 self.plan.revision_accepted();

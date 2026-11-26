@@ -200,7 +200,7 @@ def run_browser(exe, binary, folder, extension_folder, env, url, model):
                         requested = True
                     if not escaped and (folder / "ready-for-escape").exists():
                         active = cdp.call("Runtime.evaluate", {
-                            "expression": "Boolean(document.querySelector('spindle-browser-activity'))",
+                            "expression": "Boolean(document.querySelector('spindle-browser-activity[data-working]'))",
                         }, page)
                         assert active["result"]["value"], "Missing activity indicator"
                         groups = cdp.call("Runtime.evaluate", {

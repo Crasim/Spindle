@@ -336,12 +336,17 @@ function operate(operation, rule, blocked, sessionNonce) {
     const shadow = host.attachShadow({mode: "closed"});
     const style = document.createElement("style");
     style.textContent = `
-      :host { box-shadow: inset 0 0 0 2px #54c788, inset 0 0 18px #54c78860 !important }
-      div { position: absolute; right: 16px; top: 16px; background: #12251c; color: #dcf8e6;
-        border: 1px solid #54c788; border-radius: 9px; padding: 8px 12px; font: 13px system-ui;
-        box-shadow: 0 3px 16px #0005; }
-      span { position: absolute; width: 16px; height: 21px; background: #54c788;
-        clip-path: polygon(0 0, 100% 65%, 60% 68%, 68% 100%, 46% 95%, 36% 69%, 0 92%); }
+      :host { box-shadow: inset 0 0 0 2px #54c788, inset 0 0 18px #54c78860 !important; }
+      :host([data-working]) { box-shadow: inset 0 0 0 4px #70efa7, inset 0 0 32px #54c7889c !important; }
+      div { position: absolute; right: 16px; top: 16px; background: #10251b; color: #f0fff5;
+        border: 1px solid #70efa7; border-radius: 10px; padding: 9px 13px;
+        max-width: calc(100% - 60px); font: 600 13px/1.4 system-ui; box-shadow: 0 4px 18px #0009; }
+      span { position: absolute; width: 29px; height: 33px; color: #10251b;
+        filter: drop-shadow(0 2px 4px #000d) drop-shadow(0 0 8px #70efa7); }
+      span::before { content: ""; position: absolute; inset: 0; background: #70efa7;
+        clip-path: polygon(0 0, 100% 61%, 62% 67%, 77% 96%, 60% 100%, 43% 73%, 9% 93%); }
+      span::after { content: "S"; position: absolute; top: 8px; left: 6px;
+        font: 800 12px/1 system-ui; }
     `;
     const badge = document.createElement("div");
     badge.setAttribute("role", "status");
@@ -366,19 +371,24 @@ function operate(operation, rule, blocked, sessionNonce) {
         window.removeEventListener("keydown", onKey, true);
         if (!this.revoked && globalThis.spindleTabActivity === this) delete globalThis.spindleTabActivity;
       },
-      show(element) {
-        if (element) {
-          const bounds = element.getBoundingClientRect();
-          cursor.style.left = `${bounds.left + bounds.width / 2}px`;
-          cursor.style.top = `${bounds.top + bounds.height / 2}px`;
-        }
-        cursor.hidden = !element;
-        badge.textContent = "Spindle is working · Esc to disconnect";
+      show(element, action) {
+        const bounds = element?.getBoundingClientRect();
+        const offset = action === "read" ? 22 : (bounds?.width || 0) / 2;
+        const x = Math.max(12, Math.min(innerWidth - 42, (bounds?.left || 0) + offset));
+        const y = Math.max(70, Math.min(innerHeight - 42,
+          (bounds?.top || 0) + (action === "read" ? 28 : (bounds?.height || 0) / 2)));
+        cursor.style.left = `${x}px`;
+        cursor.style.top = `${y}px`;
+        cursor.hidden = false;
+        host.setAttribute("data-working", "");
+        badge.textContent = action === "read" ? "Spindle is reading this tab · Esc to revoke access" :
+          "Spindle is using this tab · Esc to revoke access";
         clearTimeout(timer);
         timer = setTimeout(() => {
-          badge.textContent = "Spindle connected · Esc to disconnect";
+          host.removeAttribute("data-working");
+          badge.textContent = "Spindle has access to this tab · Esc to revoke access";
           cursor.hidden = true;
-        }, 1250);
+        }, 2600);
       }
     };
   }
@@ -399,7 +409,8 @@ function operate(operation, rule, blocked, sessionNonce) {
     return ["http:", "https:"].includes(url.protocol) && !url.username && !url.password ? url : undefined;
   };
   if (operation.action === "read") {
-    activity.show();
+    const main = document.querySelector("main, [role='main']") || document.body;
+    activity.show(main, "read");
     cache.clear();
     const nonce = Array.from(crypto.getRandomValues(new Uint32Array(2)), n => n.toString(16)).join("-");
     const controls = [];
@@ -417,7 +428,6 @@ function operate(operation, rule, blocked, sessionNonce) {
       controls.push({ target, action });
     }
     const page = new URL(location.href);
-    const main = document.querySelector("main, [role='main']") || document.body;
     const snapshot = { title: document.title.slice(0, 240), page: page.origin + page.pathname.slice(0, 512),
       text: main?.innerText.slice(0, 8500) || "", controls, links: [] };
     const encoder = new TextEncoder();
@@ -452,7 +462,7 @@ function operate(operation, rule, blocked, sessionNonce) {
   }
   cache.clear();
   const element = target.element;
-  activity.show(element);
+  activity.show(element, operation.action);
   if (operation.action === "fill") {
     if (!field(element) || element.readOnly || typeof operation.text !== "string" || operation.text.length > 4000) {
       return { error: "This field cannot be filled." };
