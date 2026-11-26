@@ -187,7 +187,6 @@ async fn tailscale(_interfaces: &[IpAddr]) -> (Option<String>, Vec<IpAddr>) {
 pub(super) fn local_endpoints(port: u16, override_name: &str) -> String {
     let ips = super::pair::local_ips();
     let cache = DNS.lock().unwrap();
-    ips.extend(cache.vpn_ips.iter().copied());
     let system = if cfg!(target_os = "android") {
         String::new()
     } else {
