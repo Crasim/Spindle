@@ -86,14 +86,19 @@ fn label(app: &Desktop, model: &str) -> String {
     format!("{} / {tag}", app.provider_name(provider))
 }
 
-fn field(app: &mut Desktop, ui: &mut egui::Ui, label: &str, value: &mut String, rows: usize) {
+fn field(
+    ime: &mut android_ime::ComposerIme,
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut String,
+    rows: usize,
+) {
     ui.label(label);
-    app.android_ime
-        .multiline(ui, ("bobbin", label), value, |edit| {
-            edit.desired_width(f32::INFINITY)
-                .desired_rows(rows)
-                .char_limit(if rows == 1 { 240 } else { 6_000 })
-        });
+    ime.multiline(ui, ("bobbin", label), value, |edit| {
+        edit.desired_width(f32::INFINITY)
+            .desired_rows(rows)
+            .char_limit(if rows == 1 { 240 } else { 6_000 })
+    });
     ui.add_space(6.);
 }
 
@@ -206,31 +211,37 @@ impl Desktop {
 
     pub(super) fn bobbin_run_footer(&mut self, ctx: &egui::Context) {
         let chat = self.view.state.chat_id;
-        let run = self.view.state.bobbins.runs[&chat].clone();
-        egui::TopBottomPanel::bottom("bobbin-run")
+        let run = &self.view.state.bobbins.runs[&chat];
+        let (back, cancel) = egui::TopBottomPanel::bottom("bobbin-run")
             .frame(egui::Frame::new().fill(panel()).inner_margin(10))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if control(ui, Icon::Back, "Bobbin runs", egui::vec2(126., 30.), false)
-                        .clicked()
-                    {
-                        self.bobbins.selected = self
-                            .view
-                            .state
-                            .bobbins
-                            .profiles
-                            .contains_key(&run.bobbin)
-                            .then(|| run.bobbin.clone());
-                        self.bobbins.tab = Tab::Runs;
-                        self.page = Page::Bobbins;
-                    }
+                    let back = control(ui, Icon::Back, "Bobbin runs", egui::vec2(126., 30.), false)
+                        .clicked();
                     ui.strong(&run.configuration.name);
                     ui.weak(run.status.label());
-                    if run.status.active() && ui.button("Cancel run").clicked() {
-                        send(self, json!({"action":"cancel","chat":chat}));
-                    }
-                });
-            });
+                    (
+                        back,
+                        run.status.active() && ui.button("Cancel run").clicked(),
+                    )
+                })
+                .inner
+            })
+            .inner;
+        if back {
+            self.bobbins.selected = self
+                .view
+                .state
+                .bobbins
+                .profiles
+                .contains_key(&run.bobbin)
+                .then(|| run.bobbin.clone());
+            self.bobbins.tab = Tab::Runs;
+            self.page = Page::Bobbins;
+        }
+        if cancel {
+            send(self, json!({"action":"cancel","chat":chat}));
+        }
     }
 }
 
@@ -338,17 +349,22 @@ impl Screen {
         ui.add_space(10.);
         let registry = &app.view.state.bobbins;
         let query = self.search.trim().to_lowercase();
+        let mut active_counts = BTreeMap::<&str, usize>::new();
+        for (_, run) in registry.active_runs() {
+            *active_counts.entry(&run.bobbin).or_default() += 1;
+        }
         let mut matches: Vec<_> = registry
             .profiles
             .iter()
-            .filter(|(id, p)| {
+            .filter_map(|(id, p)| {
+                let active = active_counts.get(id.as_str()).copied().unwrap_or(0);
                 let status = match self.filter.as_str() {
                     "Archived" => p.archived,
                     "Paused" => p.paused && !p.archived,
-                    "Working" => !p.archived && registry.live(id).next().is_some(),
+                    "Working" => !p.archived && active != 0,
                     _ => !p.archived,
                 };
-                status
+                let visible = status
                     && self
                         .project_filter
                         .as_ref()
@@ -356,9 +372,9 @@ impl Screen {
                     && (query.is_empty()
                         || format!("{} {}", p.draft.name, p.draft.purpose)
                             .to_lowercase()
-                            .contains(&query))
+                            .contains(&query));
+                visible.then_some((id, p, active))
             })
-            .map(|(id, p)| (id.clone(), p.clone(), registry.live(id).count()))
             .collect();
         matches.sort_by_cached_key(|(_, p, _)| (!p.pinned, p.draft.name.to_lowercase()));
         if matches.is_empty() {
@@ -373,8 +389,9 @@ impl Screen {
                 }
             });
         }
+        let mut command = None;
         for (id, profile, count) in matches {
-            ui.push_id(&id, |ui| tile(ui, |ui| {
+            ui.push_id(id, |ui| tile(ui, |ui| {
                 ui.horizontal(|ui| {
                     picture(ui, &profile.draft, &mut self.art, 46.);
                     ui.vertical(|ui| {
@@ -392,13 +409,16 @@ impl Screen {
                     }
                 });
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button(if profile.archived { "View" } else { "Message" }).clicked() { self.select(&id, Tab::Overview); }
-                    if ui.button("View runs").clicked() { self.select(&id, Tab::Runs); }
+                    if ui.button(if profile.archived { "View" } else { "Message" }).clicked() { self.select(id, Tab::Overview); }
+                    if ui.button("View runs").clicked() { self.select(id, Tab::Runs); }
                     if !profile.archived && ui.button(if profile.paused { "Resume" } else { "Pause" }).clicked() {
-                        send(app, json!({"action": if profile.paused { "resume" } else { "pause" }, "id":id, "stop":false}));
+                        command = Some(json!({"action": if profile.paused { "resume" } else { "pause" }, "id":id, "stop":false}));
                     }
                 });
             }));
+        }
+        if let Some(command) = command {
+            send(app, command);
         }
     }
 
@@ -468,7 +488,7 @@ impl Screen {
                     self.tab = Tab::Runs;
                     ui.ctx().request_repaint();
                 }
-                field(app, ui, "Message", &mut self.message, 3);
+                field(&mut app.android_ime, ui, "Message", &mut self.message, 3);
                 let ready = !p.paused && app.view.models.contains(&p.draft.model);
                 if !ready {
                     ui.weak(if p.paused {
@@ -520,7 +540,7 @@ impl Screen {
         if let Some(name) = &mut self.deleting {
             let mut close = false;
             field(
-                app,
+                &mut app.android_ime,
                 ui,
                 "Type the Bobbin name to delete it. Run chats are kept.",
                 name,
@@ -551,9 +571,27 @@ impl Screen {
         if let Some((key, draft)) = &mut self.assignment {
             let mut close = false;
             tile(ui, |ui| {
-                field(app, ui, "Assignment title", &mut draft.title, 1);
-                field(app, ui, "Instructions", &mut draft.prompt, 4);
-                field(app, ui, "What should the run deliver?", &mut draft.done, 2);
+                field(
+                    &mut app.android_ime,
+                    ui,
+                    "Assignment title",
+                    &mut draft.title,
+                    1,
+                );
+                field(
+                    &mut app.android_ime,
+                    ui,
+                    "Instructions",
+                    &mut draft.prompt,
+                    4,
+                );
+                field(
+                    &mut app.android_ime,
+                    ui,
+                    "What should the run deliver?",
+                    &mut draft.done,
+                    2,
+                );
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Save assignment").clicked() {
                         send(app, json!({"action":"assign","id":id,"assignment":key,"revision":profile.revision,"draft":draft}));
@@ -631,7 +669,7 @@ impl Screen {
                 ui.weak(home());
                 access(ui, &profile.draft);
                 field(
-                    app,
+                    &mut app.android_ime,
                     ui,
                     "First run in local time (YYYY-MM-DD HH:MM)",
                     &mut form.when,
@@ -676,7 +714,7 @@ impl Screen {
     }
 
     fn runs(&mut self, app: &mut Desktop, ui: &mut egui::Ui, id: &str) {
-        let listed: Vec<_> = app
+        let mut listed = app
             .view
             .state
             .bobbins
@@ -684,23 +722,34 @@ impl Screen {
             .iter()
             .rev()
             .filter(|(_, run)| run.bobbin == id)
-            .map(|(chat, r)| (*chat, r.clone()))
-            .collect();
-        if listed.is_empty() {
+            .peekable();
+        if listed.peek().is_none() {
             ui.weak("Runs and their outputs appear here.");
         }
-        for (chat, run) in listed {
+        let mut queued = BTreeMap::new();
+        for task in &app.view.state.queue {
+            if let Some(chat) = task.origin {
+                queued.entry(chat).or_insert(task);
+            }
+        }
+        let mut command = None;
+        let mut open = None;
+        for (&chat, run) in listed {
+            let task = queued.get(&chat);
+            let held = task.and_then(|task| task.hold_reason.as_deref());
+            let model = label(
+                app,
+                run.actual_model
+                    .as_deref()
+                    .unwrap_or(&run.configuration.model),
+            );
+            let unread = app.view.state.unread.contains(&chat);
+            let can_open = app.view.state.thread_data(chat).is_some();
+            let ime = &mut app.android_ime;
             ui.push_id(chat, |ui| {
                 tile(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.strong(&run.title);
-                        let held = app
-                            .view
-                            .state
-                            .queue
-                            .iter()
-                            .find(|q| q.origin == Some(chat))
-                            .and_then(|q| q.hold_reason.as_deref());
                         ui.label(if run.held_task.is_some() {
                             "Paused"
                         } else if held.is_some() {
@@ -708,7 +757,7 @@ impl Screen {
                         } else {
                             run.status.label()
                         });
-                        if app.view.state.unread.contains(&chat) {
+                        if unread {
                             ui.colored_label(accent(), "Unread");
                         }
                     });
@@ -721,69 +770,53 @@ impl Screen {
                             "Message"
                         }
                     ));
-                    ui.weak(format!(
-                        "{} · {}",
-                        label(
-                            app,
-                            run.actual_model
-                                .as_deref()
-                                .unwrap_or(&run.configuration.model)
-                        ),
-                        run.home_label()
-                    ));
+                    ui.weak(format!("{model} · {}", run.home));
                     if run.missed > 0 {
                         ui.weak(format!("{} missed occurrences combined", run.missed));
                     }
                     if !run.outcome.is_empty() {
                         ui.label(&run.outcome);
                     }
-                    if let Some(held) = app
-                        .view
-                        .state
-                        .queue
-                        .iter()
-                        .find(|q| q.origin == Some(chat))
-                        .and_then(|q| q.hold_reason.clone())
-                    {
+                    if let Some(held) = held {
                         ui.weak(held);
                     }
                     ui.horizontal_wrapped(|ui| {
                         if ui
-                            .add_enabled(
-                                app.view.state.thread_data(chat).is_some(),
-                                egui::Button::new("Open run"),
-                            )
+                            .add_enabled(can_open, egui::Button::new("Open run"))
                             .clicked()
                         {
-                            app.send(format!("/open {chat}"));
-                            app.page = Page::Chat;
-                            app.drawer = false;
+                            open = Some(chat);
                         }
                         if run.status.active() {
                             if ui
-                                .add_enabled(
-                                    app.view.state.queue.iter().any(|q| q.origin == Some(chat)),
-                                    egui::Button::new("Steer"),
-                                )
+                                .add_enabled(task.is_some(), egui::Button::new("Steer"))
                                 .clicked()
                             {
                                 self.steering = Some((chat, String::new()));
                             }
                             if ui.button("Cancel run").clicked() {
-                                send(app, json!({"action":"cancel","chat":chat}));
+                                command = Some(json!({"action":"cancel","chat":chat}));
                             }
                         }
                     });
                     if let Some((target, correction)) = &mut self.steering
                         && *target == chat
                     {
-                        field(app, ui, "Correction for this run", correction, 2);
+                        field(ime, ui, "Correction for this run", correction, 2);
                         if ui.button("Send correction").clicked() {
-                            send(app, json!({"action":"steer","chat":chat,"text":correction}));
+                            command = Some(json!({"action":"steer","chat":chat,"text":correction}));
                         }
                     }
                 })
             });
+        }
+        if let Some(command) = command {
+            send(app, command);
+        }
+        if let Some(chat) = open {
+            app.send(format!("/open {chat}"));
+            app.page = Page::Chat;
+            app.drawer = false;
         }
         if app.notice == "Bobbin correction queued" {
             self.steering = None;
@@ -795,7 +828,7 @@ fn upcoming(profile: &Profile) -> Option<i64> {
     profile
         .assignments
         .values()
-        .filter_map(|a| a.schedule.as_ref().filter(|s| s.enabled).map(|s| s.next))
+        .filter_map(|assignment| assignment.enabled_schedule().map(|schedule| schedule.next))
         .min()
 }
 
@@ -903,10 +936,16 @@ impl Editor {
                     }
                 });
             }
-            field(app, ui, "Name", &mut self.draft.name, 1);
-            field(app, ui, "Purpose", &mut self.draft.purpose, 1);
+            field(&mut app.android_ime, ui, "Name", &mut self.draft.name, 1);
             field(
-                app,
+                &mut app.android_ime,
+                ui,
+                "Purpose",
+                &mut self.draft.purpose,
+                1,
+            );
+            field(
+                &mut app.android_ime,
                 ui,
                 "Standing instructions",
                 &mut self.draft.instructions,
@@ -1023,7 +1062,7 @@ impl Editor {
         });
         ui.separator();
         field(
-            app,
+            &mut app.android_ime,
             ui,
             "Artwork file path (PNG or JPEG)",
             &mut self.file,
@@ -1053,7 +1092,13 @@ impl Editor {
             }
         }
         ui.separator();
-        field(app, ui, "Describe an avatar", &mut self.prompt, 3);
+        field(
+            &mut app.android_ime,
+            ui,
+            "Describe an avatar",
+            &mut self.prompt,
+            3,
+        );
         let settings = crate::comfy::Settings::from(&app.view.state.preferences);
         if let Some(job) = &self.job {
             match job.receive.try_recv() {

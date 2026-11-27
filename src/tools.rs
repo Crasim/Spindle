@@ -1378,10 +1378,6 @@ pub fn resolve(root: &Path, raw: &str) -> Result<(PathBuf, bool)> {
 /// The risk of a call and the path it acts on.
 /// `sandboxed` means `root` is the conversation's sandbox copy rather than the project.
 pub fn classify(root: &Path, call: &Call, sandboxed: bool) -> Result<(Risk, PathBuf)> {
-    classify_path(root, call, sandboxed, call.raw_path())
-}
-
-pub(crate) fn classify_path(root: &Path, call: &Call, sandboxed: bool, raw_path: &str) -> Result<(Risk, PathBuf)> {
     if call.native() {
         ensure!(sandboxed, "Native execution needs a passing sandbox check");
         crate::native::validate(call)?;
@@ -1389,7 +1385,12 @@ pub(crate) fn classify_path(root: &Path, call: &Call, sandboxed: bool, raw_path:
         ensure!(inside, "Native build inputs must be inside the conversation's folder");
         return Ok((Risk::Native, path));
     }
-    let (path, inside) = resolve(root, raw_path)?;
+    let (path, inside) = resolve(root, call.raw_path())?;
+    classify_resolved(root, call, sandboxed, path, inside)
+}
+
+/// Classify a filesystem target already resolved by the caller's scope checks.
+pub(crate) fn classify_resolved(root: &Path, call: &Call, sandboxed: bool, path: PathBuf, inside: bool) -> Result<(Risk, PathBuf)> {
     if matches!(call, Call::PreviewHtml { .. }) {
         ensure!(inside && path.is_file(), "Choose an HTML file inside this working folder");
         ensure!(crate::html_preview::is_html(&path), "Choose a .html or .htm file");

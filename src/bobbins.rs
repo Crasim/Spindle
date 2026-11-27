@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -58,6 +58,22 @@ pub struct Profile {
     pub assignments: BTreeMap<String, Assignment>,
 }
 
+impl Profile {
+    fn can_dispatch(&self) -> bool {
+        !self.paused && !self.archived
+    }
+
+    fn pause_schedules(&mut self) {
+        for schedule in self
+            .assignments
+            .values_mut()
+            .filter_map(|a| a.schedule.as_mut())
+        {
+            schedule.enabled = false;
+        }
+    }
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct AssignmentDraft {
     pub title: String,
@@ -69,6 +85,12 @@ pub struct AssignmentDraft {
 pub struct Assignment {
     pub draft: AssignmentDraft,
     pub schedule: Option<Schedule>,
+}
+
+impl Assignment {
+    pub fn enabled_schedule(&self) -> Option<&Schedule> {
+        self.schedule.as_ref().filter(|schedule| schedule.enabled)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -127,12 +149,6 @@ pub struct Run {
     pub outcome: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held_task: Option<Task>,
-}
-
-impl Run {
-    pub fn home_label(&self) -> &str {
-        &self.home
-    }
 }
 
 #[derive(Deserialize)]
@@ -209,9 +225,41 @@ impl Registry {
     }
 
     pub fn live(&self, id: &str) -> impl Iterator<Item = (&u64, &Run)> {
-        self.runs
+        self.active_runs().filter(move |(_, run)| run.bobbin == id)
+    }
+
+    pub(crate) fn active_runs(&self) -> impl Iterator<Item = (&u64, &Run)> {
+        self.runs.iter().filter(|(_, run)| run.status.active())
+    }
+
+    fn next_schedule(&self) -> Option<(&str, &str, &Schedule)> {
+        let mut schedules = self
+            .profiles
             .iter()
-            .filter(move |(_, run)| run.bobbin == id && run.status.active())
+            .filter(|(_, profile)| profile.can_dispatch())
+            .flat_map(|(id, profile)| {
+                profile
+                    .assignments
+                    .iter()
+                    .filter_map(move |(key, assignment)| {
+                        assignment
+                            .enabled_schedule()
+                            .map(|schedule| (id.as_str(), key.as_str(), schedule))
+                    })
+            })
+            .peekable();
+        schedules.peek()?;
+        let active_assignments: BTreeSet<_> = self
+            .active_runs()
+            .filter_map(|(_, run)| {
+                run.assignment
+                    .as_deref()
+                    .map(|assignment| (run.bobbin.as_str(), assignment))
+            })
+            .collect();
+        schedules
+            .filter(|(id, key, _)| !active_assignments.contains(&(*id, *key)))
+            .min_by_key(|(id, key, schedule)| (schedule.next, *id, *key))
     }
 }
 
@@ -391,7 +439,7 @@ fn queue(
         .get(bobbin)
         .context("This Bobbin no longer exists.")?;
     ensure!(
-        !profile.paused && !profile.archived,
+        profile.can_dispatch(),
         "Resume the Bobbin before starting work."
     );
     let definition = assignment
@@ -530,16 +578,16 @@ pub fn finish(state: &mut State, chat: u64, status: Status, outcome: &str) {
 }
 
 pub fn recover(state: &mut State) {
+    let pending: BTreeSet<_> = state
+        .queue
+        .iter()
+        .filter_map(|task| task.origin)
+        .chain(state.requests.iter().map(|request| request.chat))
+        .collect();
     let interrupted: Vec<_> = state
         .bobbins
-        .runs
-        .iter()
-        .filter(|(chat, run)| {
-            run.status.active()
-                && run.held_task.is_none()
-                && !state.queue.iter().any(|task| task.origin == Some(**chat))
-                && !state.requests.iter().any(|pending| pending.chat == **chat)
-        })
+        .active_runs()
+        .filter(|(chat, run)| run.held_task.is_none() && !pending.contains(chat))
         .map(|(chat, _)| *chat)
         .collect();
     for chat in interrupted {
@@ -555,53 +603,20 @@ pub fn recover(state: &mut State) {
 pub fn next(state: &State) -> Option<i64> {
     state
         .bobbins
-        .profiles
-        .iter()
-        .filter(|(_, profile)| !profile.paused && !profile.archived)
-        .flat_map(|(id, profile)| {
-            profile.assignments.iter().filter_map(move |(key, a)| {
-                if state
-                    .bobbins
-                    .live(id)
-                    .any(|(_, run)| run.assignment.as_ref() == Some(key))
-                {
-                    return None;
-                }
-                a.schedule.as_ref().filter(|s| s.enabled).map(|s| s.next)
-            })
-        })
-        .min()
+        .next_schedule()
+        .map(|(_, _, schedule)| schedule.next)
 }
 
 pub fn due(state: &mut State, models: &[String], now: i64) -> Option<String> {
     if cfg!(target_os = "android") || state.held || !state.queue.is_empty() {
         return None;
     }
-    let (when, bobbin, assignment) = state
-        .bobbins
-        .profiles
-        .iter()
-        .filter(|(_, profile)| !profile.paused && !profile.archived)
-        .flat_map(|(id, profile)| {
-            profile.assignments.iter().filter_map(move |(key, a)| {
-                a.schedule
-                    .as_ref()
-                    .filter(|s| s.enabled && s.next <= now)
-                    .map(|s| (s.next, id, key))
-            })
-        })
-        .filter(|(_, id, key)| {
-            !state
-                .bobbins
-                .live(id)
-                .any(|(_, r)| r.assignment.as_ref() == Some(*key))
-        })
-        .min()
-        .map(|(when, id, key)| (when, id.clone(), key.clone()))?;
-    let schedule = state.bobbins.profiles[&bobbin].assignments[&assignment]
-        .schedule
-        .clone()
-        .unwrap();
+    let (bobbin, assignment, schedule) = state.bobbins.next_schedule()?;
+    let when = schedule.next;
+    if when > now {
+        return None;
+    }
+    let (bobbin, assignment) = (bobbin.to_owned(), assignment.to_owned());
     let missed = if schedule.interval > 0 {
         (now - when) / schedule.interval
     } else {
@@ -653,6 +668,38 @@ pub enum Access {
     Web,
 }
 
+impl Access {
+    fn file_path(self, call: &Call) -> Option<&str> {
+        let path = call.raw_path();
+        match self {
+            Self::Project => Some(path),
+            Self::Output if matches!(path, "outputs" | "outputs/") => Some("."),
+            Self::Output => Some(path.strip_prefix("outputs/").unwrap_or(path)),
+            Self::Web => None,
+        }
+    }
+}
+
+pub(crate) struct RunScope {
+    pub read_project: bool,
+    pub output_files: bool,
+    pub web: bool,
+}
+
+impl Registry {
+    pub(crate) fn scope(&self, run: &Run, block_web: bool) -> Option<RunScope> {
+        let current = &self.profiles.get(&run.bobbin)?.draft;
+        let granted = &run.configuration;
+        Some(RunScope {
+            read_project: granted.read_project
+                && current.read_project
+                && granted.project == current.project,
+            output_files: granted.output_files && current.output_files,
+            web: granted.web && current.web && !block_web,
+        })
+    }
+}
+
 pub fn visible_file(part: &str) -> bool {
     let name = part.to_ascii_lowercase();
     !name.starts_with('.')
@@ -663,19 +710,10 @@ pub fn visible_file(part: &str) -> bool {
         && !name.starts_with("id_rsa")
 }
 
-pub fn tool_path(call: &Call, access: Access) -> &str {
-    let path = call.raw_path();
-    if access != Access::Output {
-        return path;
-    }
-    if path == "outputs" || path == "outputs/" {
-        return ".";
-    }
-    path.strip_prefix("outputs/").unwrap_or(path)
-}
-
 pub fn validate_path(root: &Path, call: &Call, access: Access) -> Result<PathBuf> {
-    let path = tool_path(call, access);
+    let path = access
+        .file_path(call)
+        .context("This Bobbin tool does not open files.")?;
     if access == Access::Output {
         ensure!(
             path == "."
@@ -704,22 +742,18 @@ pub fn authorize(state: &State, chat: u64, call: &Call) -> Result<Option<Access>
         return Ok(None);
     };
     ensure!(run.status.active(), "This Bobbin run has ended.");
-    let profile = state
+    let scope = state
         .bobbins
-        .profiles
-        .get(&run.bobbin)
+        .scope(run, state.preferences.block_web)
         .context("This Bobbin was deleted.")?;
-    let both = |flag: fn(&Draft) -> bool| flag(&run.configuration) && flag(&profile.draft);
-    let project = both(|d| d.read_project) && run.configuration.project == profile.draft.project;
-    let output = both(|d| d.output_files);
     let access = match call {
         Call::List { .. } | Call::Read { .. } | Call::Search { .. }
-            if output
+            if scope.output_files
                 && (call.raw_path() == "outputs" || call.raw_path().starts_with("outputs/")) =>
         {
             Access::Output
         }
-        Call::List { .. } | Call::Read { .. } | Call::Search { .. } if project => {
+        Call::List { .. } | Call::Read { .. } | Call::Search { .. } if scope.read_project => {
             resolve_project(&run.configuration)?;
             Access::Project
         }
@@ -728,15 +762,11 @@ pub fn authorize(state: &State, chat: u64, call: &Call) -> Result<Option<Access>
         | Call::Search { .. }
         | Call::Create { .. }
         | Call::Patch { .. }
-            if output =>
+            if scope.output_files =>
         {
             Access::Output
         }
-        Call::WebSearch { .. } | Call::WebOpen { .. }
-            if both(|d| d.web) && !state.preferences.block_web =>
-        {
-            Access::Web
-        }
+        Call::WebSearch { .. } | Call::WebOpen { .. } if scope.web => Access::Web,
         _ => anyhow::bail!(
             "This action is outside the current Bobbin run’s approved access. Report the limitation in the result."
         ),
@@ -822,11 +852,7 @@ impl crate::engine::Engine {
                         || old.output_files != draft.output_files
                         || old.web != draft.web
                     {
-                        for a in saved.assignments.values_mut() {
-                            if let Some(schedule) = &mut a.schedule {
-                                schedule.enabled = false;
-                            }
-                        }
+                        saved.pause_schedules();
                     }
                     saved.draft = draft;
                     saved.revision += 1;
@@ -923,11 +949,7 @@ impl crate::engine::Engine {
                 let p = profile(s, &id)?;
                 p.archived = true;
                 p.paused = true;
-                for a in p.assignments.values_mut() {
-                    if let Some(schedule) = &mut a.schedule {
-                        schedule.enabled = false;
-                    }
-                }
+                p.pause_schedules();
                 let chats: Vec<_> = s.bobbins.live(&id).map(|(chat, _)| *chat).collect();
                 for chat in chats {
                     self.cancel_bobbin_run(chat)?;
@@ -1015,7 +1037,7 @@ impl crate::engine::Engine {
                 );
                 let p = profile(s, &id)?;
                 ensure!(
-                    !p.archived && !p.paused && p.revision == revision,
+                    p.can_dispatch() && p.revision == revision,
                     "Review the active Bobbin and its latest assignment."
                 );
                 ensure!(
