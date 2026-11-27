@@ -12,6 +12,8 @@ pub(super) struct Threads {
     pub(super) archived: bool,
     collapsed: BTreeSet<std::path::PathBuf>,
     projects_hidden: bool,
+    pub(super) importing: bool,
+    import_path: String,
 }
 
 enum Entry<R> {
@@ -217,6 +219,10 @@ impl Threads {
 
 
     pub fn observe(&mut self, v: &View) {
+        if v.notice.starts_with("Imported ") && v.notice.contains("conversation") {
+            self.importing = false;
+            self.import_path.clear();
+        }
         self.editors.retain(|id, e| {
             if v.state.thread_data(*id).is_none() {
                 return false;
@@ -449,7 +455,12 @@ impl Desktop {
                         Entry::ChatsHeader => {
                             ui.add_space(4.);
                             ui.horizontal(|ui| {
-                                left_label(ui, Text::new("Chats").size(14.).strong());
+                                left_label_with(ui, Text::new("Chats").size(14.).strong(), 2);
+                                if small(ui, Icon::Import, "Import conversations") {
+                                    self.threads.importing = true;
+                                    self.notice.clear();
+                                    self.drawer = false;
+                                }
                                 if small(ui, Icon::New, "New chat outside any project (Ctrl+N)") {
                                     new_chat = true;
                                 }
@@ -1013,6 +1024,46 @@ impl Desktop {
             } else {
                 self.threads.reader = None;
             }
+        }
+    }
+
+    pub(super) fn conversation_import_panel(&mut self, ui: &mut egui::Ui) {
+        let mut open = self.threads.importing;
+        #[cfg(not(target_os = "android"))]
+        let mut selected: Option<std::path::PathBuf> = None;
+        super::detail_panel(ui, "Import conversations", "Back", &mut open, |ui| {
+            ui.label("Choose a Codex session (.jsonl), Claude Code session (.jsonl), or Claude data export (.json or .zip).");
+            ui.weak("Imports prompts and replies as new chats. Attachments and tool activity are skipped.");
+            ui.add_space(8.);
+            #[cfg(windows)]
+            if ui.button("Choose file…").clicked() {
+                selected = rfd::FileDialog::new()
+                    .add_filter("Conversation files", &["json", "jsonl", "zip"])
+                    .pick_file();
+            }
+            #[cfg(target_os = "android")]
+            if ui.button("Choose file…").clicked() {
+                if let Err(error) = crate::android::choose_conversation_file() {
+                    self.notice = format!("Could not open the file picker: {error}");
+                }
+            }
+            #[cfg(not(any(windows, target_os = "android")))]
+            {
+                ui.label("File path");
+                ui.text_edit_singleline(&mut self.threads.import_path);
+                let path = self.threads.import_path.trim();
+                if ui.add_enabled(!path.is_empty(), egui::Button::new("Import")).clicked() {
+                    selected = Some(std::path::PathBuf::from(path));
+                }
+            }
+            if !self.notice.is_empty() {
+                ui.weak(&self.notice);
+            }
+        });
+        self.threads.importing = open;
+        #[cfg(not(target_os = "android"))]
+        if let Some(path) = selected {
+            self.send(format!("/import-chat {}", serde_json::json!(path)));
         }
     }
 }

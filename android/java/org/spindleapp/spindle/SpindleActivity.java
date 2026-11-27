@@ -43,6 +43,57 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     private native void nativeBack();
     static native void nativeBackgroundState(boolean visible, boolean active);
     private native void nativeOpenReply(long chat);
+    private static final int PICK_CONVERSATION = 7693;
+    private final AtomicReference<String> conversationFile = new AtomicReference<>();
+
+    public void chooseConversationFile() {
+        runOnUiThread(() -> {
+            android.content.Intent picker = new android.content.Intent(android.content.Intent.ACTION_OPEN_DOCUMENT)
+                    .addCategory(android.content.Intent.CATEGORY_OPENABLE)
+                    .setType("*/*");
+            try {
+                startActivityForResult(picker, PICK_CONVERSATION);
+            } catch (android.content.ActivityNotFoundException error) {
+                conversationFile.set("error:Android could not open the file picker.");
+            }
+        });
+    }
+
+    public String takeConversationFile() {
+        return conversationFile.getAndSet(null);
+    }
+
+    @Override
+    protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != PICK_CONVERSATION || result != RESULT_OK || data == null || data.getData() == null) return;
+        android.net.Uri uri = data.getData();
+        new Thread(() -> {
+            java.io.File copy = null;
+            try {
+                copy = java.io.File.createTempFile("chat-import-", ".tmp", getFilesDir());
+                try (java.io.InputStream input = getContentResolver().openInputStream(uri);
+                     java.io.OutputStream output = new java.io.FileOutputStream(copy)) {
+                    if (input == null) throw new IOException("Unreadable document");
+                    byte[] buffer = new byte[32 * 1024];
+                    long size = 0;
+                    int count;
+                    while ((count = input.read(buffer)) != -1) {
+                        size += count;
+                        if (size > 64L * 1024 * 1024) throw new IOException("Document exceeds 64 MB");
+                        output.write(buffer, 0, count);
+                    }
+                }
+                String previous = conversationFile.getAndSet("file:" + copy.getName());
+                if (previous != null && previous.startsWith("file:")) {
+                    new java.io.File(getFilesDir(), previous.substring(5)).delete();
+                }
+            } catch (IOException | SecurityException error) {
+                if (copy != null) copy.delete();
+                conversationFile.compareAndSet(null, "error:Could not read the selected file (maximum 64 MB).");
+            }
+        }, "spindle-conversation-import").start();
+    }
 
     @Override
     protected void onStart() {

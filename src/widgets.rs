@@ -267,6 +267,7 @@ pub enum Icon {
     Plan,
     Swarm,
     Attach,
+    Import,
     Chip,
     Arrow,
     Back,
@@ -318,6 +319,11 @@ pub fn draw_with(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32
         );
     };
     match icon {
+        Icon::Import => {
+            path(&[(5., 14.), (5., 20.), (19., 20.), (19., 14.)]);
+            path(&[(12., 4.), (12., 15.)]);
+            path(&[(8., 11.), (12., 15.), (16., 11.)]);
+        }
         Icon::Mic => {
             painter.rect_stroke(
                 Rect::from_min_max(pt(9., 3.), pt(15., 15.)),

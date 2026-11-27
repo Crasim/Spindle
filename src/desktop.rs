@@ -716,68 +716,39 @@ fn steps_header(
         .take(3)
         .map(|s| s.chars().take(40).collect())
         .collect();
-    if working {
-        // While the run is going, show what it's doing now.
-        let latest = notes
-            .last()
-            .map(|n| format!("{} · {}", n.summary, n.status))
-            .unwrap_or_default();
-        let mut clicked = false;
-        ui.horizontal(|ui| {
-            ui.add(egui::Spinner::new().size(13.).color(accent()));
-            disclosure(ui, open, accent());
-            clicked = ui
-                .add(
-                    egui::Label::new(
-                        Text::new(format!("Working · step {} · {}", notes.len(), latest))
-                            .size(13.)
-                            .color(accent()),
-                    )
-                    .sense(egui::Sense::click())
-                    .truncate(),
-                )
-                .on_hover_text(if open {
-                    "Hide the steps"
-                } else {
-                    "Show each step and its result"
-                })
-                .clicked();
-        });
-        return clicked;
-    }
-    let mut text = format!(
-        "{} {} step{} · {}{}",
-        "Worked ·",
-        notes.len(),
-        if notes.len() == 1 { "" } else { "s" },
-        shown.join(", "),
+    let color = if working { accent() } else { muted() };
+    let text = if working {
+        let latest = notes.last().map(|n| format!("{} · {}", n.summary, n.status)).unwrap_or_default();
+        format!("Working · step {} · {latest}", notes.len())
+    } else {
+        let mut text = format!("Worked · {} step{} · {}", notes.len(),
+            if notes.len() == 1 { "" } else { "s" }, shown.join(", "));
         if names.len() > 3 {
-            format!(", +{} more", names.len() - 3)
-        } else {
-            String::new()
+            text.push_str(&format!(", +{} more", names.len() - 3));
         }
-    );
-    if failed > 0 {
-        text.push_str(&format!(" · {failed} didn't work"));
+        if failed > 0 {
+            text.push_str(&format!(" · {failed} didn't work"));
+        }
+        text
+    };
+    let id = ui.make_persistent_id(("work-steps", state.chat_id, start));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.), egui::Sense::hover());
+    let mut row = ui.new_child(egui::UiBuilder::new()
+        .max_rect(rect.shrink2(egui::vec2(10., 0.)))
+        .layout(egui::Layout::left_to_right(egui::Align::Center)));
+    if working {
+        row.add(egui::Spinner::new().size(13.).color(color));
+    } else {
+        symbol(&mut row, Icon::Tool, color);
     }
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        symbol(ui, Icon::Tool, muted());
-        disclosure(ui, open, muted());
-        clicked = ui
-            .add(
-                egui::Label::new(Text::new(text).size(13.).color(muted()))
-                    .sense(egui::Sense::click())
-                    .truncate(),
-            )
-            .on_hover_text(if open {
-                "Hide the steps"
-            } else {
-                "Show each step and its result"
-            })
-            .clicked();
-    });
-    clicked
+    disclosure(&mut row, open, color);
+    row.add(egui::Label::new(Text::new(&text).size(13.).color(color)).truncate().selectable(false));
+    let action = ui.interact(rect, id, egui::Sense::click());
+    action.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &text));
+    action
+        .on_hover_text(if open { "Hide the steps" } else { "Show each step and its result" })
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
 }
 
 /// A small open/closed triangle, drawn (some fonts lack ▸ and ▾).
@@ -1097,6 +1068,13 @@ impl Desktop {
             let title = state.thread.label(&state.history);
             self.pending_copy = Some(crate::threads::transcript(&title, &state.history));
             self.notice = "Conversation copied as Markdown".into();
+            return Dispatch::Handled;
+        }
+        if text.trim() == "/import-chat" {
+            self.threads.importing = true;
+            self.notice.clear();
+            self.page = Page::Chat;
+            self.drawer = false;
             return Dispatch::Handled;
         }
         if text.trim() == "/new"
@@ -2032,11 +2010,9 @@ impl Desktop {
                             ui.add_space(12.);
                             let slot=ui.painter().add(egui::Shape::Noop);
                             group_box=Some((slot,ui.cursor().top(),start));
-                            ui.add_space(6.);
-                            ui.horizontal(|ui| {
-                                ui.add_space(10.);
-                                if steps_header(ui,state,groups,start,open,working) {toggle_steps=Some((state.chat_id,start));}
-                            });
+                            if steps_header(ui,state,groups,start,open,working) {
+                                toggle_steps=Some((state.chat_id,start));
+                            }
                             if !open {
                                 close_group_box(ui,slot,group_box.take().unwrap().1);
                                 self.transcript.heights[index]=Some(ui.cursor().top()-top);
@@ -2078,6 +2054,7 @@ impl Desktop {
                                 if let Some(n)=turn.output_budget {count.on_hover_text(format!("Output allowance for the final request: {n} tokens"));}
                             }
                         }
+                        if user { message_edit::versions(ui, state, index, &self.tx); }
                         if state.thread.edited_messages.contains(&index) { ui.weak("Edited"); }
                         if self.message_editors.toolbar(ui, state.chat_id, index, message) {
                             self.notice = "Message text copied".into();
@@ -2109,7 +2086,7 @@ impl Desktop {
                     let mut shown: Vec<String> = vec![];
                     let mut chosen: Vec<(String, reader::FileAction)> = vec![];
                     let clicked=ui.push_id((state.chat_id,index),|ui| {
-                        if self.message_editors.field(ui, state.chat_id, index, &message.content, (message.role=="user").then(|| state.history.len()-index-1), &self.tx) { None }
+                        if self.message_editors.field(ui, state.chat_id, index, &message.content, &self.tx, &mut self.android_ime) { None }
                         // A reply word for word the same as an earlier one: one line, not the text again.
                         else if !failed && self.transcript.repeated[index] {
                             ui.label(Text::new("Repeated an earlier reply word for word").size(13.).italics().color(muted()));
@@ -2264,7 +2241,11 @@ impl Desktop {
                         ui.push_id(("pending-result",t.id),|ui| notes::tool_result(ui,&t.text));
                     } else {
                         message_row(ui,true,|ui|{
-                            ui.label(Text::new(format!("You · #{}",t.id)).strong().color(muted()));
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(Text::new(format!("You · #{}",t.id)).strong().color(muted()));
+                                let current = &self.view.state;
+                                message_edit::versions(ui, current, current.history.len(), &self.tx);
+                            });
                             chat_text.message(self.view.state.history.len());
                             chat_text.label(ui, t.text.as_str(), false);
                         });
@@ -2638,6 +2619,7 @@ impl Desktop {
             || self.execution_panel.is_some()
             || self.tuning_editor.is_some()
             || self.threads.has_editor()
+            || self.threads.importing
             || self.projects.has_dialog()
             || self.sync_form.browse.is_some()
             || self.needs_projects_folder()
@@ -2699,7 +2681,9 @@ impl Desktop {
             self.scanner_panel(ui);
             return;
         }
-        if self.sync_form.browse.is_some() {
+        if self.threads.importing {
+            self.conversation_import_panel(ui);
+        } else if self.sync_form.browse.is_some() {
             self.folder_browser_panel(ui);
         } else if self.projects.has_dialog() {
             self.project_dialogs(ui);
@@ -2895,6 +2879,9 @@ impl eframe::App for Desktop {
                 .retain(|id, _| v.state.thread_data(*id).is_some());
             self.message_editors.observe(&v);
             self.threads.observe(&v);
+            if v.notice.starts_with("Imported ") && v.notice.contains("conversation") {
+                self.page = Page::Chat;
+            }
             self.drafts_by_thread
                 .retain(|id, _| v.state.thread_data(*id).is_some());
             self.view = v;
@@ -3005,6 +2992,12 @@ impl eframe::App for Desktop {
         // gesture bar or keyboard (see raw_input_hook).
         #[cfg(target_os = "android")]
         {
+            if let Some(chosen) = crate::android::take_conversation_file() {
+                match chosen {
+                    Ok(path) => self.send(format!("/import-chat-android {}", serde_json::json!(path))),
+                    Err(error) => self.notice = error,
+                }
+            }
             // Opened by scanning the pairing QR code: join straight away.
             if let Some(link) = crate::android::take_link() {
                 self.open_settings();
@@ -3475,6 +3468,37 @@ mod transcript_tests {
     }
 
     #[test]
+    fn work_card_opens_from_its_whole_row_at_phone_width() {
+        use egui::{Event, Modifiers, PointerButton};
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 0);
+        app.view.state.history = vec![
+            crate::ollama::Message::new("user", "Create a file."),
+            crate::ollama::Message::new("assistant", "Checking the folder."),
+        ];
+        app.view.state.thread.turns.insert(1, crate::state::Turn {
+            tool: Some(crate::state::ToolNote {
+                summary: "Tool call".into(),
+                status: "Not understood · invalid JSON".into(),
+            }),
+            ..Default::default()
+        });
+        draw_at_width(&ctx, &mut app, 0, vec![], 400.);
+        let folded = draw_at_width(&ctx, &mut app, 1, vec![], 400.);
+        let point = visible_text(&folded, "Worked · 1 step · Tool call · 1 didn't work").unwrap();
+        assert!(visible_text(&folded, "Checking the folder.").is_none());
+        let pos = egui::pos2(370., point.y);
+        for (frame, pressed) in [(2, true), (3, false)] {
+            draw_at_width(&ctx, &mut app, frame, vec![Event::PointerMoved(pos), Event::PointerButton {
+                pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+            }], 400.);
+        }
+        let expanded = draw_at_width(&ctx, &mut app, 4, vec![], 400.);
+        assert!(visible_text(&expanded, "Checking the folder.").is_some());
+        assert!(visible_text(&expanded, "Tool call · Not understood · invalid JSON").is_some());
+    }
+
+    #[test]
     fn model_changes_are_visible_in_the_phone_width_timeline() {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, mut app) = fixture(dir.path(), 0);
@@ -3650,6 +3674,7 @@ mod icon_tests {
 /// Slash commands offered while typing the first word of a message.
 const COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new chat"),
+    ("/import-chat", "Import Codex or Claude conversations"),
     ("/model", "Choose a different model"),
     ("/compact", "Summarize older messages now to free context"),
     ("/undo", "Remove your last message and edit it"),

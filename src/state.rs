@@ -236,6 +236,9 @@ pub struct State {
     pub chat_id: u64,
     pub model: String,
     pub history: Vec<Message>,
+    /// Last mode chosen with the Chat/Cowork control for new conversations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_chat_cowork: Option<bool>,
     pub queue: VecDeque<Task>,
     pub held: bool,
     pub serial: u64,
@@ -526,11 +529,20 @@ pub struct Conversation {
     pub plan: Option<(u64, String)>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PromptVersion {
+    pub group: String,
+    pub number: u64,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ThreadInfo {
     /// Existing saved threads used the work engine before the mode selector existed.
     #[serde(default = "legacy_cowork")]
     pub cowork: bool,
+    /// Prompt position → shared identifier for independently saved versions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub prompt_versions: BTreeMap<usize, PromptVersion>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub edited_messages: std::collections::BTreeSet<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -769,7 +781,9 @@ impl State {
         let next = if let Some(id) = id {
             self.chats.remove(&id).context("Unknown conversation")?
         } else {
-            Conversation::default()
+            let mut draft = Conversation::default();
+            draft.thread.cowork = self.new_chat_cowork.unwrap_or(self.thread.cowork);
+            draft
         };
         self.thread.model.clone_from(&self.model);
         let previous = Conversation {

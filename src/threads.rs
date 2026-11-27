@@ -17,13 +17,7 @@ use std::{
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Action {
-    EditMessage {
-        index: usize,
-        original: String,
-        replacement: String,
-    },
-    /// Replace a prompt and send it again: everything after it is discarded and the model
-    /// answers with only the conversation before it.
+    /// Send an edited prompt in a new version with the same preceding history.
     Resend {
         index: usize,
         original: String,
@@ -47,6 +41,19 @@ pub enum Action {
 }
 
 impl State {
+    pub(crate) fn prompt_versions(&self, group: &str) -> Vec<u64> {
+        let mut ids = self.chats.iter().map(|(id, c)| (*id, &c.thread))
+            .chain([(self.chat_id, &self.thread)])
+            .filter_map(|(id, thread)| {
+                let version = thread.prompt_versions.values().find(|v| v.group == group)?;
+                let synced = self.space.as_ref().and_then(|s| s.chats.get(&id));
+                Some((version.number, synced, id))
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.into_iter().map(|(_, _, id)| id).collect()
+    }
+
     /// Compaction policy a thread uses when it has no override of its own: the thread's
     /// model setting if one exists, otherwise the workspace default.
     /// The model a thread will use next.
@@ -184,40 +191,6 @@ impl Engine {
             "Thread no longer exists"
         );
         let result = match action {
-            Action::EditMessage {
-                index,
-                original,
-                replacement,
-            } => {
-                ensure!(!replacement.trim().is_empty(), "Enter some message text");
-                let (thread, history) = if id == self.state.chat_id {
-                    (&mut self.state.thread, &mut self.state.history)
-                } else {
-                    let chat = self
-                        .state
-                        .chats
-                        .get_mut(&id)
-                        .context("Thread no longer exists")?;
-                    (&mut chat.thread, &mut chat.history)
-                };
-                let message = history.get_mut(index).context("Message no longer exists")?;
-                ensure!(
-                    matches!(message.role.as_str(), "user" | "assistant"),
-                    "Select a completed chat message"
-                );
-                ensure!(
-                    message.content == original || message.content == replacement,
-                    "This message changed while you were editing it. Review the latest text."
-                );
-                if message.content != replacement {
-                    message.content = replacement;
-                    thread.edited_messages.insert(index);
-                    if thread.summary.as_ref().is_some_and(|s| index < s.covered) {
-                        thread.summary = None;
-                    }
-                }
-                format!("Message {} saved", index + 1)
-            }
             Action::Resend {
                 index,
                 original,
@@ -242,7 +215,7 @@ impl Engine {
                     .get(index)
                     .context("Message no longer exists")?;
                 ensure!(
-                    message.role == "user",
+                    message.role == "user" && !self.state.thread.tool_results.contains(&index),
                     "Only your own prompts can be sent again"
                 );
                 ensure!(
@@ -250,28 +223,63 @@ impl Engine {
                     "This message changed while you were editing it. Review the latest text."
                 );
                 let images = message.images.clone();
-                let dropped = self.state.history.len() - index;
-                self.state.history.truncate(index);
-                let thread = &mut self.state.thread;
-                // Forget everything recorded about the discarded messages.
+                let pastes = self.state.thread.turns.get(&(index + 1)).map(|t| t.pastes.clone()).unwrap_or_default();
+                let group = if let Some(existing) = self.state.thread.prompt_versions.get(&index) {
+                    existing.group.clone()
+                } else if let Some(gid) = self.state.space.as_ref().and_then(|s| s.chats.get(&id)) {
+                    format!("{gid}/{index}")
+                } else {
+                    crate::sync::core::hex(&crate::vault::random::<16>()?)
+                };
+                let mut version = self.state.conversation(id)?;
+                let title = version.thread.label(&version.history).to_owned();
+                make_branch(&mut version);
+                version.thread.title = title;
+                version.history.truncate(index);
+                version.goal.clear();
+                version.plan = None;
+                let thread = &mut version.thread;
                 thread.turns.retain(|k, _| *k < index);
                 thread.edited_messages.retain(|k| *k < index);
                 thread.tool_results.retain(|k| *k < index);
                 thread.compactions.retain(|k, _| *k <= index);
                 thread.plan_notes.retain(|k, _| *k <= index);
+                let number = self.state.prompt_versions(&group).iter()
+                    .filter_map(|id| self.state.thread_data(*id))
+                    .flat_map(|(thread, _)| thread.prompt_versions.values())
+                    .filter(|v| v.group == group)
+                    .map(|v| v.number)
+                    .max().unwrap_or(0).saturating_add(1);
+                thread.prompt_versions.insert(index, crate::state::PromptVersion { group: group.clone(), number });
+                thread.steps.clear();
+                thread.plan_changes.clear();
+                thread.goal_done = false;
+                thread.goal_runs = 0;
+                thread.produced.clear();
+                thread.sandbox_changes.clear();
+                thread.unchecked.clear();
                 if thread.summary.as_ref().is_some_and(|s| s.covered > index) {
                     thread.summary = None;
                 }
-                self.state.requests.retain(|r| r.chat != id);
-                self.enqueue(&replacement, self.state.thread.message_mode(), String::new())?;
-                if let Some(task) = self.state.queue.back_mut() {
-                    task.images = images;
+                self.state.serial += 1;
+                let branch = self.state.serial;
+                self.state.chats.insert(branch, version);
+                let attachment = self.state.attachment.take();
+                let pending = self.state.pending.take();
+                self.state.switch_chat(Some(branch))?;
+                if let Err(error) = self.enqueue(&replacement, self.state.thread.message_mode(), String::new()) {
+                    self.state.switch_chat(Some(id))?;
+                    self.state.chats.remove(&branch);
+                    self.state.attachment = attachment;
+                    self.state.pending = pending;
+                    return Err(error);
                 }
-                format!(
-                    "Sent the edited prompt; {} later message{} discarded",
-                    dropped - 1,
-                    if dropped == 2 { " was" } else { "s were" }
-                )
+                let task = self.state.queue.back_mut().unwrap();
+                task.images = images;
+                task.pastes = pastes;
+                self.state.chats.get_mut(&id).unwrap().thread.prompt_versions.entry(index)
+                    .or_insert(crate::state::PromptVersion { group, number: 0 });
+                "Edited prompt sent on a new branch".into()
             }
             Action::Edit {
                 title,
@@ -468,6 +476,7 @@ fn make_branch(c: &mut Conversation) {
     c.thread.started = true;
     c.thread.pinned = false;
     c.thread.archived = false;
+    c.thread.prompt_versions.clear();
     // A scratch branch may get a different artifact directory.
     for turn in c.thread.turns.values_mut() {
         turn.files.clear();

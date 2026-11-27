@@ -425,6 +425,7 @@ impl Engine {
                     "cowork" => true,
                     _ => bail!("Use /mode chat or /mode cowork"),
                 };
+                self.state.new_chat_cowork = Some(self.state.thread.cowork);
                 Ok(format!("{} mode for new messages", if self.state.thread.cowork { "Cowork" } else { "Chat" }))
             }
             "/sync-unlock" => {
@@ -651,7 +652,6 @@ impl Engine {
                 let previous = self.state.clone();
                 self.state.switch_chat(None)?;
                 self.state.thread.project = Some(project.path);
-                self.state.thread.cowork = true;
                 match self.enqueue(&prompt, Mode::Chat, String::new()) {
                     Ok(notice) => Ok(notice),
                     Err(err) => {
@@ -1290,6 +1290,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 let thread = &mut self.state.thread;
                 thread.turns.retain(|k, _| *k < last);
                 thread.edited_messages.retain(|k| *k < last);
+                thread.prompt_versions.retain(|k, _| *k < last);
                 if thread.summary.as_ref().is_some_and(|s| s.covered > last) {
                     thread.summary = None;
                 }
@@ -1437,6 +1438,41 @@ The user denied this action. Continue with other work or explain the denial. Do 
             "/new" => {
                 self.state.switch_chat(None)?;
                 Ok("New conversation".into())
+            }
+            "/import-chat" | "/import-chat-android" => {
+                let path = serde_json::from_str::<PathBuf>(args).unwrap_or_else(|_| PathBuf::from(args));
+                let temporary = cmd == "/import-chat-android";
+                #[cfg(not(target_os = "android"))]
+                if temporary {
+                    bail!("Use /import-chat with a conversation file");
+                }
+                #[cfg(target_os = "android")]
+                let path = if temporary {
+                        let name = path.to_str().context("Invalid Android import file")?;
+                        ensure!(
+                            name.strip_prefix("chat-import-").and_then(|s| s.strip_suffix(".tmp"))
+                                .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())),
+                            "Invalid Android import file"
+                        );
+                        crate::android::APP.get().and_then(|app| app.internal_data_path())
+                            .context("Android app storage is unavailable")?.join(name)
+                } else {
+                    path
+                };
+                let chats = crate::conversation_import::load(&path);
+                if temporary {
+                    let _ = std::fs::remove_file(&path);
+                }
+                let chats = chats?;
+                let count = chats.len();
+                let first = self.state.serial + 1;
+                for mut chat in chats {
+                    chat.thread.model.clone_from(&self.state.model);
+                    self.state.serial += 1;
+                    self.state.chats.insert(self.state.serial, chat);
+                }
+                self.state.switch_chat(Some(first))?;
+                Ok(format!("Imported {count} conversation{}", if count == 1 { "" } else { "s" }))
             }
             // From the CLI or MCP (control.rs): "/ext TAG {json}". Works on any chat without
             // switching the one open in the window; the reply comes back as the notice
@@ -3342,15 +3378,6 @@ fn route_resolved_call(
                 },
             );
             let repeated = strikes >= 2;
-            let _unused = state
-                .thread_data(chat)
-                .and_then(|(t, h)| {
-                    t.tool_results
-                        .contains(&h.len().saturating_sub(2))
-                        .then_some(h)
-                })
-                .and_then(|h| h.get(h.len().saturating_sub(2)))
-                .is_some_and(|m| m.content.starts_with("Tool call not understood"));
             if !repeated {
                 continue_with(
                     state,
@@ -6909,10 +6936,12 @@ mod tests {
         let notice = e
             .command(&resend(2, "Name a fruit", "Name a citrus fruit"), false)
             .unwrap();
-        assert!(
-            notice.contains("3 later messages were discarded"),
-            "{notice}"
-        );
+        assert!(notice.contains("Edited prompt sent on a new branch"), "{notice}");
+        let original = chat;
+        let version = e.state.chat_id;
+        assert_ne!(original, version);
+        let group = e.state.thread.prompt_versions[&2].group.clone();
+        assert_eq!(e.state.prompt_versions(&group), [original, version]);
         assert_eq!(e.state.history.len(), 2);
         assert!(e.state.thread.turns.keys().all(|k| *k < 2));
         let task = &e.state.queue[0];
@@ -6934,76 +6963,80 @@ mod tests {
                 .any(|m| m.contains("Apple") || m.contains("bird")),
             "{sent:?}"
         );
-        // While that reply is pending, another resend waits.
-        assert!(
-            e.command(&resend(0, "Name a colour", "Name a shade"), false)
-                .is_err()
-        );
+        finish(&mut e.state, "Orange.".into()).unwrap();
+        e.command(&format!("/open {original}"), false).unwrap();
+        assert_eq!(e.state.history.len(), 6);
+        assert_eq!(e.state.history[2].content, "Name a fruit");
+        assert_eq!(e.state.history[3].content, "Apple.");
+        assert_eq!(e.state.history[5].content, "Robin.");
+        e.command(&format!("/open {version}"), false).unwrap();
+        assert_eq!(e.state.history[2].content, "Name a citrus fruit");
+        assert_eq!(e.state.history[3].content, "Orange.");
     }
 
     #[test]
-    fn editing_history_refreshes_context_and_guards_concurrent_changes() {
+    fn failed_prompt_resend_keeps_the_original() {
         use crate::threads::Action;
         let tmp = tempfile::tempdir().unwrap();
         let mut e = fixture(tmp.path());
-        for (user, assistant) in [
-            ("First prompt", "Initial reply"),
-            ("Second prompt", "Later reply"),
-        ] {
-            e.command(user, false).unwrap();
-            finish(&mut e.state, assistant.into()).unwrap();
-        }
+        e.command("Original prompt", false).unwrap();
+        finish(&mut e.state, "Original reply".into()).unwrap();
         let id = e.state.chat_id;
-        e.state.thread.summary = Some(crate::compaction::Summary {
-            covered: 2,
-            text: "Initial reply".into(),
-        });
-        e.state
-            .thread
-            .turns
-            .get_mut(&1)
-            .unwrap()
-            .files
-            .push("example.csv".into());
-        let edit = |index, original: &str, replacement: &str| Action::EditMessage {
-            index,
-            original: original.into(),
-            replacement: replacement.into(),
+        let action = Action::Resend {
+            index: 0,
+            original: "Original prompt".into(),
+            replacement: "x".repeat(9001),
         };
-        e.state.switch_chat(None).unwrap();
-        e.thread_action(id, edit(1, "Initial reply", "**Revised**\nreply"))
-            .unwrap();
-        assert!(
-            e.thread_action(id, edit(1, "Initial reply", "stale"))
-                .is_err()
-        );
-        assert!(
-            e.thread_action(id, edit(1, "**Revised**\nreply", "  "))
-                .is_err()
-        );
-        e.thread_action(id, edit(0, "First prompt", "Revised prompt"))
-            .unwrap();
-        e.state.switch_chat(Some(id)).unwrap();
-        assert!(e.state.thread.summary.is_none());
-        assert_eq!(e.state.thread.turns[&1].files, ["example.csv"]);
-        assert_eq!(
-            e.state
-                .thread
-                .edited_messages
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            [0, 1]
-        );
-        assert!(e.state.queue.is_empty());
-        let mut messages = vec![
-            Message::new("system", "Test"),
-            Message::new("user", "Read history"),
-        ];
-        e.state.add_chat_history(id, 8192, &mut messages).unwrap();
-        assert_eq!(messages[1].content, "Revised prompt");
-        assert_eq!(messages[2].content, "**Revised**\nreply");
-        assert_eq!(messages[4].content, "Later reply");
+        assert!(e.thread_action(id, action).is_err());
+        assert_eq!(e.state.chat_id, id);
+        assert!(e.state.chats.is_empty());
+        assert!(e.state.thread.prompt_versions.is_empty());
+        assert_eq!(e.state.history[0].content, "Original prompt");
+        assert_eq!(e.state.history[1].content, "Original reply");
+    }
+
+    #[test]
+    fn new_chats_remember_the_explicit_workflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = fixture(tmp.path());
+        e.command("/mode cowork", false).unwrap();
+        e.command("Cowork thread", false).unwrap();
+        finish(&mut e.state, "Done".into()).unwrap();
+        let cowork = e.state.chat_id;
+        e.command("/new", false).unwrap();
+        assert!(e.state.thread.cowork);
+        e.command("/mode chat", false).unwrap();
+        e.command(&format!("/open {cowork}"), false).unwrap();
+        assert!(e.state.thread.cowork);
+        e.command("/new", false).unwrap();
+        assert!(!e.state.thread.cowork);
+    }
+
+    #[test]
+    fn cowork_executes_a_bare_tool_call_with_trailing_model_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = fixture(tmp.path());
+        e.command("/mode cowork", false).unwrap();
+        e.command("Create main.rs", false).unwrap();
+        finish_turn(
+            &mut e.state,
+            "I'll check the folder.\n{\"name\":\"list\",\"args\":{\"path\":\".\"}}\nI'll create the file next.".into(),
+            Default::default(),
+            Some(tmp.path()),
+        ).unwrap();
+        e.dispatch_ready(false).unwrap();
+        assert!(e.state.queue.front().is_some_and(|task| task.tool_result && task.text.starts_with("Tool result")));
+        finish_turn(
+            &mut e.state,
+            "{\"name\":\"create\",\"args\":{\"path\":\"main.rs\",\"content\":\"fn main() {}\\n\"}}\nNow I can test it.".into(),
+            Default::default(),
+            Some(tmp.path()),
+        ).unwrap();
+        e.dispatch_ready(false).unwrap();
+        let chat = e.state.chat_id;
+        let root = e.state.files_root(tmp.path(), chat);
+        let path = crate::artifacts::existing_file(&root, chat, "main.rs").unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "fn main() {}\n");
     }
 
     #[test]

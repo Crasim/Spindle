@@ -991,6 +991,15 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
             "dropped": dropped,
             "turns": turns,
         });
+        let mut versions: BTreeMap<String, crate::state::PromptVersion> = before.as_ref()
+            .and_then(|v| serde_json::from_value(v["prompt_versions"].clone()).ok())
+            .unwrap_or_default();
+        versions.extend(thread.prompt_versions.iter().filter_map(|(i, version)| {
+            Some((turns.get(*i)?.h.clone(), version.clone()))
+        }));
+        if !versions.is_empty() {
+            value["prompt_versions"] = json!(versions);
+        }
         let key = format!("chat:{gid}");
         let f = fingerprint(&value);
         if pending_merge.is_none() && sync.seen.get(&key) == Some(&f) {
@@ -1434,7 +1443,7 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
             "main": view.main.iter().map(|t| &t.turn.h).collect::<Vec<_>>(),
             "branches": view.branches.iter().map(|b| (b.new_from, b.turns.iter()
                 .map(|t| &t.turn.h).collect::<Vec<_>>())).collect::<Vec<_>>(),
-            "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"]],
+            "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"], &v["prompt_versions"]],
         }));
         if sync.seen.get(&format!("chatview:{gid}")) == Some(&fp) {
             continue;
@@ -1473,6 +1482,8 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         if messages_changed {
             let mut turns = BTreeMap::new();
             let mut results = BTreeSet::new();
+            let shared = history.iter().zip(&messages).take_while(|(a, b)| a == b).count();
+            thread.prompt_versions.retain(|i, _| *i < shared);
             for (i, t) in view.main.iter().enumerate() {
                 restore_turn(i, &t.turn.info, &mut turns, &mut results);
             }
@@ -1487,6 +1498,15 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         thread.archived = v["archived"].as_bool().unwrap_or(thread.archived);
         if let Some(s) = v["section"].as_str() {
             thread.section = s.to_owned();
+        }
+        if let Ok(mut versions) = serde_json::from_value::<BTreeMap<String, crate::state::PromptVersion>>(v["prompt_versions"].clone()) {
+            for (index, turn) in view.main.iter().enumerate().filter(|(_, t)| t.turn.role == "user") {
+                if let Some(version) = versions.remove(&turn.turn.h)
+                    && !version.group.is_empty() && version.group.len() <= 100
+                {
+                    thread.prompt_versions.insert(index, version);
+                }
+            }
         }
         if project.is_some() || v.get("project").is_some_and(Value::is_null) {
             thread.project = project;
@@ -1626,6 +1646,7 @@ pub fn make_main(state: &mut State, chat: u64, branch: &str) -> Result<()> {
         *history = b.messages.clone();
         thread.turns.retain(|i, _| *i < b.fork);
         thread.tool_results.retain(|i| *i < b.fork);
+        thread.prompt_versions.retain(|i, _| *i < b.fork);
         for (index, info) in &b.info {
             restore_turn(*index, info, &mut thread.turns, &mut thread.tool_results);
         }
@@ -1778,6 +1799,36 @@ mod tests {
     fn say(state: &mut State, role: &str, text: &str) {
         state.history.push(Message::new(role, text));
         state.thread.title = "Chat".into();
+    }
+
+    #[tokio::test]
+    async fn prompt_versions_sync_in_original_first_order() -> Result<()> {
+        let transports = [(0, Transport::Memory(Hub::default()))];
+        let mut desktop = Space::create("Desktop", None)?;
+        let mut phone = joined(&mut desktop, "Phone");
+        let mut sender = device_state(&desktop);
+        let mut receiver = device_state(&phone);
+        let group = "version-group";
+        // Lexical sync order imports chat 11 before chat 9.
+        for (id, number, prompt) in [(9, 0, "Original"), (11, 1, "Edited")] {
+            if sender.chat_id != 0 {
+                sender.switch_chat(None)?;
+            }
+            sender.chat_id = id;
+            sender.serial = id;
+            say(&mut sender, "user", prompt);
+            say(&mut sender, "assistant", "Reply");
+            sender.thread.prompt_versions.insert(0, crate::state::PromptVersion {
+                group: group.into(), number,
+            });
+        }
+        round(&mut sender, &mut desktop, &transports, true).await?;
+        round(&mut receiver, &mut phone, &transports, true).await?;
+        let ids = receiver.prompt_versions(group);
+        assert_eq!(ids.len(), 2);
+        assert_eq!(receiver.thread_data(ids[0]).unwrap().1[0].content, "Original");
+        assert_eq!(receiver.thread_data(ids[1]).unwrap().1[0].content, "Edited");
+        Ok(())
     }
 
     #[tokio::test]

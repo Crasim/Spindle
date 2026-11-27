@@ -21,7 +21,7 @@ impl MessageEditors {
 
     pub fn observe(&mut self, view: &View) {
         self.0.retain(|&thread, e| {
-            let Some(message) = view
+            let Some(_) = view
                 .state
                 .thread_data(thread)
                 .and_then(|(_, h)| h.get(e.index))
@@ -29,7 +29,10 @@ impl MessageEditors {
                 return false;
             };
             if e.pending {
-                if message.content == e.draft {
+                if thread != view.state.chat_id
+                    && view.notice
+                        == format!("Thread #{thread} · Edited prompt sent on a new branch")
+                {
                     return false;
                 }
                 if view
@@ -49,11 +52,12 @@ impl MessageEditors {
         if copying {
             ui.ctx().copy_text(msg.content.clone());
         }
-        if ui
-            .add_enabled_ui(!self.0.contains_key(&thread), |ui| {
-                small(ui, Icon::Rename, "Edit message")
-            })
-            .inner
+        if msg.role == "user"
+            && ui
+                .add_enabled_ui(!self.0.contains_key(&thread), |ui| {
+                    small(ui, Icon::Rename, "Edit message")
+                })
+                .inner
         {
             self.0.insert(
                 thread,
@@ -76,90 +80,45 @@ impl MessageEditors {
         thread: u64,
         index: usize,
         current: &str,
-        // For a prompt the user wrote: how many messages follow it. `None` for replies.
-        later: Option<usize>,
         tx: &UnboundedSender<String>,
+        ime: &mut android_ime::ComposerIme,
     ) -> bool {
         let Some(e) = self.0.get_mut(&thread).filter(|e| e.index == index) else {
             return false;
         };
         let id = ui.make_persistent_id(("edit-message", thread, index));
-        if std::mem::take(&mut e.focus) {
-            ui.memory_mut(|m| m.request_focus(id));
-        }
         egui::ScrollArea::vertical()
             .id_salt(id.with("scroll"))
             .max_height(260.)
             .show(ui, |ui| {
-                ui.add_enabled(
-                    !e.pending,
-                    egui::TextEdit::multiline(&mut e.draft)
-                        .id(id)
+                let response = ime.multiline(ui, id, &mut e.draft, |field| {
+                    field
+                        .interactive(!e.pending)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(3),
-                );
+                        .desired_rows(3)
+                });
+                if std::mem::take(&mut e.focus) {
+                    response.request_focus();
+                }
             });
-        if let Some(later) = later {
-            ui.weak(if later > 0 {
-                format!("Send answers it again with only the conversation before it, replacing the {later} message{} after it. Save edit keeps them.", if later == 1 { "" } else { "s" })
-            } else {
-                "Send answers it again. Save edit only changes the text.".to_owned()
-            });
-        } else {
-            ui.weak("Future prompts will use the edited text.");
-        }
+        ui.weak("Send creates a new branch from this message.");
         let conflict = current != e.original;
         if conflict {
-            ui.label("This message changed elsewhere. Copy your draft or reload the latest text.");
-            ui.horizontal(|ui| {
-                if ui.small_button("Copy my draft").clicked() {
-                    ui.ctx().copy_text(e.draft.clone());
-                }
-                if ui.small_button("Reload latest").clicked() {
-                    current.clone_into(&mut e.original);
-                    current.clone_into(&mut e.draft);
-                    e.error.clear();
-                }
-            });
+            ui.label(
+                "This message changed elsewhere. Cancel and reopen the editor to use the new text.",
+            );
         }
         let cancel = ui
             .horizontal(|ui| {
-                let changed = !e.draft.trim().is_empty() && e.draft != e.original;
-                if later.is_some()
-                    && ui
-                        .add_enabled(
-                            !e.draft.trim().is_empty() && !conflict && !e.pending,
-                            egui::Button::new(Text::new("Send").strong()),
-                        )
-                        .on_hover_text(
-                            "Send the edited prompt with only the conversation before it",
-                        )
-                        .clicked()
-                {
-                    let action = Action::Resend {
-                        index,
-                        original: e.original.clone(),
-                        replacement: e.draft.clone(),
-                    };
-                    e.pending = tx
-                        .send(format!(
-                            "/thread {thread} {}",
-                            serde_json::to_string(&action).expect("Message edit serializes")
-                        ))
-                        .is_ok();
-                    if !e.pending {
-                        e.error =
-                            "Session engine is unavailable. Copy your draft before closing.".into();
-                    }
-                }
                 if ui
                     .add_enabled(
-                        changed && !conflict && !e.pending,
-                        egui::Button::new("Save edit"),
+                        !e.draft.trim().is_empty() && !conflict && !e.pending,
+                        egui::Button::new(Text::new("Send").strong()),
                     )
+                    .on_hover_text("Send the edited prompt with only the conversation before it")
                     .clicked()
                 {
-                    let action = Action::EditMessage {
+                    let action = Action::Resend {
                         index,
                         original: e.original.clone(),
                         replacement: e.draft.clone(),
@@ -187,4 +146,42 @@ impl MessageEditors {
         }
         true
     }
+}
+
+pub(super) fn versions(
+    ui: &mut egui::Ui,
+    state: &crate::state::State,
+    index: usize,
+    tx: &UnboundedSender<String>,
+) {
+    let Some(version) = state.thread.prompt_versions.get(&index) else {
+        return;
+    };
+    let ids = state.prompt_versions(&version.group);
+    let Some(current) = ids.iter().position(|id| *id == state.chat_id) else {
+        return;
+    };
+    if ids.len() < 2 {
+        return;
+    }
+    ui.horizontal(|ui| {
+        let previous = current.checked_sub(1).and_then(|i| ids.get(i));
+        let next = ids.get(current + 1);
+        for (label, hint, target) in [
+            ("‹", "Previous version", previous),
+            ("›", "Next version", next),
+        ] {
+            if label == "›" {
+                ui.weak(format!("{}/{}", current + 1, ids.len()));
+            }
+            if ui
+                .add_enabled(target.is_some(), egui::Button::new(label).small())
+                .on_hover_text(hint)
+                .clicked()
+                && let Some(id) = target
+            {
+                let _ = tx.send(format!("/open {id}"));
+            }
+        }
+    });
 }

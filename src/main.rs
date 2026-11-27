@@ -21,6 +21,7 @@ mod cli;
 mod claude_console;
 mod comfy;
 mod connectors;
+mod conversation_import;
 mod compaction;
 mod control;
 mod desktop;
@@ -89,6 +90,25 @@ mod android {
 
     pub fn take_link() -> Option<String> {
         LINK.lock().unwrap().take()
+    }
+
+    pub fn choose_conversation_file() -> jni::errors::Result<()> {
+        java(|env, activity| env.call_method(activity, "chooseConversationFile", "()V", &[]).map(|_| ()))
+    }
+
+    pub fn take_conversation_file() -> Option<Result<String, String>> {
+        let value = java(|env, activity| {
+            let value = env.call_method(activity, "takeConversationFile", "()Ljava/lang/String;", &[])?.l()?;
+            if value.is_null() {
+                return Ok(String::new());
+            }
+            Ok(String::from(env.get_string(&value.into())?))
+        }).ok()?;
+        if let Some(name) = value.strip_prefix("file:") {
+            Some(Ok(name.to_owned()))
+        } else {
+            value.strip_prefix("error:").map(|message| Err(message.to_owned()))
+        }
     }
 
     static BACK_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

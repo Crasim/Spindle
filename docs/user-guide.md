@@ -15,6 +15,12 @@
 
 Sending the first message adds **New chat** to the sidebar immediately. The first completed reply supplies its title. A name you choose while the model is working takes precedence.
 
+New conversations use the last **Chat** or **Cowork** mode you selected. Click a work card to expand its steps and check their results.
+
+Use the pencil beside one of your prompts to edit it. **Send** starts a new branch with the earlier context and keeps the original conversation. Use the arrows beside the prompt to switch between versions.
+
+Use **Import conversations** beside **Chats**, or `/import-chat`. Choose a Codex session JSONL from `.codex/sessions`, a Claude Code session JSONL from `.claude/projects`, or a Claude account export ZIP or its `conversations.json`. Spindle imports the message text into new chats.
+
 Click **…** beside any thread, or right-click it, to expand its options in the sidebar. You can rename, pin, mark unread, move to a project, branch, read, copy, archive, or delete a conversation. **Conversation settings** opens a panel for its title, next model, section, project, and compaction. **Back** or **Close** returns you to what you were viewing. **Branch** starts an independent conversation with the same history. Archived threads are available through **Archive** in the sidebar. Moving a chat changes where its new files are saved. Files already generated stay where they are.
 
 **Delete conversation** asks for confirmation, removes the thread and its queued work and schedules, and propagates the deletion when project sync runs. Earlier encrypted revision files, independent branches, generated files and backups have their own retention. Re-export the phone companion from Projects to use the updated thread list.

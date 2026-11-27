@@ -354,7 +354,15 @@ pub fn extract(answer: &str) -> (String, Option<std::result::Result<Envelope, St
         let body = answer[range.clone()].trim();
         let body = &body[body.find('{').unwrap_or(0)..];
         let body = body.trim_end().trim_end_matches('`').trim();
-        found = Some(parse(body));
+        let mut stream = serde_json::Deserializer::from_str(body).into_iter::<serde_json::Value>();
+        // Some models emit a complete bare call and then keep writing. Use only
+        // that call and let the model see its result before requesting another.
+        found = Some(match stream.next() {
+            Some(Ok(value)) if value.is_object() && attempted(body) => {
+                parse(&body[..stream.byte_offset()])
+            }
+            _ => parse(body),
+        });
     }
     if count > 1 {
         found = Some(Err(
@@ -1200,7 +1208,7 @@ fn parse(body: &str) -> std::result::Result<Envelope, String> {
     let sent: String = body.chars().take(300).collect();
     let invalid = |e: String| {
         format!(
-            "The tool call isn't valid: {e}. Tools are list, read, search, patch, create, test, python, browser, apply, setup and install; for example {{\"name\":\"python\",\"args\":{{\"file\":\"make.py\"}}}}. Send one corrected tool call. You sent: {sent}"
+            "The tool call isn't valid: {e}. Send one JSON object in a spindle-tool block, then wait for the result. To inspect the workspace use {{\"name\":\"list\",\"args\":{{\"path\":\".\"}}}}; to create a file use {{\"name\":\"create\",\"args\":{{\"path\":\"main.rs\",\"content\":\"file text\"}}}}. You sent: {sent}"
         )
     };
     let mut value: serde_json::Value =
