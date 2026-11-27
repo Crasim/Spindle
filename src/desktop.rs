@@ -17,6 +17,7 @@ mod message_edit;
 mod notes;
 mod notebook;
 mod chat_search;
+mod bobbins;
 mod paste;
 mod submission;
 mod android_ime;
@@ -217,6 +218,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Page {
+    Bobbins,
     Projects,
     Project,
     Chat,
@@ -314,6 +316,7 @@ pub struct Desktop {
     drafts_by_thread: std::collections::BTreeMap<u64, String>,
     generating: Option<(u64, std::time::Instant, usize)>,
     tasks: tasks::TaskScreen,
+    bobbins: bobbins::Screen,
     reader: reader::ReaderPane,
     images: images::ImagesForm,
     voice: audio::Voice,
@@ -1027,6 +1030,7 @@ impl Desktop {
             drafts_by_thread: Default::default(),
             generating: None,
             tasks: Default::default(),
+            bobbins: Default::default(),
             reader: Default::default(),
             transcript: Default::default(),
             build_files: None,
@@ -1284,6 +1288,11 @@ impl Desktop {
             self.page = Page::Automations;
             return Dispatch::Handled;
         }
+        if text.trim() == "/bobbins" {
+            self.page = Page::Bobbins;
+            self.drawer = false;
+            return Dispatch::Handled;
+        }
         if text.trim() == "/read" {
             self.reader.open = true;
             return Dispatch::Handled;
@@ -1428,6 +1437,7 @@ impl Desktop {
                     ),
                     (Page::Skills, Icon::Skill, "Skill library".into()),
                     (Page::Notes, Icon::Memory, "Notes".into()),
+                    (Page::Bobbins, Icon::Swarm, "Bobbins".into()),
                     (Page::Automations, Icon::Clock, "Automations".into()),
                 ] {
                     if control(
@@ -1521,6 +1531,7 @@ impl Desktop {
                         Page::Automations => "Automations",
                         Page::Skills => "Skill library",
                         Page::Notes => "Notes",
+                        Page::Bobbins => "Bobbins",
                         Page::ChatSearch => "Search chats",
                         Page::Settings => "Settings",
                         Page::Projects => "Projects",
@@ -3286,7 +3297,11 @@ impl eframe::App for Desktop {
             self.send(cmd);
         }
         if self.page == Page::Chat && !detail {
-            self.composer(ctx);
+            if self.view.state.bobbins.runs.contains_key(&self.view.state.chat_id) {
+                self.bobbin_run_footer(ctx);
+            } else {
+                self.composer(ctx);
+            }
         }
         egui::CentralPanel::default()
             .frame(
@@ -3302,6 +3317,7 @@ impl eframe::App for Desktop {
                 match self.page {
                     Page::Chat => self.conversation(ui),
                     Page::Notes => self.notes_page(ui),
+                    Page::Bobbins => egui::ScrollArea::vertical().id_salt("bobbins").show(ui, |ui| self.bobbins_page(ui)).inner,
                     Page::ChatSearch => self.search_chats(ui),
                     Page::Queue => {
                         egui::ScrollArea::vertical().show(ui, |ui| self.queue(ui));
@@ -3908,6 +3924,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/defer ", "Pause this task until a date and time"),
     ("/usage", "Usage and limits"),
     ("/automation", "Schedules and automations"),
+    ("/bobbins", "Open Bobbins"),
     ("/threads", "List conversations"),
     ("/status", "Model, queue and work status"),
     ("/help", "Every command and its options"),

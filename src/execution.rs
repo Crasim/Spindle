@@ -80,6 +80,7 @@ pub struct After {
 
 #[derive(Default)]
 pub struct Jobs {
+    pub catalog_chat: Option<u64>,
     /// Started work the engine loop hasn't picked up yet.
     pub started: Option<tokio::task::JoinHandle<JobDone>>,
     /// What is running, for the window.
@@ -603,6 +604,7 @@ impl Engine {
     }
 
     pub(crate) fn start_catalog(&mut self, pending: Pending) {
+        self.jobs.catalog_chat = Some(pending.chat);
         let local = matches!(&pending.call.call, Call::FindTools { source, .. } if source == "local")
             .then(|| crate::tool_catalog::inventory(&self.state));
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
@@ -612,6 +614,7 @@ impl Engine {
         let image_settings = matches!(pending.call.call, Call::ImageModels {}).then(|| crate::comfy::Settings::from(&self.state.preferences));
         #[cfg(windows)]
         if !block_web && self.jobs.web_region_ui && self.state.chat_id == pending.chat
+            && !self.state.bobbins.runs.contains_key(&pending.chat)
             && crate::engine::builtin_browser_request(&self.state, pending.chat)
             && let Call::WebOpen { url, start: 0, diagnostics: false } = &pending.call.call
             && let Ok(address) = crate::browser::public_page(url)
@@ -787,6 +790,7 @@ impl Engine {
     /// Handle finished background work. Returns a notice for the window.
     pub(crate) fn finish_job(&mut self, done: JobDone) -> String {
         self.jobs.running = None;
+        self.jobs.catalog_chat = None;
         match done {
             JobDone::Catalog{pending:p,result}=>{
                 #[cfg(windows)]
@@ -798,6 +802,7 @@ impl Engine {
                     self.jobs.panel_read = None;
                 }
                 if self.jobs.cancel.load(Ordering::Relaxed) {
+                    crate::bobbins::finish(&mut self.state, p.chat, crate::bobbins::Status::Cancelled, "Stopped by you during the tool action.");
                     if let Call::WebOpen { url, start: 0, .. } = &p.call.call
                         && let Ok(address) = crate::browser::public_page(url)
                     {
@@ -834,10 +839,11 @@ impl Engine {
                     self.jobs.browser_retries.retain(|old| old.chat != p.chat
                         || (Some(old.message) == message && old.address != address.as_str()));
                     let policy = crate::browser_link::Policy::from_preferences(&self.state.preferences);
-                    let regular_browser = retry && crate::engine::can_request_browser(&self.state)
+                    let bobbin = self.state.bobbins.runs.contains_key(&p.chat);
+                    let regular_browser = !bobbin && retry && crate::engine::can_request_browser(&self.state)
                         && (policy.mode != crate::browser_link::Mode::Blocklist
                             || crate::browser::public_page(url).is_ok_and(|page| policy.rule_for(&page).is_some()));
-                    let visible_browser = restricted && !self.state.preferences.block_web && cfg!(windows) && !panel_read;
+                    let visible_browser = !bobbin && restricted && !self.state.preferences.block_web && cfg!(windows) && !panel_read;
                     if (regular_browser || visible_browser) && let Some(index) = message {
                         offered = regular_browser;
                         self.jobs.browser_retries.push(BrowserRetry { chat: p.chat, message: index,

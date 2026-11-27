@@ -207,7 +207,7 @@ impl Call {
         }
     }
 
-    fn raw_path(&self) -> &str {
+    pub(crate) fn raw_path(&self) -> &str {
         match self {
             Call::List { path } | Call::Search { path, .. } | Call::Test { path } => {
                 path.as_deref().unwrap_or(".")
@@ -1378,6 +1378,10 @@ pub fn resolve(root: &Path, raw: &str) -> Result<(PathBuf, bool)> {
 /// The risk of a call and the path it acts on.
 /// `sandboxed` means `root` is the conversation's sandbox copy rather than the project.
 pub fn classify(root: &Path, call: &Call, sandboxed: bool) -> Result<(Risk, PathBuf)> {
+    classify_path(root, call, sandboxed, call.raw_path())
+}
+
+pub(crate) fn classify_path(root: &Path, call: &Call, sandboxed: bool, raw_path: &str) -> Result<(Risk, PathBuf)> {
     if call.native() {
         ensure!(sandboxed, "Native execution needs a passing sandbox check");
         crate::native::validate(call)?;
@@ -1385,7 +1389,7 @@ pub fn classify(root: &Path, call: &Call, sandboxed: bool) -> Result<(Risk, Path
         ensure!(inside, "Native build inputs must be inside the conversation's folder");
         return Ok((Risk::Native, path));
     }
-    let (path, inside) = resolve(root, call.raw_path())?;
+    let (path, inside) = resolve(root, raw_path)?;
     if matches!(call, Call::PreviewHtml { .. }) {
         ensure!(inside && path.is_file(), "Choose an HTML file inside this working folder");
         ensure!(crate::html_preview::is_html(&path), "Choose a .html or .htm file");
@@ -1529,6 +1533,10 @@ fn cap(mut text: String) -> String {
 
 /// Run a call that the broker has allowed. `path` is the resolved target from `classify`.
 pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<String> {
+    run_scoped(root, call, path, replace_file, |_| true)
+}
+
+pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bool, visible: fn(&str) -> bool) -> Result<String> {
     let out = match call {
         Call::List { .. } => {
             ensure!(path.is_dir(), "{} is not a folder", rel(root, path));
@@ -1536,6 +1544,7 @@ pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<
                 .filter_map(|e| e.ok())
                 .filter_map(|e| {
                     let name = e.file_name().to_string_lossy().into_owned();
+                    if !visible(&name) { return None; }
                     let meta = e.metadata().ok()?;
                     Some((meta.is_dir(), name, meta.len()))
                 })
@@ -1598,6 +1607,7 @@ pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<
                 for entry in read.filter_map(|e| e.ok()) {
                     let p = entry.path();
                     let name = entry.file_name().to_string_lossy().into_owned();
+                    if !visible(&name) { continue; }
                     let Ok(kind) = entry.file_type() else {
                         continue;
                     };

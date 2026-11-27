@@ -5,6 +5,7 @@ mod android_apk;
 #[cfg(target_os = "android")]
 mod android_background;
 mod automation;
+mod bobbins;
 mod browser;
 mod location;
 mod browser_link;

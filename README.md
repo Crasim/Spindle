@@ -5,6 +5,7 @@ Spindle is a local-first workspace for AI chats and projects. Run models through
 - **Chat and Cowork.** Talk to a model, or give it a task that uses project files and tools. Review permission requests in the chat.
 - **Model choice.** Pick a model for each conversation, compare responses from several models, and set fallbacks for long-running work.
 - **Projects and sync.** Organize related chats and files, schedule work, and resume a project on a paired device.
+- **Bobbins.** Give named workers their own models and instructions, run assignments, and review results in dedicated chats.
 - **Computer use.** Preview generated files, test pages in an isolated browser, or connect your regular Edge or Chrome profile through Browser Link.
 
 ## Get started
@@ -19,6 +20,7 @@ Spindle is a local-first workspace for AI chats and projects. Run models through
 | --- | --- |
 | Models, chats, files, and automations | [Using Spindle](docs/user-guide.md) |
 | Project folders, device pairing, and encrypted sync | [Projects and sync](docs/projects-and-sync.md) |
+| Named workers, assignments, and run history | [Bobbins](docs/bobbins.md) |
 | Browser Link, permissions, and sandboxed builds | [Computer use](docs/computer-use.md) |
 | Building, updating, and installing on Android | [Build and install](docs/build-and-install.md) |
 | Terminal commands and agent integrations | [CLI and MCP](docs/cli-and-mcp.md) |

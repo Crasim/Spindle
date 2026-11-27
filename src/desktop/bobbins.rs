@@ -1,0 +1,1157 @@
+use super::*;
+use crate::bobbins::{AssignmentDraft, Draft, Picture, Profile, home};
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeMap,
+    sync::atomic::{AtomicBool, Ordering},
+};
+
+const PALETTE: [(Color, &str); 6] = [
+    (Color::from_rgb(86, 186, 146), "Jade"),
+    (Color::from_rgb(104, 151, 226), "Blue"),
+    (Color::from_rgb(171, 135, 222), "Violet"),
+    (Color::from_rgb(233, 171, 112), "Amber"),
+    (Color::from_rgb(213, 123, 151), "Rose"),
+    (Color::from_rgb(118, 173, 179), "Teal"),
+];
+
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Tab {
+    #[default]
+    Overview,
+    Assignments,
+    Runs,
+    Settings,
+    Appearance,
+}
+
+#[derive(Default)]
+pub(super) struct Screen {
+    selected: Option<String>,
+    tab: Tab,
+    search: String,
+    filter: String,
+    project_filter: Option<PathBuf>,
+    projects: Option<Vec<crate::projects::Project>>,
+    editor: Option<Editor>,
+    message: String,
+    project_message: Option<String>,
+    sent_chat: Option<u64>,
+    assignment: Option<(Option<String>, AssignmentDraft)>,
+    schedule: Option<ScheduleForm>,
+    steering: Option<(u64, String)>,
+    deleting: Option<String>,
+    art: BTreeMap<String, Option<egui::TextureHandle>>,
+}
+
+struct Editor {
+    key: Option<String>,
+    revision: Option<u64>,
+    draft: Draft,
+    appearance: bool,
+    file: String,
+    prompt: String,
+    artwork: Vec<String>,
+    job: Option<AssetJob>,
+    feedback: String,
+    saving: Option<std::time::Instant>,
+}
+
+struct AssetJob {
+    receive: Receiver<anyhow::Result<Vec<String>>>,
+    cancel: Arc<AtomicBool>,
+}
+impl Drop for AssetJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+struct ScheduleForm {
+    key: String,
+    when: String,
+    interval: i64,
+    skip_missed: bool,
+}
+
+fn send(app: &mut Desktop, command: Value) {
+    app.send(format!("/bobbin {command}"));
+}
+
+fn label(app: &Desktop, model: &str) -> String {
+    if model.is_empty() {
+        return "Select a model".into();
+    }
+    let (provider, tag) = route(model);
+    format!("{} / {tag}", app.provider_name(provider))
+}
+
+fn field(app: &mut Desktop, ui: &mut egui::Ui, label: &str, value: &mut String, rows: usize) {
+    ui.label(label);
+    app.android_ime
+        .multiline(ui, ("bobbin", label), value, |edit| {
+            edit.desired_width(f32::INFINITY)
+                .desired_rows(rows)
+                .char_limit(if rows == 1 { 240 } else { 6_000 })
+        });
+    ui.add_space(6.);
+}
+
+fn tile(ui: &mut egui::Ui, body: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(raised())
+        .stroke(egui::Stroke::new(1_f32, line()))
+        .corner_radius(12.)
+        .inner_margin(14)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            body(ui);
+        });
+    ui.add_space(8.);
+}
+
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .take(2)
+        .filter_map(|word| word.chars().next())
+        .flat_map(char::to_uppercase)
+        .take(3)
+        .collect()
+}
+
+fn picture(
+    ui: &mut egui::Ui,
+    draft: &Draft,
+    assets: &mut BTreeMap<String, Option<egui::TextureHandle>>,
+    length: f32,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(length, length), egui::Sense::hover());
+    let paint = ui.painter_at(rect);
+    let color = PALETTE.get(draft.color).unwrap_or(&PALETTE[0]).0;
+    paint.rect_filled(rect, length * 0.24, color.gamma_multiply(0.23));
+    if let Some(key) = &draft.avatar {
+        if assets.len() >= 64 && !assets.contains_key(key) {
+            assets.clear();
+        }
+        let image = assets.entry(key.clone()).or_insert_with(|| {
+            let file = crate::bobbins::avatar_path(key).ok()?;
+            let bytes = std::fs::read(file).ok()?;
+            if bytes.len() > 512 * 1024 {
+                return None;
+            }
+            let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            if image.dimensions() != (256, 256) {
+                return None;
+            }
+            Some(ui.ctx().load_texture(
+                format!("Bobbin {key}"),
+                egui::ColorImage::from_rgba_unmultiplied([256, 256], image.as_raw()),
+                egui::TextureOptions::LINEAR,
+            ))
+        });
+        if let Some(image) = image {
+            paint.image(
+                image.id(),
+                rect.shrink(2.),
+                egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.)),
+                Color::WHITE,
+            );
+            return;
+        }
+    }
+    let c = rect.center();
+    let p = |x: f32, y: f32| c + egui::vec2(x, y) * length;
+    let stroke = egui::Stroke::new(length * 0.05, color);
+    match draft.picture {
+        Picture::Initials => {
+            paint.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                initials(&draft.name),
+                egui::FontId::proportional(length * 0.36),
+                color,
+            );
+        }
+        Picture::Spool => {
+            for y in [-0.26, 0.26] {
+                paint.line_segment([p(-0.25, y), p(0.25, y)], stroke);
+            }
+            for x in [-0.18, 0.18] {
+                paint.line_segment([p(x, -0.26), p(x, 0.26)], stroke);
+            }
+            for y in [-0.10, 0., 0.10] {
+                paint.line_segment([p(-0.18, y + 0.05), p(0.18, y - 0.05)], stroke);
+            }
+        }
+        Picture::Shuttle => {
+            paint.add(egui::Shape::closed_line(
+                vec![p(-0.30, 0.), p(0., -0.19), p(0.30, 0.), p(0., 0.19)],
+                stroke,
+            ));
+            paint.circle_filled(c, length * 0.076, color);
+        }
+        Picture::Loop => {
+            paint.circle_stroke(p(-0.13, -0.08), length * 0.18, stroke);
+            paint.circle_stroke(p(0.13, 0.08), length * 0.18, stroke);
+        }
+    }
+}
+
+impl Desktop {
+    pub(super) fn bobbins_page(&mut self, ui: &mut egui::Ui) {
+        let mut screen = std::mem::take(&mut self.bobbins);
+        screen.render(self, ui);
+        self.bobbins = screen;
+    }
+
+    pub(super) fn bobbin_run_footer(&mut self, ctx: &egui::Context) {
+        let chat = self.view.state.chat_id;
+        let run = self.view.state.bobbins.runs[&chat].clone();
+        egui::TopBottomPanel::bottom("bobbin-run")
+            .frame(egui::Frame::new().fill(panel()).inner_margin(10))
+            .show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if control(ui, Icon::Back, "Bobbin runs", egui::vec2(126., 30.), false)
+                        .clicked()
+                    {
+                        self.bobbins.selected = self
+                            .view
+                            .state
+                            .bobbins
+                            .profiles
+                            .contains_key(&run.bobbin)
+                            .then(|| run.bobbin.clone());
+                        self.bobbins.tab = Tab::Runs;
+                        self.page = Page::Bobbins;
+                    }
+                    ui.strong(&run.configuration.name);
+                    ui.weak(run.status.label());
+                    if run.status.active() && ui.button("Cancel run").clicked() {
+                        send(self, json!({"action":"cancel","chat":chat}));
+                    }
+                });
+            });
+    }
+}
+
+impl Screen {
+    pub(super) fn for_project(&mut self, path: PathBuf, text: String) {
+        self.selected = None;
+        self.editor = None;
+        self.project_filter = Some(path);
+        self.project_message = Some(text);
+        self.filter.clear();
+        self.search.clear();
+    }
+
+    fn render(&mut self, app: &mut Desktop, ui: &mut egui::Ui) {
+        ui.set_max_width(ui.available_width().min(980.));
+        if self.projects.is_none() {
+            self.refresh_projects(&app.root);
+        }
+        if let Some(mut editor) = self.editor.take() {
+            if editor.render(self, app, ui) {
+                self.editor = Some(editor);
+            }
+        } else if let Some((id, profile)) = self.selected.clone().and_then(|id| {
+            app.view
+                .state
+                .bobbins
+                .profiles
+                .get(&id)
+                .cloned()
+                .map(|profile| (id, profile))
+        }) {
+            self.detail(app, ui, &id, &profile);
+        } else {
+            self.roster(app, ui);
+        }
+        if app.notice.starts_with("Error:") || app.notice.starts_with("Bobbin schedule paused:") {
+            ui.add_space(6.);
+            ui.colored_label(accent(), &app.notice);
+        }
+    }
+
+    fn refresh_projects(&mut self, root: &std::path::Path) {
+        let current = crate::projects::existing(root).ok().flatten();
+        self.projects = Some(crate::projects::library(current.as_ref()).unwrap_or_default());
+    }
+
+    fn select(&mut self, id: &str, tab: Tab) {
+        if self.selected.as_deref() != Some(id) {
+            self.message.clear();
+            self.sent_chat = None;
+            self.assignment = None;
+            self.schedule = None;
+            self.steering = None;
+            self.deleting = None;
+        }
+        self.selected = Some(id.into());
+        self.tab = tab;
+        if tab == Tab::Overview
+            && let Some(message) = self.project_message.take()
+        {
+            self.message = message;
+        }
+    }
+
+    fn roster(&mut self, app: &mut Desktop, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Bobbins");
+            if control(ui, Icon::New, "New bobbin", egui::vec2(126., 33.), false).clicked() {
+                let model = app.view.state.model.clone();
+                self.editor = Some(Editor::new(
+                    None,
+                    None,
+                    Draft {
+                        model,
+                        project: self.project_filter.clone(),
+                        ..Draft::default()
+                    },
+                    false,
+                ));
+            }
+        });
+        ui.weak("Give a model a purpose and repeatable work.");
+        ui.add_space(10.);
+        app.android_ime
+            .multiline(ui, "search-bobbins", &mut self.search, |edit| {
+                edit.desired_rows(1)
+                    .hint_text("Search Bobbins")
+                    .desired_width(300.)
+            });
+        ui.horizontal_wrapped(|ui| {
+            if self.filter.is_empty() {
+                self.filter = "Active".into();
+            }
+            for item in ["Active", "Working", "Paused", "Archived"] {
+                ui.selectable_value(&mut self.filter, item.into(), item);
+            }
+            project_picker(
+                ui,
+                "roster-project",
+                &mut self.project_filter,
+                self.projects.as_deref().unwrap_or(&[]),
+                "All projects",
+            );
+        });
+        ui.add_space(10.);
+        let registry = &app.view.state.bobbins;
+        let query = self.search.trim().to_lowercase();
+        let mut matches: Vec<_> = registry
+            .profiles
+            .iter()
+            .filter(|(id, p)| {
+                let status = match self.filter.as_str() {
+                    "Archived" => p.archived,
+                    "Paused" => p.paused && !p.archived,
+                    "Working" => !p.archived && registry.live(id).next().is_some(),
+                    _ => !p.archived,
+                };
+                status
+                    && self
+                        .project_filter
+                        .as_ref()
+                        .is_none_or(|path| p.draft.project.as_ref() == Some(path))
+                    && (query.is_empty()
+                        || format!("{} {}", p.draft.name, p.draft.purpose)
+                            .to_lowercase()
+                            .contains(&query))
+            })
+            .map(|(id, p)| (id.clone(), p.clone(), registry.live(id).count()))
+            .collect();
+        matches.sort_by_cached_key(|(_, p, _)| (!p.pinned, p.draft.name.to_lowercase()));
+        if matches.is_empty() {
+            tile(ui, |ui| {
+                ui.strong(if registry.profiles.is_empty() {
+                    "Your first Bobbin"
+                } else {
+                    "No matching Bobbins"
+                });
+                if registry.profiles.is_empty() {
+                    ui.label("Choose a model and start with one assignment.");
+                }
+            });
+        }
+        for (id, profile, count) in matches {
+            ui.push_id(&id, |ui| tile(ui, |ui| {
+                ui.horizontal(|ui| {
+                    picture(ui, &profile.draft, &mut self.art, 46.);
+                    ui.vertical(|ui| {
+                        ui.add(egui::Label::new(Text::new(&profile.draft.name).size(17.).strong()).wrap());
+                        ui.add(egui::Label::new(&profile.draft.purpose).wrap());
+                    });
+                });
+                ui.weak(label(app, &profile.draft.model));
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(home());
+                    ui.strong(if profile.archived { "Archived".into() } else if profile.paused { "Paused".into() }
+                        else if count > 0 { format!("{count} active") } else if !app.view.models.contains(&profile.draft.model) { "Model unavailable".into() } else { "Ready".into() });
+                    if !profile.paused && let Some(next) = upcoming(&profile) {
+                        ui.weak(format!("Next {}", crate::automation::local_time(next)));
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button(if profile.archived { "View" } else { "Message" }).clicked() { self.select(&id, Tab::Overview); }
+                    if ui.button("View runs").clicked() { self.select(&id, Tab::Runs); }
+                    if !profile.archived && ui.button(if profile.paused { "Resume" } else { "Pause" }).clicked() {
+                        send(app, json!({"action": if profile.paused { "resume" } else { "pause" }, "id":id, "stop":false}));
+                    }
+                });
+            }));
+        }
+    }
+
+    fn detail(&mut self, app: &mut Desktop, ui: &mut egui::Ui, id: &str, profile: &Profile) {
+        if ui.button("Back to Bobbins").clicked() {
+            self.selected = None;
+            return;
+        }
+        ui.add_space(5.);
+        ui.horizontal(|ui| {
+            picture(ui, &profile.draft, &mut self.art, 52.);
+            ui.vertical(|ui| {
+                ui.heading(&profile.draft.name);
+                ui.label(&profile.draft.purpose);
+            });
+        });
+        ui.add_space(10.);
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (Tab::Overview, "Overview"),
+                (Tab::Assignments, "Assignments"),
+                (Tab::Runs, "Runs"),
+                (Tab::Settings, "Settings"),
+                (Tab::Appearance, "Appearance"),
+            ] {
+                ui.selectable_value(&mut self.tab, tab, label);
+            }
+        });
+        ui.separator();
+        match self.tab {
+            Tab::Overview => self.overview(app, ui, id, profile),
+            Tab::Assignments => self.assignments(app, ui, id, profile),
+            Tab::Runs => self.runs(app, ui, id),
+            Tab::Settings | Tab::Appearance => {
+                self.editor = Some(Editor::new(
+                    Some(id.into()),
+                    Some(profile.revision),
+                    profile.draft.clone(),
+                    self.tab == Tab::Appearance,
+                ));
+                self.tab = Tab::Overview;
+                ui.ctx().request_repaint();
+            }
+        }
+    }
+
+    fn overview(&mut self, app: &mut Desktop, ui: &mut egui::Ui, id: &str, p: &Profile) {
+        tile(ui, |ui| {
+            ui.strong("Home device");
+            ui.label(home());
+            ui.strong("Model");
+            ui.label(label(app, &p.draft.model));
+            access(ui, &p.draft);
+        });
+        if !p.archived {
+            tile(ui, |ui| {
+                if self.sent_chat.is_some_and(|prior| {
+                    app.view
+                        .state
+                        .bobbins
+                        .runs
+                        .range((prior.saturating_add(1))..)
+                        .any(|(_, r)| r.bobbin == id && r.assignment.is_none())
+                }) {
+                    self.message.clear();
+                    self.sent_chat = None;
+                    self.tab = Tab::Runs;
+                    ui.ctx().request_repaint();
+                }
+                field(app, ui, "Message", &mut self.message, 3);
+                let ready = !p.paused && app.view.models.contains(&p.draft.model);
+                if !ready {
+                    ui.weak(if p.paused {
+                        "Resume this Bobbin to start new work."
+                    } else {
+                        "Connect the model or choose another in Settings."
+                    });
+                }
+                if app.notice.starts_with("Error:") {
+                    self.sent_chat = None;
+                }
+                if ui
+                    .add_enabled(
+                        ready && self.sent_chat.is_none() && !self.message.trim().is_empty(),
+                        egui::Button::new("Run now"),
+                    )
+                    .clicked()
+                {
+                    self.sent_chat = Some(
+                        app.view
+                            .state
+                            .bobbins
+                            .runs
+                            .keys()
+                            .next_back()
+                            .copied()
+                            .unwrap_or(0),
+                    );
+                    send(app, json!({"action":"run","id":id,"prompt":self.message}));
+                }
+            });
+        }
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(if p.pinned { "Unpin" } else { "Pin" }).clicked() { send(app, json!({"action":"pin","id":id,"pinned":!p.pinned})); }
+            if ui.button("Duplicate").clicked() { send(app, json!({"action":"duplicate","id":id})); }
+            if p.archived {
+                if ui.button("Restore").clicked() { send(app, json!({"action":"restore","id":id})); }
+                if ui.button("Delete Bobbin…").clicked() { self.deleting = Some(String::new()); }
+            } else {
+                if ui.button(if p.paused { "Resume" } else { "Pause after current runs" }).clicked() {
+                    send(app, json!({"action":if p.paused { "resume" } else { "pause" },"id":id,"stop":false}));
+                }
+                if app.view.state.bobbins.live(id).next().is_some() && ui.button("Pause and stop runs").clicked() {
+                    send(app, json!({"action":"pause","id":id,"stop":true}));
+                }
+                if ui.button("Archive").on_hover_text("Stop active work and disable schedules").clicked() { send(app, json!({"action":"archive","id":id})); }
+            }
+        });
+        if let Some(name) = &mut self.deleting {
+            let mut close = false;
+            field(
+                app,
+                ui,
+                "Type the Bobbin name to delete it. Run chats are kept.",
+                name,
+                1,
+            );
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(name == &p.draft.name, egui::Button::new("Delete Bobbin"))
+                    .clicked()
+                {
+                    send(app, json!({"action":"delete","id":id,"name":name}));
+                }
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
+            });
+            if close {
+                self.deleting = None;
+            }
+        }
+    }
+
+    fn assignments(&mut self, app: &mut Desktop, ui: &mut egui::Ui, id: &str, profile: &Profile) {
+        if !profile.archived && ui.button("New assignment").clicked() {
+            self.assignment = Some((None, AssignmentDraft::default()));
+            app.notice.clear();
+        }
+        if let Some((key, draft)) = &mut self.assignment {
+            let mut close = false;
+            tile(ui, |ui| {
+                field(app, ui, "Assignment title", &mut draft.title, 1);
+                field(app, ui, "Instructions", &mut draft.prompt, 4);
+                field(app, ui, "What should the run deliver?", &mut draft.done, 2);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Save assignment").clicked() {
+                        send(app, json!({"action":"assign","id":id,"assignment":key,"revision":profile.revision,"draft":draft}));
+                    }
+                    if ui.button("Back").clicked() { close = true; }
+                });
+            });
+            if close || app.notice == "Assignment saved" {
+                self.assignment = None;
+            }
+        }
+        for (key, assignment) in &profile.assignments {
+            ui.push_id(key, |ui| {
+                tile(ui, |ui| {
+                    ui.strong(&assignment.draft.title);
+                    ui.label(&assignment.draft.done);
+                    if let Some(schedule) = &assignment.schedule {
+                        ui.weak(if schedule.enabled {
+                            format!("Next {}", crate::automation::local_time(schedule.next))
+                        } else {
+                            "Schedule inactive".into()
+                        });
+                        if let Some(error) = &schedule.last_error {
+                            ui.weak(error);
+                        }
+                    }
+                    if !profile.archived {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui
+                                .add_enabled(!profile.paused, egui::Button::new("Run now"))
+                                .clicked()
+                            {
+                                send(
+                                    app,
+                                    json!({"action":"run","id":id,"assignment":key,"prompt":""}),
+                                );
+                            }
+                            if ui.button("Edit").clicked() {
+                                self.assignment =
+                                    Some((Some(key.clone()), assignment.draft.clone()));
+                                app.notice.clear();
+                            }
+                            if !cfg!(target_os = "android") && ui.button("Schedule…").clicked() {
+                                app.notice.clear();
+                                let saved = assignment.schedule.as_ref();
+                                self.schedule = Some(ScheduleForm {
+                                    key: key.clone(),
+                                    when: crate::automation::local_time(
+                                        saved
+                                            .map_or(0, |s| s.next)
+                                            .max(crate::automation::now() + 3600),
+                                    ),
+                                    interval: saved.map_or(0, |s| s.interval),
+                                    skip_missed: saved.is_some_and(|s| s.skip_missed),
+                                });
+                            }
+                            if assignment.schedule.as_ref().is_some_and(|s| s.enabled)
+                                && ui.button("Pause schedule").clicked()
+                            {
+                                send(
+                                    app,
+                                    json!({"action":"pause_schedule","id":id,"assignment":key}),
+                                );
+                            }
+                        });
+                    }
+                })
+            });
+        }
+        if let Some(form) = &mut self.schedule {
+            let mut close = false;
+            tile(ui, |ui| {
+                ui.strong("Schedule preview");
+                ui.label(label(app, &profile.draft.model));
+                ui.weak(home());
+                access(ui, &profile.draft);
+                field(
+                    app,
+                    ui,
+                    "First run in local time (YYYY-MM-DD HH:MM)",
+                    &mut form.when,
+                    1,
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for (interval, title) in [
+                        (0, "Once"),
+                        (3600, "Every hour"),
+                        (86400, "Every 24 hours"),
+                        (604800, "Every 7 days"),
+                    ] {
+                        ui.selectable_value(&mut form.interval, interval, title);
+                    }
+                });
+                ui.checkbox(&mut form.skip_missed, "Skip missed runs");
+                let next = crate::automation::parse_local(&form.when)
+                    .ok()
+                    .filter(|t| *t > crate::automation::now());
+                if let Some(next) = next {
+                    ui.weak(format!("First run {}", crate::automation::local_time(next)));
+                    if form.interval > 0 {
+                        ui.weak(format!(
+                            "Following run {}",
+                            crate::automation::local_time(next + form.interval)
+                        ));
+                    }
+                } else {
+                    ui.weak("Choose a valid future date and time.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(next) = next && ui.add_enabled(!profile.paused, egui::Button::new("Enable schedule")).clicked() {
+                        send(app, json!({"action":"schedule","id":id,"assignment":form.key,"revision":profile.revision,"next":next,"interval":form.interval,"skip_missed":form.skip_missed}));
+                    }
+                    if ui.button("Back").clicked() { close = true; }
+                });
+            });
+            if close || app.notice.starts_with("Schedule enabled for ") {
+                self.schedule = None;
+            }
+        }
+    }
+
+    fn runs(&mut self, app: &mut Desktop, ui: &mut egui::Ui, id: &str) {
+        let listed: Vec<_> = app
+            .view
+            .state
+            .bobbins
+            .runs
+            .iter()
+            .rev()
+            .filter(|(_, run)| run.bobbin == id)
+            .map(|(chat, r)| (*chat, r.clone()))
+            .collect();
+        if listed.is_empty() {
+            ui.weak("Runs and their outputs appear here.");
+        }
+        for (chat, run) in listed {
+            ui.push_id(chat, |ui| {
+                tile(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&run.title);
+                        let held = app
+                            .view
+                            .state
+                            .queue
+                            .iter()
+                            .find(|q| q.origin == Some(chat))
+                            .and_then(|q| q.hold_reason.as_deref());
+                        ui.label(if run.held_task.is_some() {
+                            "Paused"
+                        } else if held.is_some() {
+                            "Waiting"
+                        } else {
+                            run.status.label()
+                        });
+                        if app.view.state.unread.contains(&chat) {
+                            ui.colored_label(accent(), "Unread");
+                        }
+                    });
+                    ui.weak(format!(
+                        "{} · {}",
+                        crate::automation::local_time(run.triggered),
+                        if run.assignment.is_some() {
+                            "Assignment"
+                        } else {
+                            "Message"
+                        }
+                    ));
+                    ui.weak(format!(
+                        "{} · {}",
+                        label(
+                            app,
+                            run.actual_model
+                                .as_deref()
+                                .unwrap_or(&run.configuration.model)
+                        ),
+                        run.home_label()
+                    ));
+                    if run.missed > 0 {
+                        ui.weak(format!("{} missed occurrences combined", run.missed));
+                    }
+                    if !run.outcome.is_empty() {
+                        ui.label(&run.outcome);
+                    }
+                    if let Some(held) = app
+                        .view
+                        .state
+                        .queue
+                        .iter()
+                        .find(|q| q.origin == Some(chat))
+                        .and_then(|q| q.hold_reason.clone())
+                    {
+                        ui.weak(held);
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui
+                            .add_enabled(
+                                app.view.state.thread_data(chat).is_some(),
+                                egui::Button::new("Open run"),
+                            )
+                            .clicked()
+                        {
+                            app.send(format!("/open {chat}"));
+                            app.page = Page::Chat;
+                            app.drawer = false;
+                        }
+                        if run.status.active() {
+                            if ui
+                                .add_enabled(
+                                    app.view.state.queue.iter().any(|q| q.origin == Some(chat)),
+                                    egui::Button::new("Steer"),
+                                )
+                                .clicked()
+                            {
+                                self.steering = Some((chat, String::new()));
+                            }
+                            if ui.button("Cancel run").clicked() {
+                                send(app, json!({"action":"cancel","chat":chat}));
+                            }
+                        }
+                    });
+                    if let Some((target, correction)) = &mut self.steering
+                        && *target == chat
+                    {
+                        field(app, ui, "Correction for this run", correction, 2);
+                        if ui.button("Send correction").clicked() {
+                            send(app, json!({"action":"steer","chat":chat,"text":correction}));
+                        }
+                    }
+                })
+            });
+        }
+        if app.notice == "Bobbin correction queued" {
+            self.steering = None;
+        }
+    }
+}
+
+fn upcoming(profile: &Profile) -> Option<i64> {
+    profile
+        .assignments
+        .values()
+        .filter_map(|a| a.schedule.as_ref().filter(|s| s.enabled).map(|s| s.next))
+        .min()
+}
+
+fn project_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    value: &mut Option<PathBuf>,
+    projects: &[crate::projects::Project],
+    none: &str,
+) {
+    let current = value.as_ref().map(|path| {
+        projects
+            .iter()
+            .find(|p| &p.path == path)
+            .map_or_else(|| crate::projects::display_path(path), |p| p.name.clone())
+    });
+    crate::widgets::InlineChoice::from_label(id)
+        .selected_text(current.as_deref().unwrap_or(none))
+        .show_ui(ui, |ui| {
+            ui.selectable_value(value, None, none);
+            for p in projects {
+                ui.selectable_value(value, Some(p.path.clone()), &p.name);
+            }
+        });
+}
+
+fn access(ui: &mut egui::Ui, draft: &Draft) {
+    ui.strong("Access");
+    if draft.read_project
+        && let Some(path) = &draft.project
+    {
+        ui.label(format!(
+            "Read project · {}",
+            crate::projects::display_path(path)
+        ));
+    }
+    if draft.output_files {
+        ui.label("Save files in the run chat");
+    }
+    if draft.web {
+        ui.label("Search and read public pages");
+    }
+    if !draft.read_project && !draft.output_files && !draft.web {
+        ui.label("Prompt and reply");
+    }
+}
+
+impl Editor {
+    fn new(key: Option<String>, revision: Option<u64>, draft: Draft, appearance: bool) -> Self {
+        Self {
+            key,
+            revision,
+            draft,
+            appearance,
+            file: String::new(),
+            prompt: String::new(),
+            artwork: vec![],
+            job: None,
+            feedback: String::new(),
+            saving: None,
+        }
+    }
+
+    fn render(&mut self, screen: &mut Screen, app: &mut Desktop, ui: &mut egui::Ui) -> bool {
+        if self.saving.is_some() && app.notice == "Bobbin saved" {
+            return false;
+        }
+        if self
+            .saving
+            .is_some_and(|t| t.elapsed() > Duration::from_secs(5))
+            || app.notice.starts_with("Error:")
+        {
+            self.saving = None;
+        }
+        if panel_header(
+            ui,
+            if self.key.is_some() {
+                "Bobbin settings"
+            } else {
+                "New bobbin"
+            },
+            "Back",
+        ) {
+            return false;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.appearance, false, "Profile");
+            ui.selectable_value(&mut self.appearance, true, "Appearance");
+        });
+        ui.add_space(9.);
+        if self.appearance {
+            self.appearance(screen, app, ui);
+        } else {
+            if self.key.is_none() && self.draft.name.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Research brief").clicked() {
+                        self.draft.name = "Research brief".into(); self.draft.purpose = "Compare options and cite the sources".into();
+                        self.draft.instructions = "Separate verified details from assumptions. List the sources and open questions.".into();
+                        self.draft.picture = Picture::Loop; self.draft.color = 1;
+                    }
+                    if ui.button("Project digest").clicked() {
+                        self.draft.name = "Project digest".into(); self.draft.purpose = "Summarize decisions, changes and open work".into();
+                        self.draft.instructions = "Keep the digest brief. Include filenames and identify anything that still needs a decision.".into();
+                        self.draft.picture = Picture::Spool; self.draft.color = 0;
+                    }
+                });
+            }
+            field(app, ui, "Name", &mut self.draft.name, 1);
+            field(app, ui, "Purpose", &mut self.draft.purpose, 1);
+            field(
+                app,
+                ui,
+                "Standing instructions",
+                &mut self.draft.instructions,
+                4,
+            );
+            ui.strong("Home device");
+            ui.label(home());
+            ui.strong("Model");
+            crate::widgets::InlineChoice::from_label("bobbin model")
+                .selected_text(label(app, &self.draft.model))
+                .show_ui(ui, |ui| {
+                    for model in &app.view.models {
+                        ui.selectable_value(
+                            &mut self.draft.model,
+                            model.clone(),
+                            label(app, model),
+                        );
+                    }
+                });
+            ui.add_space(7.);
+            ui.strong("Project and access");
+            ui.horizontal_wrapped(|ui| {
+                project_picker(
+                    ui,
+                    "bobbin project",
+                    &mut self.draft.project,
+                    screen.projects.as_deref().unwrap_or(&[]),
+                    "No project",
+                );
+                if ui.button("Refresh projects").clicked() {
+                    screen.refresh_projects(&app.root);
+                }
+            });
+            if self.draft.project.is_none() {
+                self.draft.read_project = false;
+            }
+            ui.add_enabled(
+                self.draft.project.is_some(),
+                egui::Checkbox::new(&mut self.draft.read_project, "Read files in this project"),
+            );
+            ui.checkbox(
+                &mut self.draft.output_files,
+                "Create output files in run chats",
+            );
+            ui.add_enabled(
+                !app.view.state.preferences.block_web,
+                egui::Checkbox::new(&mut self.draft.web, "Search and read public web pages"),
+            );
+            if self.key.is_some() {
+                ui.weak(
+                    "Changes to model, instructions or access pause existing schedules for review.",
+                );
+            }
+        }
+        ui.add_space(12.);
+        let ready = !self.draft.name.trim().is_empty()
+            && !self.draft.purpose.trim().is_empty()
+            && !self.draft.model.is_empty();
+        if ui
+            .add_enabled(
+                ready && self.saving.is_none(),
+                egui::Button::new(if self.key.is_none() {
+                    "Save draft"
+                } else {
+                    "Save changes"
+                }),
+            )
+            .clicked()
+        {
+            app.notice = "Saving Bobbin…".into();
+            send(
+                app,
+                json!({"action":"save","id":self.key,"revision":self.revision,"draft":self.draft}),
+            );
+            self.saving = Some(std::time::Instant::now());
+        }
+        true
+    }
+
+    fn appearance(&mut self, screen: &mut Screen, app: &mut Desktop, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            picture(ui, &self.draft, &mut screen.art, 72.);
+            picture(ui, &self.draft, &mut screen.art, 36.);
+        });
+        ui.add_space(8.);
+        ui.horizontal_wrapped(|ui| {
+            for (preset, text) in [
+                (Picture::Initials, "Initials"),
+                (Picture::Spool, "Spool"),
+                (Picture::Shuttle, "Shuttle"),
+                (Picture::Loop, "Loop"),
+            ] {
+                if ui
+                    .selectable_label(
+                        self.draft.avatar.is_none() && self.draft.picture == preset,
+                        text,
+                    )
+                    .clicked()
+                {
+                    self.draft.picture = preset;
+                    self.draft.avatar = None;
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (index, (color, name)) in PALETTE.iter().enumerate() {
+                if ui
+                    .selectable_label(self.draft.color == index, Text::new(*name).color(*color))
+                    .clicked()
+                {
+                    self.draft.color = index;
+                }
+            }
+        });
+        ui.separator();
+        field(
+            app,
+            ui,
+            "Artwork file path (PNG or JPEG)",
+            &mut self.file,
+            1,
+        );
+        #[cfg(windows)]
+        if ui.button("Choose artwork…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Avatar image", &["png", "jpg", "jpeg"])
+                .pick_file()
+        {
+            self.file = path.to_string_lossy().into_owned();
+        }
+        if ui
+            .add_enabled(
+                !self.file.trim().is_empty(),
+                egui::Button::new("Use artwork"),
+            )
+            .clicked()
+        {
+            match crate::bobbins::import_avatar(&PathBuf::from(self.file.trim())) {
+                Ok(key) => {
+                    self.draft.avatar = Some(key);
+                    self.feedback.clear();
+                }
+                Err(err) => self.feedback = format!("Artwork: {err:#}"),
+            }
+        }
+        ui.separator();
+        field(app, ui, "Describe an avatar", &mut self.prompt, 3);
+        let settings = crate::comfy::Settings::from(&app.view.state.preferences);
+        if let Some(job) = &self.job {
+            match job.receive.try_recv() {
+                Ok(Ok(assets)) => {
+                    self.artwork = assets;
+                    self.job = None;
+                    self.feedback.clear();
+                }
+                Ok(Err(e)) => {
+                    self.job = None;
+                    self.feedback = format!("Generation: {e:#}");
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.job = None;
+                    self.feedback = "Avatar generation stopped.".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ui.weak("Generating avatars…");
+                    if ui.button("Stop generation").clicked() {
+                        self.job = None;
+                    }
+                    ui.ctx().request_repaint_after(Duration::from_millis(200));
+                }
+            }
+        } else if settings.ready() {
+            if ui
+                .add_enabled(
+                    !self.prompt.trim().is_empty(),
+                    egui::Button::new(format!("Generate with {}", settings.label())),
+                )
+                .clicked()
+            {
+                let prompt = self.prompt.trim().to_owned();
+                let (send, receive) = std::sync::mpsc::channel();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let stop = cancel.clone();
+                std::thread::spawn(move || {
+                    let result = (|| -> anyhow::Result<Vec<String>> {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()?;
+                        let request = crate::comfy::Request::configured(
+                            &prompt,
+                            &crate::comfy::Options {
+                                aspect_ratio: Some("1:1".into()),
+                                count: Some(2),
+                                ..Default::default()
+                            },
+                            &settings,
+                        )?;
+                        let images = runtime.block_on(crate::comfy::run(
+                            &settings,
+                            &request,
+                            None,
+                            stop.clone(),
+                        ))?;
+                        anyhow::ensure!(!stop.load(Ordering::Relaxed), "Generation stopped.");
+                        images
+                            .images
+                            .iter()
+                            .map(|image| crate::bobbins::store_avatar(image))
+                            .collect()
+                    })();
+                    let _ = send.send(result);
+                });
+                self.job = Some(AssetJob { receive, cancel });
+                ui.ctx().request_repaint();
+            }
+            ui.weak("Your description is sent to the configured image server.");
+        } else {
+            ui.weak("Configure an image server in Settings to generate artwork.");
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (index, asset) in self.artwork.iter().enumerate() {
+                ui.vertical(|ui| {
+                    picture(
+                        ui,
+                        &Draft {
+                            avatar: Some(asset.clone()),
+                            ..self.draft.clone()
+                        },
+                        &mut screen.art,
+                        72.,
+                    );
+                    if ui
+                        .selectable_label(
+                            self.draft.avatar.as_ref() == Some(asset),
+                            format!("Choose {}", index + 1),
+                        )
+                        .clicked()
+                    {
+                        self.draft.avatar = Some(asset.clone());
+                    }
+                });
+            }
+        });
+        if !self.feedback.is_empty() {
+            ui.colored_label(accent(), &self.feedback);
+        }
+    }
+}

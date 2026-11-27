@@ -300,6 +300,7 @@ pub fn next_tick(state: &State, t: i64) -> std::time::Duration {
                 .filter(|s| s.enabled && state.queue.is_empty() && !state.held)
                 .map(|s| s.next),
         )
+        .chain((state.queue.is_empty() && !state.held).then(|| crate::bobbins::next(state)).flatten())
         .min();
     std::time::Duration::from_secs(
         next.map(|n| n.saturating_sub(t).clamp(1, 60) as u64)

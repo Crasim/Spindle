@@ -156,6 +156,8 @@ pub struct BrowserRead {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct State {
+    #[serde(default, skip_serializing_if = "crate::bobbins::Registry::is_empty")]
+    pub bobbins: crate::bobbins::Registry,
     #[serde(default, skip_serializing_if = "crate::sync::placement::Placement::is_empty")]
     pub placement: crate::sync::placement::Placement,
     #[serde(skip)]

@@ -80,6 +80,7 @@ impl State {
     /// Folder whose artifacts directory receives this thread's generated files and pastes.
     /// A project that is no longer available falls back to the workspace.
     pub fn files_root(&self, root: &Path, id: u64) -> PathBuf {
+        if self.bobbins.runs.contains_key(&id) { return files_root(root, None); }
         files_root(root, self.thread_data(id).and_then(|(t, _)| t.project.as_deref()))
     }
 

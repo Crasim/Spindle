@@ -413,6 +413,7 @@ impl Desktop {
         };
         let mut send = None;
         let mut open = None;
+        let mut bobbin_prompt = None;
         let sending = self.awaiting_submission();
         #[cfg(target_os = "android")]
         let ime = &mut self.android_ime;
@@ -463,7 +464,10 @@ impl Desktop {
                     ui.add(egui::Label::new(Text::new(
                         "Files from this project's chats go to its artifacts folder",
                     ).weak()).wrap());
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Use a Bobbin").clicked() {
+                            bobbin_prompt = Some(draft.clone());
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let ready = !sending && !draft.trim().is_empty();
                             if (ui.add_enabled(ready, egui::Button::new("Start chat")).clicked() || enter)
@@ -595,6 +599,10 @@ impl Desktop {
             body(ui, &mut self.projects);
             ui.separator();
             side(ui, &mut self.projects);
+        }
+        if let Some(prompt) = bobbin_prompt {
+            self.bobbins.for_project(project.path.clone(), prompt);
+            self.page = Page::Bobbins;
         }
         if let Some(cmd) = revoke {
             self.send(cmd);
