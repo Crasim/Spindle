@@ -289,6 +289,7 @@ impl Engine {
                 if let Some(m) = &model {
                     ensure!(self.models.contains(m), "Select an available model");
                 }
+                let previous = model.as_ref().map(|_| self.state.thread_model(id).to_owned());
                 let info = self.state.thread_mut(id)?;
                 if let Some(t) = title {
                     info.title = t;
@@ -296,8 +297,8 @@ impl Engine {
                 if let Some(s) = section {
                     info.section = s;
                 }
-                if let Some(m) = model {
-                    info.model = m.clone();
+                if let Some((m, previous)) = model.zip(previous) {
+                    info.select_model(&previous, &m);
                     if id == self.state.chat_id {
                         if route(&self.state.model).0 != route(&m).0
                             && self.state.attachment.is_some()

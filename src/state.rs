@@ -582,7 +582,16 @@ pub struct ThreadInfo {
     pub project: Option<PathBuf>,
     pub title: String,
     pub model: String,
+    /// A model selection shown at the end of the chat until its next matching reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<ModelChange>,
     pub turns: BTreeMap<usize, Turn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelChange {
+    pub from: String,
+    pub to: String,
 }
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -618,6 +627,10 @@ pub struct Turn {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub earlier_output: u64,
     pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<ModelChange>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from: Option<String>,
     pub input: u64,
     pub output: u64,
     pub tokens_per_second: Option<f64>,
@@ -649,6 +662,22 @@ fn legacy_cowork() -> bool {
 }
 
 impl ThreadInfo {
+    pub fn select_model(&mut self, previous: &str, selected: &str) {
+        if (self.started || !self.turns.is_empty()) && !previous.is_empty() && previous != selected {
+            let from = self.model_selection.take().map_or_else(|| previous.to_owned(), |change| change.from);
+            self.model_selection = (from != selected).then(|| ModelChange { from, to: selected.to_owned() });
+        }
+        self.model = selected.to_owned();
+    }
+
+    pub fn take_model_selection(&mut self, requested: &str) -> Option<ModelChange> {
+        if self.model_selection.as_ref().is_some_and(|change| change.to == requested) {
+            self.model_selection.take()
+        } else {
+            None
+        }
+    }
+
     pub fn message_mode(&self) -> Mode {
         if self.cowork { Mode::Chat } else { Mode::Conversation }
     }
@@ -662,6 +691,13 @@ impl ThreadInfo {
         } else {
             &self.title
         }
+    }
+}
+
+impl Task {
+    pub fn fallback_from(&self, actual: &str) -> Option<&str> {
+        (actual != self.model && self.chain.iter().any(|model| model == actual))
+            .then_some(self.model.as_str())
     }
 }
 

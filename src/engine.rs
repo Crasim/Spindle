@@ -1572,6 +1572,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 if route(&self.state.model).0 != route(args).0 && self.state.attachment.is_some() {
                     self.state.pending = self.state.attachment.take();
                 }
+                self.state.thread.select_model(&self.state.model, args);
                 self.state.model = args.into();
                 Ok(format!("Selected {args} for new tasks"))
             }
@@ -4328,6 +4329,7 @@ fn stop_failed_task(state: &mut State, reason: &str) -> String {
     let Some(task) = state.queue.pop_front() else {
         return notice;
     };
+    let fallback_from = task.actual.as_deref().and_then(|actual| task.fallback_from(actual)).map(str::to_owned);
     state.held = false;
     if state.automation.wake.as_ref().is_some_and(|wake| wake.task == task.id) {
         state.automation.wake = None;
@@ -4356,8 +4358,12 @@ fn stop_failed_task(state: &mut State, reason: &str) -> String {
             }
             history.push(Message { images: task.images, ..Message::new("user", prompt) });
         }
+        let model_selection = thread.take_model_selection(&task.model);
         thread.turns.insert(history.len(), Turn {
             failed: true,
+            model: task.actual.clone().unwrap_or_default(),
+            model_selection,
+            fallback_from,
             pastes: task.pastes,
             ..Default::default()
         });
@@ -4430,6 +4436,7 @@ fn finish_turn(
     if turn.model.is_empty() {
         turn.model = task.actual.as_ref().unwrap_or(&task.model).clone();
     }
+    turn.fallback_from = task.fallback_from(&turn.model).map(str::to_owned);
     let mut title = None;
     let mut steps = None;
     if let Mode::Plan(_) = task.mode {
@@ -4677,6 +4684,7 @@ fn finish_turn(
                     })
                 }))
     };
+    turn.model_selection = thread.take_model_selection(&task.model);
     thread.turns.insert(history.len() + 1, turn);
     if task.tool_result {
         thread.tool_results.insert(history.len());
@@ -6256,6 +6264,34 @@ mod tests {
         assert!(!e.state.queue.is_empty());
         e.command("/sync hold", false).unwrap();
         assert!(e.state.held);
+    }
+
+    #[test]
+    fn model_changes_follow_the_matching_reply_and_its_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = fixture(tmp.path());
+        let original = e.state.model.clone();
+        e.models.extend(["second-model".into(), "fallback-model".into()]);
+        e.command("First question", false).unwrap();
+        finish(&mut e.state, "First answer.".into()).unwrap();
+        e.command("An older queued question", false).unwrap();
+        e.command("/model second-model", true).unwrap();
+        let selection = crate::state::ModelChange { from: original, to: "second-model".into() };
+        assert_eq!(e.state.thread.model_selection.as_ref(), Some(&selection));
+        finish(&mut e.state, "The older task finished.".into()).unwrap();
+        assert!(e.state.thread.turns[&3].model_selection.is_none());
+        assert_eq!(e.state.thread.model_selection.as_ref(), Some(&selection));
+
+        e.state.automation.chain = vec!["fallback-model".into()];
+        e.command("Resume work", false).unwrap();
+        e.state.queue[0].actual = Some("fallback-model".into());
+        finish(&mut e.state, "Work resumed.".into()).unwrap();
+        let saved: State = serde_json::from_slice(&serde_json::to_vec(&e.state).unwrap()).unwrap();
+        assert!(saved.thread.model_selection.is_none());
+        let turn = &saved.thread.turns[&5];
+        assert_eq!(turn.model_selection.as_ref(), Some(&selection));
+        assert_eq!(turn.fallback_from.as_deref(), Some("second-model"));
+        assert_eq!(turn.model, "fallback-model");
     }
 
     #[test]

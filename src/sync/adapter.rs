@@ -1967,8 +1967,10 @@ mod tests {
         question.images.push("example-image".into());
         alt.history.push(question);
         alt.history.push(Message::new("assistant", "phone answer"));
+        let model_selection = crate::state::ModelChange { from: "earlier-model".into(), to: "example-model".into() };
         alt.thread.turns.insert(3, crate::state::Turn {
             model: "example-model".into(),
+            model_selection: Some(model_selection.clone()),
             artifacts: vec![crate::state::Attachment { path: "answer.txt".into(), text: "answer".into() }],
             ..Default::default()
         });
@@ -1991,6 +1993,7 @@ mod tests {
         round(&mut b, &mut phone, &transport, false).await.unwrap();
         assert_eq!(b.chats[&bid].history, a.history);
         assert_eq!(b.chats[&bid].thread.turns[&4].model, "example-model");
+        assert_eq!(b.chats[&bid].thread.turns[&4].model_selection.as_ref(), Some(&model_selection));
         assert!(a.space.as_ref().unwrap().branches.get(&aid).is_none());
         assert!(b.space.as_ref().unwrap().branches.get(&bid).is_none());
 

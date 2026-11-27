@@ -1860,6 +1860,39 @@ impl Desktop {
             });
     }
 
+    fn model_divider(&self, ui: &mut egui::Ui, from: &str, to: &str, fallback: bool) {
+        let (old_provider, old_name) = route(from);
+        let (new_provider, new_name) = route(to);
+        let label = if old_name == new_name {
+            format!("Model changed from {old_name} ({}) to {new_name} ({})",
+                self.provider_name(old_provider), self.provider_name(new_provider))
+        } else {
+            format!("Model changed from {old_name} to {new_name}")
+        };
+        let width = ui.available_width();
+        let sides = (width * 0.09).clamp(8., 40.);
+        let mut job = egui::text::LayoutJob::simple(label.clone(), egui::FontId::proportional(12.),
+            muted(), (width - 2. * sides - 40.).max(20.));
+        job.wrap.break_anywhere = true;
+        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+        let height = galley.size().y.max(14.) + 18.;
+        if TranscriptRows::skip(ui, height + ui.spacing().item_spacing.y) { return; }
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+        let left = rect.center().x - (galley.size().x + 22.) * 0.5;
+        let right = left + galley.size().x + 22.;
+        let y = rect.center().y;
+        let stroke = egui::Stroke::new(1_f32, line());
+        let painter = ui.painter();
+        painter.hline(rect.left()..=(left - 8.), y, stroke);
+        painter.hline((right + 8.)..=rect.right(), y, stroke);
+        draw(ui, Icon::Chip, egui::Rect::from_center_size(egui::pos2(left + 7., y), egui::vec2(14., 14.)), muted());
+        let text_y = y - galley.size().y * 0.5;
+        painter.galley(egui::pos2(left + 22., text_y), galley, muted());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &label));
+        response.on_hover_text(if fallback { "Spindle used a configured fallback model for this request." }
+            else { "The new model was selected for this conversation." });
+    }
+
     fn conversation(&mut self, ui: &mut egui::Ui) {
         // Branches from other devices, above the conversation.
         self.branch_bar(ui);
@@ -1975,6 +2008,19 @@ impl Desktop {
                         group_box=None;
                     }
                     if let Some(n)=state.thread.compactions.get(&index) { compaction_divider(ui,*n); }
+                    let turn = state.thread.turns.get(&index);
+                    let user = message.role == "user";
+                    let selected = if user {
+                        state.thread.turns.get(&(index + 1)).and_then(|turn| turn.model_selection.as_ref())
+                    } else if index == 0 || state.history[index - 1].role != "user" {
+                        turn.and_then(|turn| turn.model_selection.as_ref())
+                    } else { None };
+                    if let Some(change) = selected {
+                        self.model_divider(ui, &change.from, &change.to, false);
+                    }
+                    if let Some(turn) = turn && let Some(from) = &turn.fallback_from {
+                        self.model_divider(ui, from, &turn.model, true);
+                    }
                     if let Some(start)=groups[index] {
                         let open=self.open_steps.contains(&(state.chat_id,start));
                         if start==index {
@@ -2006,8 +2052,6 @@ impl Desktop {
                         self.transcript.heights[index].unwrap_or(self.transcript.estimates[index])) { continue; }
                     let top = ui.cursor().top();
                     if !copy_row && ui.clip_rect().y_range().contains(top) { visible_row = Some(index); }
-                    let user=message.role=="user";
-                    let turn=state.thread.turns.get(&index);
                     if user && let Some(update)=state.thread.plan_notes.get(&index) {
                         ui.push_id(("plan-note",index),|ui| if let Some(a)=notes::user_plan_note(ui,update) {note=Some(a);});
                     }
@@ -2208,7 +2252,12 @@ impl Desktop {
                         }
                     }
                 }
-                if let Some(t) = self.view.state.queue.front().filter(|t|t.origin.unwrap_or(self.view.state.chat_id)==self.view.state.chat_id) {
+                let pending_selection = self.view.state.thread.model_selection.as_ref();
+                let active_task = self.view.state.queue.front().filter(|t|t.origin.unwrap_or(self.view.state.chat_id)==self.view.state.chat_id);
+                if let Some(change) = pending_selection.filter(|c| active_task.is_none_or(|t| t.model == c.to)) {
+                    self.model_divider(ui, &change.from, &change.to, false);
+                }
+                if let Some(t) = active_task {
                     ui.add_space(12.);
                     if t.tool_result {
                         // A tool result or Spindle note on its way to the model, not the user's words.
@@ -2219,6 +2268,9 @@ impl Desktop {
                             chat_text.message(self.view.state.history.len());
                             chat_text.label(ui, t.text.as_str(), false);
                         });
+                    }
+                    if let Some(actual) = t.actual.as_deref() && let Some(from) = t.fallback_from(actual) {
+                        self.model_divider(ui, from, actual, true);
                     }
                     chat_text.message(self.view.state.history.len()+1);
                     message_row(ui,false,|ui|{
@@ -2273,6 +2325,9 @@ impl Desktop {
                         }
                     });
                     });
+                }
+                if let Some(change) = pending_selection.filter(|c| active_task.is_some_and(|t| t.model != c.to)) {
+                    self.model_divider(ui, &change.from, &change.to, false);
                 }
                 self.chat_selection.update(ui, chat_text, copy_selection);
             });
@@ -3417,6 +3472,30 @@ mod transcript_tests {
             }
         }
         output.shapes.iter().find_map(|shape| find(&shape.shape, shape.clip_rect, label))
+    }
+
+    #[test]
+    fn model_changes_are_visible_in_the_phone_width_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 0);
+        app.view.state.history = vec![
+            crate::ollama::Message::new("user", "Resume work"),
+            crate::ollama::Message::new("assistant", "Work resumed."),
+        ];
+        app.view.state.thread.turns.insert(1, crate::state::Turn {
+            model: "fallback-model".into(),
+            model_selection: Some(crate::state::ModelChange {
+                from: "first-model".into(), to: "second-model".into(),
+            }),
+            fallback_from: Some("second-model".into()),
+            ..Default::default()
+        });
+        draw_at_width(&ctx, &mut app, 0, vec![], 360.);
+        let output = draw_at_width(&ctx, &mut app, 1, vec![], 360.);
+        let y = |label| visible_text(&output, label).expect("annotation is visible").y;
+        assert!(y("Model changed from first-model to second-model") < y("Resume work"));
+        assert!(y("Resume work") < y("Model changed from second-model to fallback-model"));
+        assert!(y("Model changed from second-model to fallback-model") < y("Work resumed."));
     }
 
     #[test]
