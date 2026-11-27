@@ -231,6 +231,7 @@ impl Engine {
                     c.thread.started = true;
                 }
                 self.state.queue.push_back(Task {
+                    queued_at: Some(automation::now()),
                     steps: 0,
                     tool_result: false,
                     pastes: vec![],
@@ -322,6 +323,7 @@ impl Engine {
         }
         self.state.thread.started = true;
         self.state.queue.push_back(Task {
+            queued_at: Some(automation::now()),
             steps: 0,
             tool_result: false,
             pastes: vec![],
@@ -2559,7 +2561,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
     let remote_here = |kind| matches!(state.placement.effective(state, &scope, kind), Some(WorkTarget::Device(_)));
     let mut tools = vec![
         r#"- See the files: {"name":"list","args":{"path":"."}}"#.to_owned(),
-        format!(r#"- Read a file: {{"name":"read","args":{{"path":"{file}"}}}}"#),
+        format!(r#"- Read a page: {{"name":"read","args":{{"path":"{file}"}}}}"#),
         r#"- Find text in the files: {"name":"search","args":{"query":"text to find"}}"#.to_owned(),
         format!(
             r#"- Create a file: {{"name":"create","args":{{"path":"{file}","content":"whole file"}}}}"#
@@ -3291,6 +3293,7 @@ pub(crate) fn add_exchange(
         thread.title = asked.chars().take(70).collect();
     }
     let turn = Turn {
+        reply_at: Some(automation::now()),
         model: by.into(),
         files,
         ..Default::default()
@@ -3337,6 +3340,7 @@ fn queue_followup_at(state: &mut State, chat: u64, model: &str, steps: u32, text
         else { state.chats.get_mut(&chat).map(|conversation| &mut conversation.thread) };
     let steering = thread.map_or_else(Vec::new, |thread| std::mem::take(&mut thread.pending_steering));
     let task = Task {
+        queued_at: Some(automation::now()),
         steps,
         tool_result: true,
         pastes: vec![],
@@ -4508,6 +4512,12 @@ impl Engine {
             } else if matches!(p.call.call, crate::tools::Call::Apply {}) {
                 let approved = p.confirmed_change().then_some(p.preview.as_str());
                 crate::workcopy::apply_approved(&p.root, approved)
+            } else if matches!(p.call.call, crate::tools::Call::Read { .. }) {
+                let window = self.state.thread_data(p.chat).and_then(|(thread, _)| {
+                    thread.turns.values().rev().filter(|turn| turn.model == p.model).find_map(|turn| turn.window)
+                }).or_else(|| self.state.tuning.get(&p.model).and_then(|tuning| tuning.context))
+                    .unwrap_or(crate::compaction::UNKNOWN_WINDOW);
+                crate::tools::read_chunk(&p.root, &p.call.call, &p.target, window)
             } else if self.state.bobbins.runs.contains_key(&p.chat) {
                 crate::tools::run_scoped(&p.root, &p.call.call, &p.target, p.confirmed_change(), crate::bobbins::visible_file)
             } else {
@@ -4704,6 +4714,8 @@ fn stop_failed_task(state: &mut State, reason: &str) -> String {
         }
         let model_selection = thread.take_model_selection(&task.model);
         thread.turns.insert(history.len(), Turn {
+            request_at: task.queued_at,
+            reply_at: Some(automation::now()),
             failed: true,
             model: task.actual.clone().unwrap_or_default(),
             model_selection,
@@ -4958,6 +4970,7 @@ fn finish_turn(
     // model in a loop.
     // Only within one run of steps: a fresh message from the user starts over (re-reading a
     // file to answer it is normal, and so is trying again when asked to).
+    let mut repeated_page = None;
     let repeated = task.tool_result && {
         let now = match &call {
             Some(Ok(env)) => Some(env.call.summary()),
@@ -4990,8 +5003,9 @@ fn finish_turn(
                     .enumerate()
                     .rev()
                     .take_while(|(i, m)| m.role != "user" || thread.tool_results.contains(i))
-                    .filter_map(|(i, _)| thread.turns.get(&i))
+                    .filter_map(|(i, _)| thread.turns.get(&i).map(|turn| (i, turn)))
                 {
+                    let (index, t) = t;
                     let failed = t.tool.as_ref().is_some_and(|n| failed_status(&n.status));
                     // Reading the same thing again with nothing changed since is a loop
                     // too, even though each read works.
@@ -5002,6 +5016,16 @@ fn finish_turn(
                             | crate::tools::Call::Search { .. }
                     );
                     if t.call.as_deref() == Some(same.as_str()) && (failed || looks) && !changed {
+                        if !failed && matches!(env.call, crate::tools::Call::Read { .. }) {
+                            let result = if index + 1 == history.len() {
+                                Some(prompt.as_str())
+                            } else {
+                                history.get(index + 1).filter(|_| thread.tool_results.contains(&(index + 1)))
+                                    .map(|m| m.content.as_str())
+                            };
+                            repeated_page = result.filter(|r| r.starts_with("Tool result "))
+                                .map(|r| r[..r.floor_char_boundary(r.len().min(4_500))].to_owned());
+                        }
                         found = true;
                         break;
                     }
@@ -5033,6 +5057,8 @@ fn finish_turn(
                 }))
     };
     turn.model_selection = thread.take_model_selection(&task.model);
+    turn.request_at = task.queued_at;
+    turn.reply_at = Some(automation::now());
     thread.turns.insert(history.len() + 1, turn);
     if task.tool_result {
         thread.tool_results.insert(history.len());
@@ -5068,6 +5094,7 @@ fn finish_turn(
                     path,
                     start: None,
                     lines: None,
+                    offset: None,
                 },
             };
             route_call(state, origin, &model, task.steps, root, Ok(call), false);
@@ -5103,7 +5130,9 @@ fn finish_turn(
                 matches!(task.mode, Mode::Conversation),
                 format!(
                     "{REPEAT_NOTE}\n{}",
-                    if matches!(
+                    if let Some(page) = repeated_page {
+                        format!("You already did exactly this. Use the saved page below. Follow its Next page cursor only if more text is needed.\n\n{page}")
+                    } else if matches!(
                         call,
                         Some(Ok(crate::tools::Envelope {
                             call: crate::tools::Call::Read { .. }
@@ -5149,6 +5178,7 @@ fn finish_turn(
                 path,
                 start: None,
                 lines: None,
+                offset: None,
             },
         };
         route_call(state, origin, &model, task.steps, root, Ok(call), false);
@@ -6693,7 +6723,7 @@ mod tests {
         let (_, mut messages) = request(&e.state, &e.state.queue[0]).unwrap();
         let chat = e.state.chat_id;
         e.state
-            .add_chat_history(chat, 32_000, &mut messages)
+            .add_chat_history(chat, 32_000, &mut messages, true)
             .unwrap();
         let earlier = messages.iter().find(|m| m.role == "assistant").unwrap();
         assert!(
@@ -7495,7 +7525,7 @@ mod tests {
         let (_, mut messages) = request(&e.state, task).unwrap();
         let chat = e.state.chat_id;
         e.state
-            .add_chat_history(chat, 32_000, &mut messages)
+            .add_chat_history(chat, 32_000, &mut messages, false)
             .unwrap();
         let sent: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
         assert!(
@@ -8587,7 +8617,8 @@ impl Engine {
                                         );
                                         msgs[1].images =
                                             self.state.queue.front().unwrap().images.clone();
-                                        self.state.add_chat_history(origin, window, &mut msgs)?;
+                                        let tool_chain = self.state.queue.front().unwrap().tool_result;
+                                        self.state.add_chat_history(origin, window, &mut msgs, tool_chain)?;
                                     }
                                     self.state.queue.front_mut().unwrap().actual =
                                         Some(model.clone());

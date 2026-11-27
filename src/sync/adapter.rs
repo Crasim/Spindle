@@ -138,6 +138,9 @@ pub struct BranchInfo {
     /// Syncable tool notes, results and attachments, keyed by position in this history.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub info: BTreeMap<usize, Value>,
+    /// Sync record time in Unix milliseconds, in message order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recorded_at_ms: Vec<u64>,
 }
 
 impl BranchInfo {
@@ -1546,6 +1549,7 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
                 fork: b.fork,
                 messages: to_messages(&b.turns),
                 new_from: b.new_from,
+                recorded_at_ms: b.turns.iter().map(|place| place.clock.wall).collect(),
                 info: b.turns.iter().enumerate().skip(b.fork)
                     .filter(|(_, t)| !t.turn.info.is_null())
                     .map(|(index, t)| (index, t.turn.info.clone())).collect(),

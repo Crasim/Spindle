@@ -113,6 +113,9 @@ fn clipped(s: &str, bytes: usize) -> String {
 fn digest(thread: &ThreadInfo, prefix: &[Message], budget: usize) -> String {
     let mut candidates = Vec::new();
     for (index, m) in prefix.iter().enumerate() {
+        if thread.tool_results.contains(&index) {
+            continue;
+        }
         let mut in_code = false;
         let mut first = true;
         for line in m.content.lines().map(str::trim).filter(|l| !l.is_empty()) {
@@ -299,6 +302,7 @@ impl State {
         id: u64,
         window: u64,
         messages: &mut Vec<Message>,
+        tool_chain: bool,
     ) -> Result<()> {
         let defaults = self.default_compaction(id);
         let pressure = self.automation.pressure(self.thread_model(id));
@@ -311,14 +315,38 @@ impl State {
         let fixed = generation::message_tokens(messages) + 64;
         // Reserve a little output space even when the chosen trigger is 100%.
         let input_limit = window.saturating_sub((window / 10).min(1024));
-        if checkpoint(thread, history, fixed, gate.min(input_limit), false) {
+        if !tool_chain && checkpoint(thread, history, fixed, gate.min(input_limit), false) {
             let covered = thread.summary.as_ref().map_or(0, |s| s.covered / 2);
             thread.compactions.insert(history.len(), covered);
         }
         let mut recalled = Vec::new();
         let mut room = input_limit.saturating_sub(fixed);
+        // A tool result is a continuation of the last real request. Reserve its
+        // goal before the summary and the working history compete for space.
+        let anchor = if tool_chain && room >= 48 {
+            history
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(index, m)| m.role == "user" && !thread.tool_results.contains(index))
+                .map(|(index, m)| {
+                    let max_bytes =
+                        usize::try_from((room - 12).saturating_mul(3)).unwrap_or(usize::MAX);
+                    let original = generation::message_tokens(std::slice::from_ref(m));
+                    let mut m = m.clone();
+                    if m.content.len() > max_bytes {
+                        m.content = clipped(&m.content, max_bytes);
+                    }
+                    room -= generation::message_tokens(std::slice::from_ref(&m));
+                    (index, m, original)
+                })
+        } else {
+            None
+        };
         let mut start = 0;
-        if let Some(summary) = &thread.summary {
+        if let Some(summary) = &thread.summary
+            && summary.covered <= history.len()
+        {
             start = summary.covered;
             let excerpt = summary.messages();
             let cost = generation::message_tokens(&excerpt);
@@ -329,16 +357,38 @@ impl State {
         }
         let mut first_recent = history.len();
         for pair in history[start..].rchunks_exact(2) {
-            let cost = generation::message_tokens(pair);
+            let at = first_recent - pair.len();
+            let mut cost = generation::message_tokens(pair);
+            if let Some((index, _, original)) = &anchor
+                && (at..first_recent).contains(index)
+            {
+                cost -= original;
+            }
+            for index in at..first_recent {
+                if let Some(call) = thread.turns.get(&index).and_then(|turn| turn.call.as_ref()) {
+                    cost += (call.len() + 2).div_ceil(3) as u64;
+                }
+            }
             if cost > room {
                 break;
             }
             room -= cost;
             first_recent -= 2;
         }
+        if let Some((index, request, _)) = &anchor
+            && *index < first_recent
+        {
+            recalled.push(request.clone());
+        }
         // A reply that called a tool is sent back with its call: without it the model sees
         // itself announcing steps and stopping, and small models copy that.
         for (i, m) in history.iter().enumerate().skip(first_recent) {
+            if let Some((index, request, _)) = &anchor
+                && i == *index
+            {
+                recalled.push(request.clone());
+                continue;
+            }
             match thread.turns.get(&i).and_then(|t| t.call.as_deref()) {
                 Some(call) if m.role == "assistant" => {
                     let mut m = m.clone();
@@ -384,12 +434,14 @@ mod tests {
         let original = serde_json::to_vec(&state.history).unwrap();
         let mut before = prompt();
         state
-            .add_chat_history(0, size * 2 + 2, &mut before)
+            .add_chat_history(0, size * 2 + 2, &mut before, false)
             .unwrap();
         assert!(state.thread.summary.is_none());
         assert_eq!(before.len(), 18);
         let mut after = prompt();
-        state.add_chat_history(0, size * 2, &mut after).unwrap();
+        state
+            .add_chat_history(0, size * 2, &mut after, false)
+            .unwrap();
         let summary = state.thread.summary.as_ref().unwrap();
         assert!(summary.text.contains("ORCHARD"));
         assert!(summary.covered < state.history.len());
@@ -400,11 +452,65 @@ mod tests {
         );
         assert_eq!(serde_json::to_vec(&state.history).unwrap(), original);
         let mut again = prompt();
-        state.add_chat_history(0, size * 2, &mut again).unwrap();
+        state
+            .add_chat_history(0, size * 2, &mut again, false)
+            .unwrap();
         assert_eq!(
             serde_json::to_vec(&again).unwrap(),
             serde_json::to_vec(&after).unwrap()
         );
+    }
+
+    #[test]
+    fn reading_through_many_pages_keeps_the_original_request_until_the_tool_run_finishes() {
+        let mut state = State::default();
+        state.preferences.compaction.percent = 25;
+        let request = "Find the one line containing LANTERN in the file and report its value";
+        state.history.push(Message::new("user", request));
+        state
+            .history
+            .push(Message::new("assistant", "I'll read the first page."));
+        for n in 1..=14 {
+            let row = state.history.len();
+            state.thread.tool_results.insert(row);
+            state.history.push(Message::new(
+                "user",
+                format!(
+                    "Tool result from page {n}\n{}",
+                    "unrelated file text ".repeat(148)
+                ),
+            ));
+            state.history.push(Message::new(
+                "assistant",
+                "I'll follow the next read cursor.",
+            ));
+            let page = format!("Next page: {}\n{}", n + 1, "more evidence ".repeat(180));
+            let mut msgs = vec![
+                Message::new(
+                    "system",
+                    "Follow the user's request and use read with the supplied cursor.",
+                ),
+                Message::new("user", page.clone()),
+            ];
+            state.add_chat_history(0, 4096, &mut msgs, true).unwrap();
+            assert_eq!(msgs.iter().filter(|m| m.content == request).count(), 1);
+            assert_eq!(msgs.last().unwrap().content, page);
+            assert!(generation::message_tokens(&msgs) < 4096);
+            assert!(state.thread.summary.is_none() && state.thread.compactions.is_empty());
+        }
+        // A queued read from an older build may already have been compacted.
+        state.compact_now(0, 4096).unwrap();
+        let before = state.thread.compactions.clone();
+        let mut resumed = prompt();
+        state.add_chat_history(0, 4096, &mut resumed, true).unwrap();
+        assert!(resumed.iter().any(|m| m.content == request));
+        assert_eq!(state.thread.compactions, before);
+        // At the next user message the normal trigger is enabled again.
+        state.thread.summary = None;
+        state
+            .add_chat_history(0, 4096, &mut prompt(), false)
+            .unwrap();
+        assert!(state.thread.summary.is_some());
     }
 
     #[test]

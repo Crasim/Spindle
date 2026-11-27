@@ -506,6 +506,7 @@ fn queue(
     );
     state.serial += 1;
     state.queue.push_back(Task {
+        queued_at: Some(crate::automation::now()),
         steps: 0,
         tool_result: false,
         pastes: vec![],

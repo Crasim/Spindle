@@ -2501,6 +2501,7 @@ mod tests {
                 device_name: "Laptop".into(),
                 fork: 1,
                 new_from: 1,
+                recorded_at_ms: vec![],
                 info: Default::default(),
                 messages: vec![
                     crate::ollama::Message::new("user", "hi"),

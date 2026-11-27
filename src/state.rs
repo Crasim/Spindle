@@ -30,6 +30,9 @@ pub enum Mode {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Task {
+    /// When this prompt or continuation entered the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_at: Option<i64>,
     /// Tool actions already taken in this run of work, counting toward the limit.
     #[serde(default, skip_serializing_if = "no_steps")]
     pub steps: u32,
@@ -602,6 +605,9 @@ pub struct PromptVersion {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ThreadInfo {
+    /// Local source and shared prefix of an explicitly forked chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_from: Option<(u64, usize)>,
     /// Stable identity of a conversation copied from another local application.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_from: Option<String>,
@@ -678,6 +684,10 @@ pub struct ModelChange {
 
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Turn {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_at: Option<i64>,
     /// A status from Spindle after a run failed, rather than text from the model.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub failed: bool,

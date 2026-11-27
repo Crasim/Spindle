@@ -41,6 +41,8 @@ Use the pencil beside one of your prompts to edit it. **Send** creates another v
 
 Use **Import conversations** beside **Chats**, or `/import-chat`. On desktop, select **Codex** or **Claude Code** to browse local sessions and select chats to copy. The file picker also accepts session JSONL files and the ZIP or `conversations.json` from a Claude account export. Spindle copies the visible prompts and replies. It recognizes sessions it has imported before.
 
+Choose **Export conversation…** in the chat's **…** menu or Conversation settings to save a plaintext JSON archive. It includes the selected chat and its saved branches, recorded tool calls and results, approvals, successful and failed steps, model changes, compaction notes, and available timestamps. Request, reply, and action times are UTC Unix seconds. Sync record times are Unix milliseconds. Older records without a saved time leave that field out. Review the export before sharing because it contains the saved conversation and tool data.
+
 Generated PNG and JPEG files preview in the conversation. For several images, select a thumbnail to change the main preview. Paste a URL or write a Markdown link to add a clickable link to a message.
 
 In **Settings → Models → Image generation**, refresh ComfyUI to discover checkpoints and separate diffusion models. The built-in workflows cover SDXL and supported FLUX models. Use **Add workflow** to register a ComfyUI API graph for other nodes. Give it a name and optionally set defaults for named inputs such as `{{steps}}`. The model can use `image_models` to list available choices, then select the model, workflow, and options when it calls `image`.
@@ -62,6 +64,8 @@ On Windows, Spindle sends a system notification when a reply finishes and its wi
 ### Revising work in progress
 
 Use the square **Stop** button beside **Send** to stop a reply or model tool running in this chat. Your draft stays in the composer.
+
+Spindle reads text files in pages sized for the model's context window. It can search a file first and read only the relevant lines, or follow the next page cursor for a sequential read. Automatic compaction waits until the next user request while a tool sequence is in progress.
 
 Switch between **Chat** and **Cowork** in the sidebar. The sync indicator sits beside Settings. Open **Panel → Plan** to edit the current conversation's checklist. Choose **Revise plan…** to describe a change while the model is working. Check **Replace the current objective** when the deliverable itself has changed. For example, `/goal replace Build and test a Windows Rust executable` replaces an HTML goal. Use `/plan revise Include an empty-input test` to keep the objective and amend the plan. Steering an active plan also carries your correction into subsequent tool turns.
 

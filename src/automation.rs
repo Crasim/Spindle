@@ -255,6 +255,7 @@ pub fn due(state: &mut State, t: i64) -> bool {
     }
     state.serial += 1;
     state.queue.push_back(Task {
+        queued_at: Some(now()),
         steps: 0,
         tool_result: false,
         pastes: vec![],

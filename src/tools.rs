@@ -42,6 +42,9 @@ pub enum Call {
         start: Option<usize>,
         #[serde(default)]
         lines: Option<usize>,
+        /// UTF-8 byte offset into the first line, returned when a line spans pages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offset: Option<usize>,
     },
     #[serde(rename = "file_history")]
     FileHistory {
@@ -525,14 +528,14 @@ pub fn definitions() -> serde_json::Value {
         ),
         f(
             "read",
-            "Read a text file with line numbers and its hash.",
-            serde_json::json!({"path": s("File path"), "start": {"type": "integer"}, "lines": {"type": "integer"}}),
+            "Read one page of a text file with line numbers and its hash. Follow the returned next cursor when more lines are needed.",
+            serde_json::json!({"path": s("File path"), "start": {"type": "integer"}, "lines": {"type": "integer"}, "offset": {"type": "integer", "description": "Use the byte offset from the next cursor for a long line"}}),
             &["path"]
         ),
         f(
             "search",
             "Search files for literal text.",
-            serde_json::json!({"query": s("Text to find"), "path": s("Folder to search")}),
+            serde_json::json!({"query": s("Text to find"), "path": s("File or folder to search")}),
             &["query"]
         ),
         f(
@@ -1165,7 +1168,7 @@ fn normalize(value: &mut serde_json::Value) {
         // failing the whole call.
         let known: &[&str] = match tool.as_str() {
             "list" => &["path"],
-            "read" => &["path", "start", "lines"],
+            "read" => &["path", "start", "lines", "offset"],
             "file_history" => &["path", "revision", "applied"],
             "search" => &["query", "path"],
             "patch" => &["path", "find", "replace", "hash"],
@@ -1569,6 +1572,7 @@ pub fn hash(bytes: &[u8]) -> String {
 
 const MAX_RESULT: usize = 6_000;
 const MAX_READ: u64 = 2 * 1024 * 1024;
+const READ_PAGE_BYTES: usize = 3_200;
 
 fn skip_dir(name: &str) -> bool {
     matches!(
@@ -1607,6 +1611,63 @@ fn cap(mut text: String) -> String {
     text
 }
 
+pub(crate) fn read_chunk(root: &Path, call: &Call, path: &Path, window: u64) -> Result<String> {
+    let Call::Read { start, lines, offset, .. } = call else { bail!("Not a read request") };
+    if !path.exists() {
+        bail!("{}", missing_file(root, path));
+    }
+    let body = text_of(path)?;
+    let budget = (window / 4 * 3).clamp(256, READ_PAGE_BYTES as u64) as usize;
+    read_page(root, path, &body, start.unwrap_or(1).max(1),
+        lines.unwrap_or(80).clamp(1, 400), offset.unwrap_or(0), budget)
+}
+
+fn read_page(root: &Path, path: &Path, body: &str, start: usize, count: usize, offset: usize, budget: usize) -> Result<String> {
+    use std::fmt::Write as _;
+    let name = rel(root, path);
+    let all: Vec<_> = body.lines().collect();
+    let hash = hash(body.as_bytes());
+    if all.is_empty() {
+        return Ok(format!("{name} · empty file · hash {hash}"));
+    }
+    ensure!(start <= all.len(), "{name} ends at line {}. Choose a start from 1 to {}.", all.len(), all.len());
+    let first = all[start - 1];
+    ensure!(offset <= first.len() && first.is_char_boundary(offset), "Use the byte offset returned by the previous page, or start at the beginning of the line");
+    let mut page = String::new();
+    let mut last = start;
+    let mut next = (start, offset);
+    for (index, line) in all.iter().enumerate().skip(start - 1).take(count) {
+        let number = index + 1;
+        let skip = if number == start { offset } else { 0 };
+        let prefix = if skip == 0 { format!("{number:>5}  ") } else { format!("{number:>5} +{skip}  ") };
+        let remaining = &line[skip..];
+        let room = budget.saturating_sub(page.len() + prefix.len() + 1);
+        if remaining.len() > room && !page.is_empty() {
+            break;
+        }
+        let end = remaining.floor_char_boundary(remaining.len().min(room));
+        writeln!(page, "{prefix}{}", &remaining[..end])?;
+        last = number;
+        if end < remaining.len() {
+            next = (number, skip + end);
+            break;
+        }
+        next = (number + 1, 0);
+    }
+    let mut text = format!("{name} · lines {start}-{last} of {} · hash {hash}\n{page}", all.len());
+    if next.0 <= all.len() {
+        let mut args = serde_json::json!({"path": name, "start": next.0, "lines": count});
+        if next.1 != 0 {
+            args["offset"] = next.1.into();
+        }
+        let call = format!(r#"{{"name":"read","args":{args}}}"#);
+        write!(text, "\nMore remains. Next page: {call}\nFor a specific term, search this file and start near the matching line.")?;
+    } else {
+        text.push_str("\nEnd of file.");
+    }
+    Ok(text)
+}
+
 /// Run a call that the broker has allowed. `path` is the resolved target from `classify`.
 pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<String> {
     run_scoped(root, call, path, replace_file, |_| true)
@@ -1643,27 +1704,8 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
             }
             text
         }
-        Call::Read { start, lines, .. } => {
-            if !path.exists() {
-                bail!("{}", missing_file(root, path));
-            }
-            let body = text_of(path)?;
-            let all: Vec<&str> = body.lines().collect();
-            let start = start.unwrap_or(1).max(1);
-            let count = lines.unwrap_or(200).clamp(1, 400);
-            let end = (start - 1 + count).min(all.len());
-            let mut text = format!(
-                "{} · lines {}-{} of {} · hash {}\n",
-                rel(root, path),
-                start.min(all.len().max(1)),
-                end,
-                all.len(),
-                hash(body.as_bytes())
-            );
-            for (i, line) in all.iter().enumerate().take(end).skip(start - 1) {
-                text.push_str(&format!("{:>5}  {line}\n", i + 1));
-            }
-            text
+        Call::Read { .. } => {
+            return read_chunk(root, call, path, crate::compaction::UNKNOWN_WINDOW);
         }
         Call::FileHistory { revision, .. } => {
             let (working, inside) = resolve(root, call.raw_path())?;
@@ -1686,6 +1728,22 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 "Search for 1 to 200 characters"
             );
             let mut hits = vec![];
+            let collect = |path: &Path, hits: &mut Vec<String>| -> Result<()> {
+                let body = text_of(path)?;
+                for (n, line) in body.lines().enumerate() {
+                    if let Some(at) = line.find(query.as_str()) {
+                        let from = line.floor_char_boundary(at.saturating_sub(55));
+                        hits.push(format!("{}:{}: {}", rel(root, path), n + 1, short(line[from..].trim(), 160)));
+                        if hits.len() >= 50 {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            };
+            if path.is_file() {
+                collect(path, &mut hits)?;
+            }
             let mut stack = vec![path.to_owned()];
             let mut files = 0;
             while let Some(dir) = stack.pop() {
@@ -1708,19 +1766,9 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                         }
                     } else if kind.is_file() {
                         files += 1;
-                        let Ok(body) = text_of(&p) else { continue };
-                        for (n, line) in body.lines().enumerate() {
-                            if line.contains(query.as_str()) {
-                                hits.push(format!(
-                                    "{}:{}: {}",
-                                    rel(root, &p),
-                                    n + 1,
-                                    short(line.trim(), 160)
-                                ));
-                                if hits.len() >= 50 {
-                                    break;
-                                }
-                            }
+                        let _ = collect(&p, &mut hits);
+                        if hits.len() >= 50 {
+                            break;
                         }
                     }
                 }
@@ -2043,6 +2091,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn file_pages_resume_exactly_at_the_unread_line_or_byte() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let path = root.join("paged.txt");
+        let rows = (1..=120).map(|i| format!("line-{i:03} {}", "text ".repeat(17))).collect::<Vec<_>>();
+        let long = format!("{} unique-target {}", "é".repeat(2100), "ø".repeat(1800));
+        std::fs::write(&path, format!("{}\n{long}\nlast line\n", rows.join("\n")))?;
+        let mut call = Call::Read { path: "paged.txt".into(), start: None, lines: Some(400), offset: None };
+        let mut completed = false;
+        let mut previous = (0, 0);
+        let mut receipts = String::new();
+        for _ in 0..40 {
+            let page = read_chunk(&root, &call, &path, 2048)?;
+            assert!(page.len() < 2_000, "{page}");
+            assert!(!page.contains("(cut;"));
+            receipts.push_str(&page);
+            let Some(next) = page.lines().find_map(|line| line.strip_prefix("More remains. Next page: ")) else {
+                assert!(page.contains("End of file.") && page.contains("last line"));
+                completed = true;
+                break;
+            };
+            let (_, next) = extract(next);
+            let next = next.unwrap().unwrap().call;
+            let Call::Read { start, offset, .. } = &next else { panic!("Expected a read cursor") };
+            let position = (start.unwrap(), offset.unwrap_or(0));
+            assert!(position > previous);
+            previous = position;
+            call = next;
+        }
+        assert!(completed);
+        for i in 1..=120 {
+            assert_eq!(receipts.matches(&format!("line-{i:03}")).count(), 1);
+        }
+        assert_eq!(receipts.matches("unique-target").count(), 1);
+        let search = Call::Search { path: Some("paged.txt".into()), query: "unique-target".into() };
+        let hit = run(&root, &search, &path, false)?;
+        assert!(hit.contains("paged.txt:121:") && hit.contains("unique-target"));
+        Ok(())
+    }
+
+    #[test]
     fn streaming_tool_calls_show_as_one_line() {
         let partial = "I'll write the game.\n\n{\"name\":\"create\",\"args\":{\"path\":\"snake.html\",\"content\":\"<!DOCTYPE html><html><body><canvas";
         let shown = streaming_view(partial);
@@ -2163,7 +2252,8 @@ mod tests {
             Call::Read {
                 path: "a.py".into(),
                 start: None,
-                lines: None
+                lines: None,
+                offset: None,
             }
         );
         let bad = |s: &str| {
@@ -2292,6 +2382,7 @@ mod tests {
             path: "src/a.py".into(),
             start: None,
             lines: None,
+            offset: None,
         };
         let (risk, path) = classify(&root, &read, false).unwrap();
         assert_eq!(risk, Risk::Read);
@@ -2335,6 +2426,7 @@ mod tests {
             path: "/etc/hostname".into(),
             start: None,
             lines: None,
+            offset: None,
         };
         assert_eq!(classify(&root, &abs, false).unwrap().0, Risk::ReadOutside);
         let create = Call::Create {

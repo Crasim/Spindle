@@ -414,6 +414,7 @@ impl Engine {
             Action::Branch => {
                 let mut c = self.state.conversation(id)?;
                 make_branch(&mut c);
+                c.thread.forked_from = Some((id, c.history.len()));
                 self.state.serial += 1;
                 let new_id = self.state.serial;
                 self.state.chats.insert(new_id, c);
@@ -514,6 +515,7 @@ fn make_branch(c: &mut Conversation) {
     c.thread.imported_from = None;
     c.thread.prompt_versions.clear();
     c.thread.prompt_family = None;
+    c.thread.forked_from = None;
     c.thread.pending_steering.clear();
     // A scratch branch may get a different artifact directory.
     for turn in c.thread.turns.values_mut() {

@@ -23,6 +23,7 @@ mod claude_console;
 mod comfy;
 mod connectors;
 mod conversation_import;
+mod conversation_export;
 mod compaction;
 mod control;
 mod desktop;

@@ -292,33 +292,49 @@ fn close_row_options(ui: &egui::Ui) {
     ui.data_mut(|data| data.remove::<egui::Id>(egui::Id::new("sidebar-row-options")));
 }
 
-#[cfg(windows)]
 fn export_transcript(
+    view: &crate::engine::View,
     id: u64,
-    title: &str,
-    history: &[crate::ollama::Message],
+    preview: &tokio::sync::watch::Receiver<String>,
 ) -> anyhow::Result<Option<PathBuf>> {
-    let stem: String = title
-        .chars()
-        .take(60)
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let stream = view.busy.then(|| {
+        view.state.queue.front().map(|task| (task.origin.unwrap_or(view.state.chat_id), preview.borrow().clone()))
+    }).flatten();
+    let bytes = crate::conversation_export::archive(&view.state, id, stream.as_ref().map(|(chat, partial)| (*chat, partial.as_str())))?;
+    let name = format!("Spindle-chat-{id}-{}.json", chrono::Utc::now().format("%Y%m%d-%H%M%S%.3f"));
+    #[cfg(target_os = "android")]
+    return crate::android::download_file(&name, &bytes).map(|path| Some(path.into()));
+    #[cfg(windows)]
     let Some(path) = rfd::FileDialog::new()
-        .set_title("Export a plaintext Markdown transcript")
-        .set_file_name(format!("Thread-{id}-{stem}.md"))
-        .add_filter("Markdown", &["md"])
+        .set_title("Export a plaintext conversation archive")
+        .set_file_name(name)
+        .add_filter("Spindle conversation archive", &["json"])
         .save_file()
     else {
         return Ok(None);
     };
-    super::export_skill(&path, &transcript(title, history))?;
-    Ok(Some(path))
+    #[cfg(target_os = "linux")]
+    let path = {
+        let home = std::env::var_os("HOME").ok_or_else(|| anyhow::anyhow!("Downloads folder is unavailable"))?;
+        let folder = PathBuf::from(home).join("Downloads");
+        std::fs::create_dir_all(&folder)?;
+        folder.join(name)
+    };
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        crate::tools::write_generated(&path, &bytes, cfg!(windows))?;
+        Ok(Some(path))
+    }
+    #[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
+    anyhow::bail!("Conversation export is unavailable on this platform")
+}
+
+fn export_message(result: anyhow::Result<Option<PathBuf>>) -> String {
+    match result {
+        Ok(Some(path)) => format!("Exported to {}", projects::display_path(&path)),
+        Ok(None) => String::new(),
+        Err(err) => format!("Could not export the conversation: {err:#}"),
+    }
 }
 impl Editor {
     fn refresh_project(&mut self, current: Option<&std::path::Path>) {
@@ -815,6 +831,12 @@ impl Desktop {
                                     ui.ctx().copy_text(transcript(&title, h));
                                 }
                             }
+                            if menu_item(ui, Icon::Reader, "Export conversation…") {
+                                let result = export_transcript(&self.view, id, &self.preview);
+                                let notice = export_message(result);
+                                if !notice.is_empty() { self.notice = notice; }
+                                close_row_options(ui);
+                            }
                             if menu_item(
                                 ui,
                                 Icon::Archive,
@@ -1058,20 +1080,12 @@ impl Desktop {
                         {
                             editor.confirm_delete = true;
                         }
-                        #[cfg(windows)]
                         if ui
-                            .link(Text::new("Export Markdown…").size(13.).color(muted()))
-                            .on_hover_text("Save a plaintext copy for sharing")
+                            .link(Text::new("Export conversation…").size(13.).color(muted()))
+                            .on_hover_text("Save plaintext JSON with chat messages, branches, and tool activity")
                             .clicked()
                         {
-                            match export_transcript(id, label, history) {
-                                Ok(Some(path)) => {
-                                    editor.feedback =
-                                        format!("Exported to {}", projects::display_path(&path))
-                                }
-                                Err(err) => editor.feedback = err.to_string(),
-                                Ok(None) => {}
-                            }
+                            editor.feedback = export_message(export_transcript(&self.view, id, &self.preview));
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             let changed = editor.title != editor.saved_title
