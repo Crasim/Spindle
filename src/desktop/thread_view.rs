@@ -122,6 +122,64 @@ enum Entry<R> {
     Project(std::path::PathBuf, String, usize, bool),
     Row(R),
 }
+
+type ThreadRow = (u64, bool, bool, String, String, bool, Option<PathBuf>);
+
+fn thread_entries(
+    mut rows: Vec<ThreadRow>,
+    library: &[(PathBuf, String)],
+    archived: bool,
+    hidden: bool,
+    collapsed: &BTreeSet<PathBuf>,
+) -> Vec<Entry<ThreadRow>> {
+    rows.retain(|row| row.2 == archived);
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.3.cmp(&b.3)).then_with(|| b.0.cmp(&a.0)));
+
+    let known: BTreeSet<_> = library.iter().map(|(path, _)| path.as_path()).collect();
+    let mut projects = library.to_vec();
+    let mut grouped = BTreeMap::<PathBuf, Vec<ThreadRow>>::new();
+    let mut standalone = Vec::new();
+    for row in rows {
+        if let Some(path) = &row.6 {
+            if let Some(mine) = grouped.get_mut(path) {
+                mine.push(row);
+            } else {
+                if !known.contains(path.as_path()) {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    projects.push((path.clone(), name));
+                }
+                grouped.insert(path.clone(), vec![row]);
+            }
+        } else {
+            standalone.push(row);
+        }
+    }
+
+    let mut entries = Vec::new();
+    if !archived || !projects.is_empty() {
+        entries.push(Entry::ProjectsHeader(projects.len(), hidden));
+    }
+    if !hidden {
+        for (path, name) in projects {
+            let mine = grouped.remove(&path).unwrap_or_default();
+            if archived && mine.is_empty() { continue; }
+            let closed = collapsed.contains(&path);
+            entries.push(Entry::Project(path, name, mine.len(), closed));
+            if !closed { entries.extend(mine.into_iter().map(Entry::Row)); }
+        }
+    }
+    entries.push(Entry::ChatsHeader);
+    let mut group: Option<String> = None;
+    for row in standalone {
+        let heading = if row.1 { "Pinned" } else if row.3.is_empty() { "Recent" } else { &row.3 };
+        if group.as_deref() != Some(heading) {
+            group = Some(heading.to_owned());
+            entries.push(Entry::Heading(heading.to_owned(), false));
+        }
+        entries.push(Entry::Row(row));
+    }
+    entries
+}
 struct Editor {
     title: String,
     saved_title: String,
@@ -399,7 +457,7 @@ impl Desktop {
         let mut edit = None;
         let mut delete_dialog = None;
         let state = &self.view.state;
-        let mut rows: Vec<_> = std::iter::once(state.chat_id)
+        let rows: Vec<_> = std::iter::once(state.chat_id)
             .chain(state.chats.keys().copied())
             .filter_map(|id| {
                 let (t, h) = state.thread_data(id)?;
@@ -425,11 +483,6 @@ impl Desktop {
                 })
             })
             .collect();
-        rows.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| a.3.cmp(&b.3))
-                .then_with(|| b.0.cmp(&a.0))
-        });
         ui.add_space(6.);
         ui.horizontal(|ui| {
             ui.strong(if self.threads.archived {
@@ -449,67 +502,14 @@ impl Desktop {
             }
         });
         let archived = self.threads.archived;
-        let rows: Vec<_> = rows.into_iter().filter(|r| r.2 == archived).collect();
-        let mut projects: Vec<(std::path::PathBuf, String)> = self
+        let library: Vec<_> = self
             .projects
             .recent
             .iter()
             .filter(|p| p.path != self.root)
             .map(|p| (p.path.clone(), p.name.clone()))
             .collect();
-        for r in &rows {
-            if let Some(p) = &r.6 {
-                if !projects.iter().any(|(q, _)| q == p) {
-                    let name = p.file_name().unwrap_or_default().to_string_lossy().into();
-                    projects.push((p.clone(), name));
-                }
-            }
-        }
-        let mut entries = vec![];
-        let any_project = !archived || !projects.is_empty();
-        let hidden = self.threads.projects_hidden;
-        if any_project {
-            entries.push(Entry::ProjectsHeader(projects.len(), hidden));
-        }
-        for (path, name) in projects.into_iter().filter(|_| !hidden) {
-            let mine: Vec<_> = rows
-                .iter()
-                .filter(|r| r.6.as_ref() == Some(&path))
-                .cloned()
-                .collect();
-            if archived && mine.is_empty() {
-                continue;
-            }
-            let collapsed = self.threads.collapsed.contains(&path);
-            entries.push(Entry::Project(path, name, mine.len(), collapsed));
-            if !collapsed {
-                entries.extend(mine.into_iter().map(Entry::Row));
-            }
-        }
-        let mut group: Option<String> = None;
-        let _ = any_project;
-        entries.push(Entry::ChatsHeader);
-        for r in rows.into_iter().filter(|r| r.6.is_none()) {
-            let heading = if r.1 {
-                "Pinned".to_owned()
-            } else if r.3.is_empty() {
-                "Recent".to_owned()
-            } else {
-                r.3.clone()
-            };
-            if group.as_deref() != Some(heading.as_str()) {
-                group = Some(heading.clone());
-                entries.push(Entry::Heading(heading, false));
-            }
-            entries.push(Entry::Row(r));
-        }
-        let library: Vec<(std::path::PathBuf, String)> = self
-            .projects
-            .recent
-            .iter()
-            .filter(|p| p.path != self.root)
-            .map(|p| (p.path.clone(), p.name.clone()))
-            .collect();
+        let entries = thread_entries(rows, &library, archived, self.threads.projects_hidden, &self.threads.collapsed);
         let mut toggle = None;
         let mut start_in = None;
         let mut toggle_projects = false;
@@ -1197,6 +1197,45 @@ impl Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_groups_threads_in_library_and_section_order() {
+        let known = PathBuf::from("known");
+        let empty = PathBuf::from("empty");
+        let discovered = PathBuf::from("discovered");
+        let library = vec![(known.clone(), "Known".into()), (empty, "Empty".into())];
+        let row = |id, pinned, archived, section: &str, project| {
+            (id, pinned, archived, section.into(), format!("chat {id}"), false, project)
+        };
+        let rows = vec![
+            row(1, false, false, "", Some(known.clone())),
+            row(2, true, false, "", Some(discovered.clone())),
+            row(3, false, false, "", Some(known.clone())),
+            row(4, true, false, "", None),
+            row(5, false, false, "Ideas", None),
+            row(6, false, true, "", Some(known.clone())),
+            row(7, false, false, "", None),
+            row(8, false, false, "", Some(discovered.clone())),
+        ];
+        let summarize = |entries: Vec<Entry<ThreadRow>>| entries.into_iter().map(|entry| match entry {
+            Entry::ProjectsHeader(count, hidden) => format!("projects {count} {hidden}"),
+            Entry::ChatsHeader => "chats".into(),
+            Entry::Heading(name, _) => name,
+            Entry::Project(_, name, count, closed) => format!("{name} {count} {closed}"),
+            Entry::Row(row) => row.4,
+        }).collect::<Vec<_>>();
+        let collapsed = BTreeSet::from([discovered]);
+        assert_eq!(summarize(thread_entries(rows.clone(), &library, false, false, &collapsed)), [
+            "projects 3 false", "Known 2 false", "chat 3", "chat 1", "Empty 0 false", "discovered 2 true",
+            "chats", "Pinned", "chat 4", "Recent", "chat 7", "Ideas", "chat 5",
+        ]);
+        assert_eq!(summarize(thread_entries(rows.clone(), &library, true, false, &collapsed)), [
+            "projects 2 false", "Known 1 false", "chat 6", "chats",
+        ]);
+        assert_eq!(summarize(thread_entries(rows, &library, false, true, &collapsed)), [
+            "projects 3 true", "chats", "Pinned", "chat 4", "Recent", "chat 7", "Ideas", "chat 5",
+        ]);
+    }
     use egui::{Event, PointerButton, Pos2};
 
     // Drive the same sidebar and settings windows as the desktop, without creating a native window.

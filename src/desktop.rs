@@ -513,6 +513,8 @@ struct TranscriptRows {
     geometry: Option<(f32, f32, f32, bool, bool, Color)>,
     heights: Vec<Option<f32>>,
     estimates: Vec<f32>,
+    /// Height of each complete block of ordinary rows, excluding blocks with transcript controls.
+    block_heights: Vec<Option<f32>>,
     repeated: Vec<bool>,
     groups: Vec<Option<usize>>,
     markdown: std::collections::BTreeMap<usize, reader::Markdown>,
@@ -522,6 +524,23 @@ struct TranscriptRows {
 }
 
 type ArtifactMetadata = (String, Option<usize>, Option<egui::ColorImage>);
+const TRANSCRIPT_BLOCK: usize = 64;
+
+fn message_model_change(state: &crate::state::State, index: usize) -> Option<&crate::state::ModelChange> {
+    let row = if state.history[index].role == "user" {
+        index + 1
+    } else if index == 0 || state.history[index - 1].role != "user" {
+        index
+    } else {
+        return None;
+    };
+    state.thread.turns.get(&row)?.model_selection.as_ref()
+}
+
+fn ordinary_transcript_row(state: &crate::state::State, groups: &[Option<usize>], index: usize) -> bool {
+    groups[index].is_none() && !state.thread.compactions.contains_key(&index)
+        && !state.thread.plan_notes.contains_key(&index) && !state.thread.tool_results.contains(&index)
+}
 
 fn image_artifact(name: &str) -> bool {
     Path::new(name).extension().and_then(|ext| ext.to_str())
@@ -619,11 +638,16 @@ impl TranscriptRows {
         if common != before.history.len() || common != after.history.len() {
             self.repeated.clear();
             self.groups.clear();
+            self.block_heights.clear();
         }
         if before.thread.tool_results != after.thread.tool_results
             || before.thread.turns.iter().filter(|(_, turn)| turn.tool.is_some()).map(|(index, _)| index)
                 .ne(after.thread.turns.iter().filter(|(_, turn)| turn.tool.is_some()).map(|(index, _)| index)) {
             self.groups.clear();
+            self.block_heights.clear();
+        }
+        if before.thread.compactions != after.thread.compactions || before.thread.plan_notes != after.thread.plan_notes {
+            self.block_heights.clear();
         }
         self.heights.truncate(common);
         self.estimates.truncate(common);
@@ -636,6 +660,7 @@ impl TranscriptRows {
                         != after.thread.turns.get(&(index + 1)).map(|turn| &turn.pastes))
             {
                 *height = None;
+                self.block_heights.clear();
                 self.markdown.remove(&index);
                 if let Some(turn) = after.thread.turns.get(&index) {
                     for file in &turn.files {
@@ -658,6 +683,7 @@ impl TranscriptRows {
             self.geometry = Some(geometry);
             self.heights.clear();
             self.estimates.clear();
+            self.block_heights.clear();
             self.markdown.clear();
         }
         self.heights.resize(state.history.len(), None);
@@ -707,6 +733,19 @@ impl TranscriptRows {
             };
             self.estimates.push(48. + lines as f32 * (font + 4.));
         }
+        // The final row may have a Continue goal button. Keep it on the individual row path.
+        let blocks = state.history.len().saturating_sub(1) / TRANSCRIPT_BLOCK;
+        if self.block_heights.len() != blocks {
+            use egui::emath::GuiRounding as _;
+            self.block_heights = (0..blocks).map(|block| {
+                let start = block * TRANSCRIPT_BLOCK;
+                let rows = start..start + TRANSCRIPT_BLOCK;
+                let plain = rows.clone().all(|i| ordinary_transcript_row(state, &self.groups, i)
+                    && message_model_change(state, i).is_none()
+                    && !state.thread.turns.get(&i).is_some_and(|turn| turn.fallback_from.is_some()));
+                plain.then(|| rows.map(|i| self.heights[i].unwrap_or(self.estimates[i]).round_ui()).sum())
+            }).collect();
+        }
     }
 
     fn read_file_sizes(&mut self, ui: &egui::Ui, workspace: &Path, state: &crate::state::State,
@@ -734,12 +773,16 @@ impl TranscriptRows {
     }
 
     fn skip(ui: &mut egui::Ui, height: f32) -> bool {
+        Self::skip_rows(ui, height, 1)
+    }
+
+    fn skip_rows(ui: &mut egui::Ui, height: f32, rows: usize) -> bool {
         let top = ui.cursor().top();
         let clip = ui.clip_rect();
         // Keep a buffer in both directions so a scroll gesture has rows ready to paint.
         if top + height < clip.top() - 160. || top > clip.bottom() + 160. {
             ui.add_space(height);
-            ui.skip_ahead_auto_ids(1);
+            ui.skip_ahead_auto_ids(rows);
             return true;
         }
         false
@@ -2073,7 +2116,21 @@ impl Desktop {
                 let mut toggle_steps=None;
                 // The box drawn behind the current group of steps: its shape slot, top and start.
                 let mut group_box: Option<(egui::layers::ShapeIdx,f32,usize)>=None;
-                for (index,message) in state.history.iter().enumerate() {
+                let mut next_row = 0;
+                while next_row < state.history.len() {
+                    let index = next_row;
+                    let end = index + TRANSCRIPT_BLOCK;
+                    if index % TRANSCRIPT_BLOCK == 0 && group_box.is_none()
+                        && let Some(Some(height)) = self.transcript.block_heights.get(index / TRANSCRIPT_BLOCK)
+                        && !editing_row.is_some_and(|row| (index..end).contains(&row))
+                        && !copy_rows.as_ref().is_some_and(|rows| *rows.start() < end && *rows.end() >= index)
+                        && TranscriptRows::skip_rows(ui, *height, TRANSCRIPT_BLOCK)
+                    {
+                        next_row = end;
+                        continue;
+                    }
+                    next_row += 1;
+                    let message = &state.history[index];
                     let copy_row = copy_rows.as_ref().is_some_and(|rows| rows.contains(&index));
                     chat_text.message(index);
                     if let Some((slot,top,s))=group_box && groups[index]!=Some(s) {
@@ -2083,12 +2140,7 @@ impl Desktop {
                     if let Some(n)=state.thread.compactions.get(&index) { compaction_divider(ui,*n); }
                     let turn = state.thread.turns.get(&index);
                     let user = message.role == "user";
-                    let selected = if user {
-                        state.thread.turns.get(&(index + 1)).and_then(|turn| turn.model_selection.as_ref())
-                    } else if index == 0 || state.history[index - 1].role != "user" {
-                        turn.and_then(|turn| turn.model_selection.as_ref())
-                    } else { None };
-                    if let Some(change) = selected {
+                    if let Some(change) = message_model_change(state, index) {
                         self.model_divider(ui, &change.from, &change.to, false);
                     }
                     if let Some(turn) = turn && let Some(from) = &turn.fallback_from {
@@ -2115,8 +2167,7 @@ impl Desktop {
                         }
                         if !open {continue;}
                     }
-                    let cache_row = groups[index].is_none() && !state.thread.compactions.contains_key(&index)
-                        && !state.thread.plan_notes.contains_key(&index) && !state.thread.tool_results.contains(&index)
+                    let cache_row = ordinary_transcript_row(state, groups, index)
                         && editing_row != Some(index) && !(index + 1 == state.history.len()
                             && state.can_continue_stopped_goal());
                     if cache_row && !copy_row && TranscriptRows::skip(ui,
@@ -2295,7 +2346,14 @@ impl Desktop {
                     });
                     });
                     });
-                    self.transcript.heights[index] = cache_row.then(|| ui.cursor().top() - top);
+                    let height = cache_row.then(|| ui.cursor().top() - top);
+                    if let Some(Some(total)) = self.transcript.block_heights.get_mut(index / TRANSCRIPT_BLOCK) {
+                        use egui::emath::GuiRounding as _;
+                        let estimate = self.transcript.estimates[index];
+                        *total += height.unwrap_or(estimate).round_ui()
+                            - self.transcript.heights[index].unwrap_or(estimate).round_ui();
+                    }
+                    self.transcript.heights[index] = height;
                 }
                 if let Some((slot,top,_))=group_box { close_group_box(ui,slot,top); }
                 if let Some(index) = visible_row && self.transcript.markdown.len() > 96 {
@@ -3750,6 +3808,32 @@ mod transcript_tests {
         let copied = draw(&ctx, &mut app, 49, vec![Event::Copy]);
         assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
             egui::OutputCommand::CopyText(text) if text.contains("Message 0") && text.contains("Message 79"))));
+    }
+
+    #[test]
+    fn transcript_rechecks_blocks_when_special_rows_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 180);
+        // A model change on the next turn belongs before the user row at the end of the block.
+        app.view.state.history[TRANSCRIPT_BLOCK - 1].role = "user".into();
+        draw_at_width(&ctx, &mut app, 0, vec![], 360.);
+        assert_eq!(app.transcript.block_heights.len(), 2);
+        assert!(app.transcript.block_heights.iter().all(Option::is_some));
+
+        let before = app.view.state.clone();
+        app.view.state.thread.turns.insert(TRANSCRIPT_BLOCK, crate::state::Turn {
+            model_selection: Some(crate::state::ModelChange { from: "old".into(), to: "new".into() }),
+            ..Default::default()
+        });
+        app.view.state.thread.compactions.insert(TRANSCRIPT_BLOCK + 5, 12);
+        app.transcript.observe(&before, &app.view.state);
+        draw_at_width(&ctx, &mut app, 1, vec![], 360.);
+        assert_eq!(app.transcript.block_heights, vec![None, None]);
+
+        app.transcript.observe(&app.view.state, &before);
+        app.view.state = before;
+        draw_at_width(&ctx, &mut app, 2, vec![], 360.);
+        assert!(app.transcript.block_heights.iter().all(Option::is_some));
     }
 
     #[test]
