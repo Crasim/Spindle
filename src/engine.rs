@@ -2027,7 +2027,7 @@ const BROWSER_LINK_BLOCKED: &str =
 pub(crate) const SITE_BLOCKED: &str =
     "This tab matches a rule in Settings › Computer use › Website access › Blocklist. Remove that rule there if you want to allow this site.";
 const TOOL_ACCESS_GUIDANCE: &str =
-    "Use tools before claiming inability. Ask before destructive actions. Honor denials. If a setting blocks a tool, explain how to change it.";
+    "Try offered tools. Ask before destructive actions. Honor denials and explain settings that block access.";
 
 pub(crate) fn browser_access_blocker(state: &State) -> Option<&'static str> {
     if state.preferences.block_web {
@@ -2118,7 +2118,8 @@ fn requested_browser_page(state: &State, chat: u64, suggested: Option<&str>) -> 
 pub(crate) const BROWSER_TOOL_EXAMPLE: &str =
     r#"{"name":"browser_tab","args":{"action":"read"}}"#;
 
-const TOOL_CALL_GUIDANCE: &str = "Call one offered tool and wait for its result. Use the provider's native function when available. Otherwise put one JSON object in a spindle-tool fenced block and end the reply immediately after it. If web_search is offered, use it for current prices, reviews, availability, and other changing facts before answering. Cite verified URLs with Markdown links using the source name as the label. Report only what the tool confirmed.";
+const TOOL_CALL_GUIDANCE: &str = "Call one tool, then wait. Use its native function or send one JSON object in a spindle-tool fenced block.";
+const WEB_RESEARCH_GUIDANCE: &str = "Use web_search for current prices, reviews, availability, and other changing facts. Verify details and cite sources with Markdown links.";
 const WEB_SEARCH_EXAMPLE: &str =
     r#"- Search public pages: {"name":"web_search","args":{"query":"public search terms"}}"#;
 
@@ -2237,6 +2238,8 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
             system.push_str(WEB_SEARCH_EXAMPLE);
             system.push_str(r#"
 - Read a result: {"name":"web_open","args":{"url":"https://example.com/"}}"#);
+            system.push_str("\n");
+            system.push_str(WEB_RESEARCH_GUIDANCE);
         }
         let builtin = wants_builtin_browser(&task.text)
             || ((task.tool_result || browser_retry(&task.text)) && builtin_browser_request(state, origin));
@@ -2459,6 +2462,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         || ((followup || browser_retry(request)) && builtin_browser_request(state, chat));
     let browser_request = wants_browser_link(request) || wants_browser_link(&first_user);
     if !state.preferences.block_web && (builtin || needs_web_address(request) || needs_web_address(&first_user)) {
+        tools.push(WEB_RESEARCH_GUIDANCE.into());
         tools.push(WEB_ADDRESS_GUIDANCE.into());
         if needs_web_region(request) || (followup || browser_retry(request))
             && needs_web_region(browser_prompt(state, chat)) {
@@ -2628,7 +2632,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         format!("You are Spindle. You do tasks by using tools on the files in {place}.")
     };
     let mut text = format!(
-        "{introduction}\n\n{TOOL_CALL_GUIDANCE}\n\nYour tools:\n{}\n\nHow to work:\n1. Before you change a file that already exists, read it. (A new file needs no reading: just create it.)\n2. Make one change at a time.\n3. After editing, check your work: {check}.\n4. Summarize the result. Spindle presents your files.",
+        "{introduction}\n\n{TOOL_CALL_GUIDANCE}\n\nTools:\n{}\n\nHow to work:\n1. Before you change a file that already exists, read it. (A new file needs no reading: just create it.)\n2. Make one change at a time.\n3. Verify edits: {check}.\n4. Report the result.",
         tools.join("\n")
     );
     text.push_str("\n\n");
@@ -2638,7 +2642,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         text.push_str(browser_link_status(state, chat));
         text.push_str("\n\n");
     }
-    text.push_str("Installed skills (descriptions only):\n");
+    text.push_str("Skills:\n");
     text.push_str(&state.skill_catalog(12));
     if paired_tab && [request, &first_user].iter().any(|prompt|
         prompt.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word.eq_ignore_ascii_case("cart"))
