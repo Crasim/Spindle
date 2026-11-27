@@ -8723,8 +8723,11 @@ impl Engine {
                             let id=Provider::new_id()?;
                             let vault=format!("{:x}-{id}",hash.finish());
                             let client=self.api.0.clone();
+                            let warning = form.uses_remote_http();
                             connecting=Some(tokio::spawn(async move{Provider::connect(form,id,vault,&client).await}));
-                            return Ok("Connecting to provider…".into());
+                            return Ok(if warning {
+                                format!("Connecting to provider… {}", crate::providers::PLAIN_HTTP_WARNING)
+                            } else { "Connecting to provider…".into() });
                         }
                         if cmd=="/refresh" && args!="ollama" {
                             let mut p = self.state.providers.iter().find(|p|p.id==args).cloned().context("Unknown provider")?;

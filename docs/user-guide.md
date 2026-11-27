@@ -69,6 +69,8 @@ In a project chat, ask about a previous discussion or name a distinctive topic f
 
 Use **Settings → Model providers → Add provider** to test and save an LM Studio, OpenAI, OpenRouter, Anthropic, or custom Chat Completions connection. Enter the provider's API base URL, including its API version path, and supply a key if required. Spindle fetches the model list. Windows Credential Manager stores keys. Selecting a hosted model sends its request context to that provider. Accounts and billing are managed with the provider.
 
+Model servers accept HTTP and HTTPS addresses. Spindle warns when a remote HTTP connection carries prompts, replies, and any API key in plain text. Use HTTPS when the server supports it.
+
 Add multiple connections of the same type. Each connection has its own address, catalog and optional key. Leave the display name empty to use the suggested name, such as **Ollama-2**, or enter your own.
 
 Click the model control beside the message box or press **Ctrl+K**. Search by model or provider, star favorites, and select a result. Icons beside each model show what it accepts beyond text: an eye for images and sound waves for audio. A brain marks models that can reason. Spindle reads these from Ollama's reported capabilities and provider catalogs, and otherwise from known model families. They describe the model; Spindle does not yet send images or audio.

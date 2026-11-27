@@ -1,5 +1,17 @@
 use super::*;
 
+fn warn_unencrypted_http(ui: &mut egui::Ui) {
+    let color = if ui.visuals().dark_mode {
+        Color::from_rgb(232, 178, 64)
+    } else {
+        Color::from_rgb(139, 82, 12)
+    };
+    ui.add(
+        egui::Label::new(Text::new(crate::providers::PLAIN_HTTP_WARNING).color(color).size(13.))
+            .wrap(),
+    );
+}
+
 const TEMPLATES: &[(&str, &str, Protocol)] = &[
     (
         "Claude · Anthropic API",
@@ -2110,6 +2122,11 @@ impl Desktop {
                         connect = Some(server.clone());
                     }
                 });
+                if !active && matches!(server.kind, Kind::Ollama | Kind::Compatible)
+                    && crate::providers::uses_remote_http(&server.url)
+                {
+                    warn_unencrypted_http(ui);
+                }
             }
         });
         if let Some(server) = connect {
@@ -2142,6 +2159,9 @@ impl Desktop {
                     ui.weak(format!("{count} models"));
                 });
                 ui.add(egui::Label::new(Text::new(base).monospace().size(12.).color(muted())).wrap());
+                if crate::providers::uses_remote_http(base) {
+                    warn_unencrypted_http(ui);
+                }
                 ui.horizontal_wrapped(|ui| {
                         if id != "ollama-cloud" && ui.small_button("Remove").clicked() {
                             self.remove_provider = Some(id.into());
@@ -2333,6 +2353,9 @@ impl Desktop {
                 "Test & connect"
             }
         };
+        if self.connection.uses_remote_http() {
+            warn_unencrypted_http(ui);
+        }
         if !self.settings_feedback.is_empty() {
             ui.label(Text::new(&self.settings_feedback).color(accent()));
         }

@@ -29,7 +29,7 @@ pub fn address(value: &str) -> Result<String> {
             && url.password().is_none()
             && url.query().is_none()
             && url.fragment().is_none(),
-        "Enter an HTTP or HTTPS base address without credentials or query parameters"
+        "Enter an HTTP or HTTPS base address without credentials, query parameters, or a fragment"
     );
     Ok(url.as_str().trim_end_matches('/').to_owned())
 }

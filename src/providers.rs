@@ -42,6 +42,16 @@ pub struct Connection {
     pub key: String,
 }
 
+impl Connection {
+    pub(crate) fn uses_remote_http(&self) -> bool {
+        match self.protocol {
+            Protocol::ChatGpt | Protocol::ClaudeConsole => false,
+            Protocol::Ollama => uses_remote_http(&ollama_address(&self.base)),
+            _ => uses_remote_http(&self.base),
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Provider {
     #[serde(skip)]
@@ -190,21 +200,31 @@ pub fn route(model: &str) -> (&str, &str) {
         .unwrap_or(("ollama", model))
 }
 
-fn endpoint(input: &str) -> Result<String> {
-    let url = Url::parse(input.trim()).context("Enter a full API base URL")?;
-    let local = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
-    ensure!(
-        url.scheme() == "https" || (local && url.scheme() == "http"),
-        "Use HTTPS for remote providers or HTTP on loopback"
-    );
-    ensure!(
-        url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none(),
-        "Enter a base URL without credentials, query or fragment"
-    );
-    Ok(url.as_str().trim_end_matches('/').into())
+pub(crate) const PLAIN_HTTP_WARNING: &str =
+    "Unencrypted HTTP. Prompts, replies, and any API key travel in plain text.";
+
+pub(crate) fn uses_remote_http(input: &str) -> bool {
+    Url::parse(input.trim()).is_ok_and(|url| {
+        url.scheme() == "http"
+            && url.host_str().is_some_and(|host| {
+                let host = host.trim_matches(['[', ']']);
+                host.trim_end_matches('.') != "localhost"
+                    && !host
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.to_canonical().is_loopback())
+            })
+    })
+}
+
+fn ollama_address(input: &str) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        crate::ollama::default_endpoint()
+    } else if input.contains("://") {
+        input.to_owned()
+    } else {
+        format!("http://{input}")
+    }
 }
 
 impl Provider {
@@ -252,17 +272,8 @@ impl Provider {
             name: form.name.trim().into(),
             base: match form.protocol {
                 Protocol::ClaudeConsole => "https://api.anthropic.com/v1".into(),
-                Protocol::Ollama => {
-                    let base = if form.base.trim().is_empty() {
-                        crate::ollama::default_endpoint()
-                    } else if form.base.contains("://") {
-                        form.base.trim().to_owned()
-                    } else {
-                        format!("http://{}", form.base.trim())
-                    };
-                    crate::local_servers::address(&base)?
-                }
-                _ => endpoint(&form.base)?,
+                Protocol::Ollama => crate::local_servers::address(&ollama_address(&form.base))?,
+                _ => crate::local_servers::address(&form.base)?,
             },
             protocol: form.protocol,
             models: vec![],
@@ -1102,6 +1113,85 @@ fn complete(answer: String, limited: bool) -> Result<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_urls_accept_http_and_https_and_warn_for_remote_http() {
+        for base in [
+            "http://192.168.1.50:8080/v1/",
+            "http://10.0.0.2:8080",
+            "http://172.16.0.2:8080",
+            "http://model-host.local/v1",
+            "http://api.example.com/v1",
+            "http://100.64.0.1/v1",
+            "http://203.0.113.5/v1",
+            "http://[fd12::1]:8080",
+            "http://[2001:db8::5]/v1",
+        ] {
+            assert!(crate::local_servers::address(base).is_ok(), "rejected {base}");
+            assert!(uses_remote_http(base), "missing warning for {base}");
+        }
+        for base in [
+            "http://127.0.0.2:8080",
+            "http://localhost:8080",
+            "http://[::1]:8080",
+            "http://[::ffff:127.0.0.1]",
+            "https://api.example.com/v1",
+        ] {
+            assert!(crate::local_servers::address(base).is_ok(), "rejected {base}");
+            assert!(!uses_remote_http(base), "unexpected warning for {base}");
+        }
+        assert_eq!(
+            crate::local_servers::address(" http://model-host.local:8080/v1/ ").unwrap(),
+            "http://model-host.local:8080/v1"
+        );
+        for base in [
+            "ftp://model-host.local/v1",
+            "file:///v1",
+            "http://user:secret@model-host.local/v1",
+            "http://model-host.local/v1?key=secret",
+            "http://model-host.local/v1#fragment",
+        ] {
+            assert!(crate::local_servers::address(base).is_err(), "accepted {base}");
+        }
+        assert!(
+            Connection {
+                base: "model-host.local:11434".into(),
+                protocol: Protocol::Ollama,
+                ..Default::default()
+            }
+            .uses_remote_http()
+        );
+    }
+
+    #[tokio::test]
+    async fn connects_to_a_remote_http_model_hostname() -> Result<()> {
+        use axum::{Json, Router, routing::get};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let addr = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let api = Router::new().route(
+                "/v1/models",
+                get(|| async { Json(json!({"data":[{"id":"fixture-model"}]})) }),
+            );
+            axum::serve(listener, api).await.unwrap();
+        });
+        let client = Client::builder()
+            .no_proxy()
+            .resolve("model-host.test", addr)
+            .build()?;
+        let base = format!("http://model-host.test:{}/v1", addr.port());
+        let form = Connection {
+            name: "Maya LAN".into(),
+            base: base.clone(),
+            ..Default::default()
+        };
+        assert!(form.uses_remote_http());
+        let provider = Provider::connect(form, "remote".into(), "unused".into(), &client).await?;
+        assert_eq!(provider.base, base);
+        assert_eq!(provider.models, ["fixture-model"]);
+        server.abort();
+        Ok(())
+    }
+
     #[tokio::test]
     async fn named_ollama_connections_route_the_same_tag_to_independent_servers() -> Result<()> {
         use axum::{Json, Router, routing::{get, post}};
@@ -1428,10 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn connection_destinations_and_qualified_ids() {
-        assert!(endpoint("http://localhost:1234/v1/").is_ok());
-        assert!(endpoint("http://host.example/v1").is_err());
-        assert!(endpoint("https://user:secret@server.example/v1").is_err());
+    fn qualified_model_ids() {
         assert_eq!(route("@p7/vendor/model"), ("p7", "vendor/model"));
         assert_eq!(route("vendor/model"), ("ollama", "vendor/model"));
     }
