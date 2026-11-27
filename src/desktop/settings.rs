@@ -519,6 +519,7 @@ impl Desktop {
         self.connection = Connection::default();
         self.settings_feedback.clear();
         self.browser_setup.manage = None;
+        self.app_control_manage = false;
     }
 
     pub(super) fn settings(&mut self, ui: &mut egui::Ui) {
@@ -639,7 +640,8 @@ impl Desktop {
                     self.sandbox_tab = false;
                     self.sync_tab = false;
                     self.integration_tab = Some(tab);
-                self.browser_setup.manage = None;
+                    self.browser_setup.manage = None;
+                    self.app_control_manage = false;
                 }
             }
         });
@@ -1078,33 +1080,27 @@ impl Desktop {
             }
             IntegrationTab::ComputerUse => {}
         }
-        egui::Frame::new().fill(raised()).corner_radius(8).inner_margin(12).show(ui, |ui| {
-            ui.strong("Local computer");
-            let shells = crate::host_shell::available();
-            if !shells.is_empty() {
-                ui.label(format!("Available shells: {shells}. Spindle asks before each command."));
-            }
-            if crate::computer_use::SUPPORTED {
-                ui.label("Windows app control asks before listing windows, inspecting a window or sending input. Press Escape to revoke access.");
-                if let Some(window) = crate::computer_use::current() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(format!("Controlling {window}"));
-                        if ui.button("Stop control").clicked() { crate::computer_use::stop(None); }
-                    });
-                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-                }
-            }
-        });
+        if self.app_control_manage {
+            self.app_control_management(ui);
+            return;
+        }
+        if let Some(browser) = self.browser_setup.manage {
+            self.poll_browser_setup(ui);
+            self.browser_management(ui, browser);
+            return;
+        }
+        self.app_control_card(ui);
+        let shells = crate::host_shell::available();
+        if !shells.is_empty() {
+            ui.add_space(8.);
+            ui.weak(format!("Local shells: {shells}. Each command requires approval."));
+        }
         ui.add_space(12.);
         if !crate::browser::SUPPORTED {
             ui.label("Spindle Browser Link is available on Windows and Linux.");
             return;
         }
         self.poll_browser_setup(ui);
-        if let Some(browser) = self.browser_setup.manage {
-            self.browser_management(ui, browser);
-            return;
-        }
         ui.label("Use Browser Link with the tabs in your regular browser.");
         ui.add_space(10.);
         for browser in crate::browser::LinkBrowser::ALL {
@@ -1122,6 +1118,98 @@ impl Desktop {
                 self.sync_tab = true;
             }
         });
+    }
+
+    fn app_control_card(&mut self, ui: &mut egui::Ui) {
+        let mut enabled = self.view.state.preferences.app_control.enabled;
+        egui::Frame::new().fill(raised()).corner_radius(8).inner_margin(12).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong("App control");
+                if ui.button("Manage").clicked() { self.app_control_manage = true; }
+                ui.add_enabled_ui(crate::computer_use::SUPPORTED, |ui| {
+                    if crate::widgets::switch(ui, &mut enabled, "App control").changed() {
+                        if !enabled { crate::computer_use::stop(None); }
+                        self.set_app_access("enabled", enabled);
+                    }
+                });
+            });
+            ui.weak(crate::computer_use::setup_status());
+        });
+    }
+
+    fn set_app_access(&mut self, setting: &str, allowed: bool) {
+        self.send(format!("/desktop-access {}", serde_json::json!([setting, allowed])));
+    }
+
+    fn app_control_management(&mut self, ui: &mut egui::Ui) {
+        if super::panel_header(ui, "App control", "Back") {
+            self.app_control_manage = false;
+            return;
+        }
+        ui.add_space(8.);
+        ui.label(crate::computer_use::setup_status());
+        if !crate::computer_use::SUPPORTED { return; }
+        #[cfg(target_os = "linux")]
+        {
+            use std::sync::mpsc;
+            if let Some(check) = &self.app_control_check {
+                match check.try_recv() {
+                    Ok(status) => { self.app_control_setup = status; self.app_control_check = None; }
+                    Err(mpsc::TryRecvError::Empty) => ui.ctx().request_repaint_after(std::time::Duration::from_millis(150)),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.app_control_setup = "The app control setup check stopped.".into();
+                        self.app_control_check = None;
+                    }
+                }
+            }
+            if ui.add_enabled(self.app_control_check.is_none(), egui::Button::new("Check setup")).clicked() {
+                let (tx, rx) = mpsc::channel();
+                self.app_control_check = Some(rx);
+                self.app_control_setup = "Checking X11 and desktop accessibility…".into();
+                let context = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(crate::computer_use::check_setup());
+                    context.request_repaint();
+                });
+            }
+            if !self.app_control_setup.is_empty() { ui.weak(&self.app_control_setup); }
+        }
+        let settings = self.view.state.preferences.app_control;
+        let mut enabled = settings.enabled;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Allow app control in this workspace");
+            if crate::widgets::switch(ui, &mut enabled, "Allow app control").changed() {
+                if !enabled { crate::computer_use::stop(None); }
+                self.set_app_access("enabled", enabled);
+            }
+        });
+        ui.add_space(10.);
+        ui.strong("Permissions");
+        ui.weak("Spindle asks for one-time approval before each allowed action.");
+        for (setting, label, mut allowed) in [
+            ("list", "List open app windows", settings.list),
+            ("inspect", "Read labels and positions in a window", settings.inspect),
+            ("click", "Click in an approved window", settings.click),
+            ("type", "Type into an approved window", settings.type_text),
+        ] {
+            if ui.checkbox(&mut allowed, label).changed() {
+                crate::computer_use::stop(None);
+                self.set_app_access(setting, allowed);
+            }
+        }
+        ui.add_space(10.);
+        let current = crate::computer_use::current();
+        if let Some(window) = &current {
+            ui.label(format!("Active in {window}"));
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        let pending = self.view.state.requests.iter().any(|p|
+            matches!(p.call.call, crate::tools::Call::DesktopControl(_)));
+        if ui.add_enabled(current.is_some() || pending, egui::Button::new("Revoke access")).clicked() {
+            crate::computer_use::stop(None);
+            self.send("/desktop-release");
+        }
+        ui.weak("Press Esc to end control. New actions require fresh approval.");
     }
 
     fn troubleshooting(&mut self, ui: &mut egui::Ui) {

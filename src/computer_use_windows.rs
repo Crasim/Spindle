@@ -1,10 +1,10 @@
-use super::Action;
+use super::{Action, epoch};
 use anyhow::{Context, Result, bail, ensure};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{
     Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc,
 };
 use std::time::{Duration, Instant};
@@ -129,15 +129,6 @@ fn available_windows() -> Vec<Window> {
         EnumWindows(Some(collect), &mut windows as *mut Vec<Window> as isize);
     }
     windows
-}
-
-fn epoch() -> &'static AtomicU64 {
-    static EPOCH: OnceLock<AtomicU64> = OnceLock::new();
-    EPOCH.get_or_init(|| {
-        AtomicU64::new(u64::from_le_bytes(
-            crate::vault::random().expect("desktop approval nonce"),
-        ))
-    })
 }
 
 #[derive(Clone, Copy)]

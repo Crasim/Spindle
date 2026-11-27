@@ -365,6 +365,11 @@ pub struct Desktop {
     sandbox_tab: bool,
     integration_tab: Option<settings::IntegrationTab>,
     browser_setup: settings::BrowserSetup,
+    app_control_manage: bool,
+    #[cfg(target_os = "linux")]
+    app_control_check: Option<std::sync::mpsc::Receiver<String>>,
+    #[cfg(target_os = "linux")]
+    app_control_setup: String,
     #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     updates: settings::UpdatePanel,
     connector_setup: settings::ConnectorSetup,
@@ -1128,6 +1133,11 @@ impl Desktop {
             sandbox_tab: false,
             integration_tab: None,
             browser_setup: Default::default(),
+            app_control_manage: false,
+            #[cfg(target_os = "linux")]
+            app_control_check: None,
+            #[cfg(target_os = "linux")]
+            app_control_setup: String::new(),
             #[cfg(any(windows, target_os = "linux", target_os = "android"))]
             updates: Default::default(),
             connector_setup: Default::default(),
@@ -2913,6 +2923,13 @@ impl eframe::App for Desktop {
     }
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape))
+            && (crate::computer_use::current().is_some()
+                || self.view.state.requests.iter().any(|p| matches!(p.call.call, crate::tools::Call::DesktopControl(_))))
+        {
+            crate::computer_use::stop(None);
+            self.send("/desktop-release");
+        }
         if self.shutdown.finished.load(Ordering::Acquire) {
             self.tray = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);

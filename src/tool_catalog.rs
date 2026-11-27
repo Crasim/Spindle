@@ -251,8 +251,10 @@ pub fn inventory(state: &crate::state::State) -> String {
     if !shells.is_empty() {
         lines.push(format!("Approved local shells (host_shell): {shells}. Each command requires one-time approval."));
     }
-    if crate::computer_use::SUPPORTED {
-        lines.push("Native Windows apps (desktop_control): list windows, inspect, click, type and release. Each access action requires approval. Press Escape to end access.".into());
+    if crate::computer_use::SUPPORTED && state.preferences.app_control.enabled {
+        lines.push(format!("Native apps (desktop_control): list windows, inspect, click, type and release. Each access action requires approval. Press Escape to end access. {}", crate::computer_use::setup_status()));
+    } else if crate::computer_use::SUPPORTED {
+        lines.push("App control is off. Turn it on in Settings › Computer use › App control.".into());
     }
     lines.join("\n")
 }

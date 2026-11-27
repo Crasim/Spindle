@@ -455,13 +455,13 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
             let scope = if req.risk == crate::policy::Risk::Browser {
                 format!("Paired tab for chat #{}", req.chat)
             } else if matches!(req.call.call, crate::tools::Call::DesktopControl(_)) {
-                "Local Windows desktop".into()
+                "Local desktop".into()
             } else {
                 crate::projects::display_path(&req.target)
             };
             let permission = match &req.call.call {
                 crate::tools::Call::HostShell { .. } => "Run a local shell command",
-                crate::tools::Call::DesktopControl(_) => "Windows app access",
+                crate::tools::Call::DesktopControl(_) => "App control",
                 _ => req.risk.label(),
             };
             ui.label(
@@ -1783,6 +1783,30 @@ mod tests {
         assert!(commands.try_recv().is_ok_and(|command| command == "/browser-mode \"blocklist\""));
         click(&mut app, &ctx, labels["On"]);
         assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|sent| sent == "/browser-control edge off"));
+    }
+
+    #[test]
+    #[cfg(any(windows, target_os = "linux"))]
+    fn app_control_management_exposes_workspace_permissions() {
+        let ctx = egui::Context::default();
+        ctx.style_mut(|style| style.animation_time = 0.);
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_views, rx) = std::sync::mpsc::channel();
+        let (_stream, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        app.page = Page::Settings;
+        app.integration_tab = Some(settings::IntegrationTab::ComputerUse);
+        app.view.state.preferences.app_control.enabled = true;
+        run(&mut app, &ctx, vec![]);
+        let labels = run(&mut app, &ctx, vec![]);
+        assert!(labels.contains_key("App control"));
+        let labels = click(&mut app, &ctx, labels["Manage"]);
+        assert!(labels.contains_key("Back") && labels.contains_key("Revoke access"));
+        assert!(!labels.contains_key("Google Chrome"));
+        click(&mut app, &ctx, labels["Click in an approved window"]);
+        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|sent| sent == "/desktop-access [\"click\",false]"));
     }
 
     #[test]

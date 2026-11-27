@@ -402,6 +402,9 @@ pub struct Preferences {
     /// Browser access preferences belong to this workspace on this device.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_browsers: Vec<crate::browser::LinkBrowser>,
+    /// Local app control permissions for this workspace.
+    #[serde(default)]
+    pub app_control: crate::computer_use::Access,
     /// ComfyUI address for /image and the image tool, such as http://localhost:8188.
     #[serde(default)]
     pub comfyui: String,
@@ -507,6 +510,7 @@ impl Default for Preferences {
             browser_blocklist: vec![],
             browser_mode: Default::default(),
             disabled_browsers: vec![],
+            app_control: Default::default(),
             comfyui: String::new(),
             ollama: String::new(),
             ollama_on: ollama_default(),

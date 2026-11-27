@@ -507,10 +507,11 @@ fn fingerprint(v: &Value) -> String {
 }
 
 /// Preference fields that stay with one device.
-const LOCAL_PREFS: [&str; 16] = [
+const LOCAL_PREFS: &[&str] = &[
     "browser_path",
     "browser_mode",
     "disabled_browsers",
+    "app_control",
     "web_country",
     "use_os_location",
     "sidebar_width",
@@ -530,7 +531,7 @@ const LOCAL_PREFS: [&str; 16] = [
 fn pref_value(state: &State) -> Value {
     let mut prefs = serde_json::to_value(&state.preferences).unwrap_or(Value::Null);
     if let Some(o) = prefs.as_object_mut() {
-        for k in LOCAL_PREFS {
+        for &k in LOCAL_PREFS {
             o.remove(k);
         }
     }

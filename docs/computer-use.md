@@ -6,7 +6,13 @@
 
 Ask Spindle to use a shell on **This device**. It shows the executable, working folder, and exact command and waits for **Allow once**. The command runs with the current account’s permissions outside the workspace sandbox. Windows supports PowerShell, Command Prompt, and Git Bash if detected. Linux supports Bash and `sh`. Android uses `/system/bin/sh` with Spindle’s app permissions. Output goes to the selected model. You can check detected shells in **Settings › Computer use**.
 
-On Windows, ask Spindle to inspect or interact with a visible app window. It can list window titles, read accessible controls, click, and type literal text. Each action shows its scope and asks for one-time approval. The same Spindle cursor used by Browser Link marks a click, and a border and status badge mark the window while control is active. Press **Esc** to revoke access and invalidate pending desktop approvals. A later action needs fresh approval. Use Browser Link for your regular browser.
+### App control
+
+Open **Settings › Computer use › App control** to turn native app access on or off for this workspace. **Manage** lets you allow window listing, inspection, clicking, and typing independently. Every allowed action still asks for one-time approval, and the approval names the app window. These settings stay on the device. Use **Revoke access** or press **Esc** to end control and invalidate outstanding approvals. The Spindle cursor marks a click, and a border and badge identify the active window. Use Browser Link for your regular browser.
+
+- **Windows** uses built-in Windows UI Automation. No add-on is required.
+- **Linux** uses a local X11 session with XTEST and SHAPE. **Manage › Check setup** checks the display and accessibility service. Labels and text insertion in focused, non-password fields require the app to expose AT-SPI controls. Check your desktop’s Accessibility settings if inspection or typing is unavailable. Wayland sessions cannot use this backend.
+- **Android** would require a user-enabled Android Accessibility service. This release leaves native app control unavailable on Android. [Android AccessibilityService](https://developer.android.com/reference/android/accessibilityservice/AccessibilityService)
 
 ## Side panel
 
