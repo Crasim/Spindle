@@ -32,7 +32,7 @@ fn unit_path(root: &Path) -> Result<PathBuf> {
 }
 
 /// The unit file for Linux.
-#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 pub fn unit(root: &Path, exe: &Path) -> String {
     format!(
         "[Unit]\nDescription=Spindle in the background ({root})\nAfter=network-online.target\n\n[Service]\nExecStart=\"{exe}\" service --dir \"{root}\"\nRestart=on-failure\nRestartSec=10\n# The workspace passphrase (SPINDLE_SESSION_PASSPHRASE=…), readable only by you.\nEnvironmentFile=-%h/.config/spindle/service.env\n\n[Install]\nWantedBy=default.target\n",

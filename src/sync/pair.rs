@@ -290,7 +290,7 @@ fn open(key: &[u8; 32], s: &str) -> Result<Value> {
 /// What the person sees on the existing device while pairing.
 #[derive(Clone, Debug, Default)]
 pub struct HostView {
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub invite: Invite,
     /// The QR link and the typed code (with where to connect).
     pub link: String,
@@ -435,6 +435,10 @@ pub fn start(
         relay.is_some() || addr.is_some(),
         "Add a sync server, or allow pairing on this network"
     );
+    // Typed: the server, or the addresses to choose from.
+    let typed_where = relay.as_ref().cloned()
+        .or_else(|| addr.as_ref().map(|a| a.replace(',', " or ")))
+        .unwrap_or_default();
     let invite = Invite {
         id: code(4)?.to_lowercase(),
         secret: if short {
@@ -442,24 +446,13 @@ pub fn start(
         } else {
             b64(&crate::vault::random::<16>()?).replace(['+', '/'], "x")
         },
-        relay: relay.clone(),
-        addr: addr.clone(),
+        relay,
+        addr,
     };
-    // Typed: the server, or the addresses one per line to choose from.
-    let typed_where = relay
-        .clone()
-        .or(addr.as_ref().map(|a| a.replace(',', " or ")))
-        .unwrap_or_default();
     let view = Arc::new(Mutex::new(HostView {
         link: invite.link(),
-        typed: format!(
-            "{} at {typed_where}",
-            Invite {
-                secret: invite.secret.clone(),
-                ..invite.clone()
-            }
-            .typed()
-        ),
+        typed: format!("{} at {typed_where}", invite.typed()),
+        #[cfg(test)]
         invite: invite.clone(),
         status: "Waiting for the other device".into(),
         ..Default::default()

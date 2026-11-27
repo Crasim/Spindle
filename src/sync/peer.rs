@@ -313,7 +313,6 @@ pub struct Conn {
     sent: u64,
     got: u64,
     /// The device on the other end.
-    #[allow(dead_code)]
     pub device: String,
 }
 

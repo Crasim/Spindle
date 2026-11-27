@@ -11,6 +11,7 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+#[cfg(test)]
 use std::sync::{Arc, Mutex};
 
 /// IDs a transport has after a cursor, and the cursor to use next time.
@@ -27,14 +28,15 @@ pub fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
-/// Records shared in memory (tests, and a device talking to itself).
+/// Records shared in memory for transport tests.
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct Hub(Arc<Mutex<Vec<(String, Vec<u8>)>>>);
 
 #[derive(Clone)]
 pub enum Transport {
     /// In-memory (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     Memory(Hub),
     /// A shared folder: OneDrive, Syncthing, a network share…
     Folder(PathBuf),
@@ -46,6 +48,7 @@ pub enum Transport {
 impl Transport {
     pub fn label(&self) -> String {
         match self {
+            #[cfg(test)]
             Transport::Memory(_) => "memory".into(),
             Transport::Folder(p) => format!("folder {}", p.display()),
             Transport::Hosted(c) => format!("server {}", c.base),
@@ -59,6 +62,7 @@ impl Transport {
 
     pub async fn list(&self, space: &str, since: &str) -> Result<Listing> {
         match self {
+            #[cfg(test)]
             Transport::Memory(h) => {
                 let all = h.0.lock().unwrap();
                 let from: usize = since.parse().unwrap_or(0);
@@ -95,6 +99,7 @@ impl Transport {
 
     pub async fn get(&self, space: &str, ids: &[String]) -> Result<Vec<Vec<u8>>> {
         match self {
+            #[cfg(test)]
             Transport::Memory(h) => {
                 let all = h.0.lock().unwrap();
                 Ok(all
@@ -123,6 +128,7 @@ impl Transport {
 
     pub async fn put(&self, space: &str, records: &[(String, Vec<u8>)]) -> Result<()> {
         match self {
+            #[cfg(test)]
             Transport::Memory(h) => {
                 let mut all = h.0.lock().unwrap();
                 for (id, b) in records {

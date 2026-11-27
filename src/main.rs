@@ -803,11 +803,13 @@ fn main() -> Result<()> {
     let service = args.first().is_some_and(|s| s == "service");
     let serving = args.first().is_some_and(|s| s == "serve") || service;
     // A windowless Spindle (started by the CLI or MCP) may hold the workspace: the window
-    // and the terminal ask it to hand over first.
-    if !background && !serving && state::Store::open(&root).is_err() {
+    // and the terminal ask it to hand over when opening the workspace fails.
+    let mut opened = state::Store::open(&root);
+    if !background && !serving && opened.is_err() {
         let _ = control::hand_over(&root);
+        opened = state::Store::open(&root);
     }
-    let (store, state) = match state::Store::open(&root) {
+    let (store, state) = match opened {
         Err(e)
             if background
                 && matches!(

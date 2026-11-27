@@ -188,7 +188,6 @@ impl Space {
 
     /// Publish an item's new value, unless it is already the merged value. Returns the new
     /// record's ID when something was published.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn put(&mut self, kind: Kind, id: &str, value: Value) -> Result<Option<String>> {
         let before = self.value(kind, id);
         if before.as_ref() == Some(&value) {

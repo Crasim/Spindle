@@ -192,11 +192,10 @@ dependencies = [
  "sha1",
  "sync_wrapper",
  "tokio",
- "tokio-tungstenite 0.29.0",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -215,7 +214,6 @@ dependencies = [
  "sync_wrapper",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -3260,7 +3258,7 @@ dependencies = [
 
 [[package]]
 name = "spindle-android"
-version = "0.3.0-beta.36"
+version = "0.3.0-beta.37"
 dependencies = [
  "anyhow",
  "axum",
@@ -3293,7 +3291,7 @@ dependencies = [
  "spake2",
  "tempfile",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite",
  "webbrowser",
  "winit",
  "x25519-dalek",
@@ -3566,9 +3564,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.26.2"
+version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
+checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
@@ -3576,20 +3574,8 @@ dependencies = [
  "rustls-pki-types",
  "tokio",
  "tokio-rustls",
- "tungstenite 0.26.2",
+ "tungstenite",
  "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "tokio-tungstenite"
-version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
-dependencies = [
- "futures-util",
- "log",
- "tokio",
- "tungstenite 0.29.0",
 ]
 
 [[package]]
@@ -3635,7 +3621,6 @@ dependencies = [
  "tokio",
  "tower-layer",
  "tower-service",
- "tracing",
 ]
 
 [[package]]
@@ -3702,25 +3687,6 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tungstenite"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "rustls",
- "rustls-pki-types",
- "sha1",
- "thiserror 2.0.21",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c01152af293afb9c7c2a57e4b559c5620b421f6d133261c60dd2d0cdb38e6b8"
@@ -3731,6 +3697,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.21",
 ]
