@@ -449,7 +449,7 @@ pub fn command(state: &mut State, root: &Path, args: &str) -> Result<String> {
         );
         let bytes = core::unb64(&receipt.bytes)?;
         #[cfg(target_os = "android")]
-        return crate::android::download_apk(
+        return crate::android::download_file(
             &format!("remote-{}.{}", &id[..16], receipt.extension),
             &bytes,
         );

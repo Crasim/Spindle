@@ -113,6 +113,32 @@ fn base(copy: &Path) -> Result<Base> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Bring a restored project file into this chat's sandbox when its copy is clean.
+pub(crate) fn refresh_restored_file(data: &Path, chat: u64, project: &Path, file: &Path) -> Result<()> {
+    let project_root = project.canonicalize()?;
+    let Ok(relative) = file.strip_prefix(&project_root) else { return Ok(()); };
+    let rel = relative.to_str().context("Invalid project file name")?.replace('\\', "/");
+    let copy = folder(data, chat, project);
+    if !copy.join(MANIFEST).is_file() {
+        return Ok(());
+    }
+    let mut record = base(&copy)?;
+    ensure!(record.project.canonicalize()? == project_root, "Sandbox project has changed");
+    let (target, inside) = crate::tools::resolve(&copy, &rel)?;
+    ensure!(inside && target == copy.canonicalize()?.join(relative), "Sandbox file path has changed");
+    let baseline = record.files.get(&rel);
+    let current = target.is_file().then(|| file_hash(&target)).transpose()?;
+    if current.as_ref() != baseline {
+        return Ok(());
+    }
+    let bytes = std::fs::read(file)?;
+    std::fs::create_dir_all(target.parent().context("Missing sandbox folder")?)?;
+    crate::file_history::write(&target, &bytes, target.is_file())?;
+    record.files.insert(rel, crate::tools::hash(&bytes));
+    crate::tools::write_generated(&copy.join(MANIFEST), &serde_json::to_vec(&record)?, true)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Change {
     Added(String),
@@ -213,39 +239,43 @@ fn apply_changes(copy: &Path, changes: Vec<Change>) -> Result<String> {
     let project = record.project.clone();
     let mut applied = vec![];
     let mut conflicts = vec![];
-    for change in changes {
-        let rel = change.path().to_owned();
-        let target = project.join(&rel);
-        ensure!(
-            !crate::policy::protected(&target),
-            "{rel} is in a protected location"
-        );
-        let current = target.is_file().then(|| file_hash(&target)).transpose()?;
-        let expected = record.files.get(&rel).cloned();
-        if current != expected {
-            conflicts.push(rel);
-            continue;
-        }
-        match &change {
-            Change::Deleted(_) => {
-                std::fs::remove_file(&target)?;
-                record.files.remove(&rel);
+    let canonical = project.canonicalize()?;
+    let result = (|| -> Result<()> {
+        for change in changes {
+            let rel = change.path().to_owned();
+            let (target, inside) = crate::tools::resolve(&project, &rel)?;
+            ensure!(
+                inside && target == canonical.join(&rel) && !crate::policy::protected(&target),
+                "{rel} is in a protected location"
+            );
+            let current = target.is_file().then(|| file_hash(&target)).transpose()?;
+            let expected = record.files.get(&rel).cloned();
+            if current != expected {
+                conflicts.push(rel);
+                continue;
             }
-            Change::Added(_) | Change::Modified(_) => {
-                let bytes = std::fs::read(copy.join(&rel))?;
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
+            match &change {
+                Change::Deleted(_) => {
+                    crate::file_history::remove(&target)?;
+                    record.files.remove(&rel);
                 }
-                let mut tmp =
-                    tempfile::NamedTempFile::new_in(target.parent().context("No folder")?)?;
-                std::io::Write::write_all(&mut tmp, &bytes)?;
-                tmp.persist(&target).map_err(|e| e.error)?;
-                record.files.insert(rel.clone(), crate::tools::hash(&bytes));
+                Change::Added(_) | Change::Modified(_) => {
+                    let bytes = std::fs::read(copy.join(&rel))?;
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    crate::file_history::write(&target, &bytes, current.is_some())?;
+                    record.files.insert(rel.clone(), crate::tools::hash(&bytes));
+                }
             }
+            applied.push(change.label());
         }
-        applied.push(change.label());
+        Ok(())
+    })();
+    if !applied.is_empty() {
+        crate::tools::write_generated(&copy.join(MANIFEST), &serde_json::to_vec(&record)?, true)?;
     }
-    std::fs::write(copy.join(MANIFEST), serde_json::to_vec(&record)?)?;
+    result?;
     let mut text = if applied.is_empty() {
         "No changes were applied.".to_owned()
     } else {
@@ -324,9 +354,11 @@ pub fn undo(copy: &Path, keep: &Path) -> Result<String> {
     )?;
     let mut record = base(copy)?;
     let project = record.project.clone();
+    let canonical = project.canonicalize()?;
     let (mut restored, mut skipped) = (vec![], vec![]);
     for (rel, before, wrote) in &checkpoint.files {
-        let target = project.join(rel);
+        let (target, inside) = crate::tools::resolve(&project, rel)?;
+        ensure!(inside && target == canonical.join(rel) && !crate::policy::protected(&target), "{rel} is in a protected location");
         let now = target.is_file().then(|| file_hash(&target)).transpose()?;
         if &now != wrote {
             skipped.push(rel.clone());
@@ -339,7 +371,7 @@ pub fn undo(copy: &Path, keep: &Path) -> Result<String> {
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::write(&target, &bytes)?;
+                crate::file_history::write(&target, &bytes, now.is_some())?;
                 if let Some(parent) = in_copy.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -348,7 +380,7 @@ pub fn undo(copy: &Path, keep: &Path) -> Result<String> {
             }
             None => {
                 if target.is_file() {
-                    std::fs::remove_file(&target)?;
+                    crate::file_history::remove(&target)?;
                 }
                 if in_copy.is_file() {
                     std::fs::remove_file(&in_copy)?;

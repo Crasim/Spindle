@@ -164,7 +164,8 @@ impl Editable {
             self.modified.is_some() && current == self.modified,
             "This file changed on disk after you opened it. Use Save as, or reload and edit again."
         );
-        write(&self.path, &self.content)?;
+        let bytes = encode(&ext(&self.path), &self.content)?;
+        crate::file_history::write(&self.path, &bytes, true)?;
         self.modified = std::fs::metadata(&self.path)?.modified().ok();
         Ok(())
     }
@@ -190,14 +191,7 @@ pub fn copy_name(path: &Path) -> PathBuf {
 /// Write content to `path` atomically in the format its extension names.
 pub fn write(path: &Path, content: &Content) -> Result<()> {
     let bytes = encode(&ext(path), content)?;
-    let dir = path
-        .parent()
-        .filter(|d| !d.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut file = tempfile::NamedTempFile::new_in(dir)?;
-    file.write_all(&bytes)?;
-    file.as_file().sync_all()?;
-    file.persist(path)?;
+    crate::file_history::write(path, &bytes, path.is_file())?;
     Ok(())
 }
 

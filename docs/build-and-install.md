@@ -6,6 +6,8 @@
 
 Use Rust 1.89 or later. On Windows, install the MSVC C++ build tools. On Linux, install the development packages for ALSA, OpenGL, X11, and xkbcommon. On Ubuntu, the release build uses `pkg-config libasound2-dev libgl1-mesa-dev libx11-dev libxkbcommon-dev`. For a local generation test, start Ollama and pull a model.
 
+On Linux, set `SPINDLE_SESSION_PASSPHRASE` to a passphrase of at least 12 characters before running Spindle or its test suite. Tests that exercise encryption can use a temporary test passphrase and a separate `SPINDLE_DATA_DIR`.
+
 ```powershell
 cargo test --locked
 cargo run --release --locked

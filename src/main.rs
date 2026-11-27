@@ -33,6 +33,7 @@ mod editing;
 mod engine;
 mod eval;
 mod execution;
+mod file_history;
 mod generation;
 mod html_preview;
 mod git;
@@ -308,16 +309,16 @@ mod android {
         }).context("Android APK build service did not respond")
     }
 
-    pub fn download_apk(name: &str, bytes: &[u8]) -> anyhow::Result<String> {
+    pub fn download_file(name: &str, bytes: &[u8]) -> anyhow::Result<String> {
         use anyhow::Context;
         java(|env, activity| {
             let name = env.new_string(name)?;
             let input = env.byte_array_from_slice(bytes)?;
-            let result = env.call_method(activity, "downloadApk",
+            let result = env.call_method(activity, "downloadFile",
                 "(Ljava/lang/String;[B)Ljava/lang/String;", &[(&name).into(), (&input).into()])?.l()?;
             let result = jni::objects::JString::from(result);
             Ok(env.get_string(&result)?.into())
-        }).context("Android could not save the APK to Downloads")
+        }).context("Android could not save the file to Downloads")
     }
 
     pub fn open_update_apk(version: &str) -> anyhow::Result<()> {

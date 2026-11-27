@@ -60,6 +60,7 @@ pub(super) enum Pick {
     },
     /// Open a file from the library.
     Path(PathBuf),
+    History(PathBuf),
     /// Show a file's folder.
     Reveal(PathBuf),
 }
@@ -97,6 +98,7 @@ pub(super) fn files_tab(ui: &mut egui::Ui, files: &[ChatFile]) -> Option<Pick> {
                                     text: f.text.clone(),
                                 },
                                 RowAction::Reveal(p) => Pick::Reveal(p),
+                                RowAction::History(p) => Pick::History(p),
                             });
                         }
                     });
@@ -109,6 +111,7 @@ pub(super) fn files_tab(ui: &mut egui::Ui, files: &[ChatFile]) -> Option<Pick> {
 enum RowAction {
     Open,
     Reveal(PathBuf),
+    History(PathBuf),
 }
 
 fn file_row(
@@ -121,7 +124,8 @@ fn file_row(
     ui.horizontal(|ui| {
         let shown = name.rsplit(['/', '\\']).next().unwrap_or(name);
         let open = ui
-            .add(
+            .add_sized(
+                [(ui.available_width() - if disk.is_some() { 130. } else { 58. }).max(24.), 21.],
                 egui::Button::new(Text::new(shown).size(13.))
                     .frame(false)
                     .truncate(),
@@ -138,6 +142,11 @@ fn file_row(
                     .clicked()
             {
                 action = Some(RowAction::Reveal(path.to_owned()));
+            }
+            if let Some(path) = disk
+                && ui.small_button("History").on_hover_text("Compare and restore file versions").clicked()
+            {
+                action = Some(RowAction::History(path.to_owned()));
             }
             if size > 0 {
                 ui.weak(size_text(size));
@@ -257,6 +266,7 @@ impl Library {
                         match file_row(ui, name, *size, Some(&path)) {
                             Some(RowAction::Open) => pick = Some(Pick::Path(path)),
                             Some(RowAction::Reveal(p)) => pick = Some(Pick::Reveal(p)),
+                            Some(RowAction::History(p)) => pick = Some(Pick::History(p)),
                             None => {}
                         }
                     });

@@ -8,6 +8,7 @@ use std::sync::mpsc::{self, TryRecvError};
 pub(super) struct ReaderPane {
     pub open: bool,
     pub(super) preview: html_preview::HtmlPreview,
+    pub(super) history: Option<super::file_versions::Pane>,
     width: Option<f32>,
     resizing: bool,
     pub(super) file: PathBuf,
@@ -55,6 +56,15 @@ fn column(mut n: usize) -> String {
 }
 
 impl ReaderPane {
+    pub(super) fn open_history(&mut self, path: PathBuf) -> Result<()> {
+        anyhow::ensure!(!self.dirty, "Save or cancel your file edits before opening history.");
+        self.history = Some(super::file_versions::Pane::open(&path)?);
+        self.preview.hide();
+        self.browser.hide();
+        self.open = true;
+        Ok(())
+    }
+
     pub fn open_output(&mut self, name: String, source: String) {
         self.browser.hide();
         self.open = true;
@@ -660,6 +670,7 @@ impl ReaderPane {
         plan: Option<(&mut notes::PlanPane, &crate::state::ThreadInfo, &str, &mut android_ime::ComposerIme)>,
         browser_path: &str,
         browser_chat: (u64, &[(u64, String)], bool),
+        can_restore: bool,
     ) {
         if !self.open {
             self.preview.hide();
@@ -721,6 +732,20 @@ impl ReaderPane {
             .resizable(false)
             .frame(egui::Frame::new().fill(panel()).inner_margin(14))
             .show(ctx, |ui| {
+                if let Some(history) = &mut self.history {
+                    if history.show(ui, can_restore) {
+                        let path = self.history.take().and_then(|history| history.restored_path());
+                        if let Some(path) = path {
+                            self.load(path);
+                        }
+                    } else if let Some(path) = history.take_restored()
+                        && let Some((project, _)) = &self.library_root
+                        && let Err(error) = crate::workcopy::refresh_restored_file(&crate::runtime::data_dir(), browser_chat.0, project, path)
+                    {
+                        history.status = format!("File restored. Could not refresh the sandbox: {error:#}");
+                    }
+                    return;
+                }
                 if self.edit_excerpt.is_some() {
                     if let Some(text) = &mut self.edit_excerpt {
                         let mut open = true;
@@ -865,6 +890,11 @@ impl ReaderPane {
                     }
                     if ready && !self.snapshot && ui.small_button("Reload").clicked() {
                         reload = true;
+                    }
+                    if ready && !self.snapshot && !self.dirty && ui.small_button("File history").clicked()
+                        && let Err(error) = self.open_history(self.file.clone())
+                    {
+                        self.status = format!("{error:#}");
                     }
                     if ready
                         && self.editor.is_none()
@@ -1088,6 +1118,7 @@ pub(super) enum FileAction {
     Open,
     Source,
     Edit,
+    History,
     CopyPath,
     SaveCopy,
     Download,
@@ -1169,6 +1200,9 @@ pub(super) fn file_card(ui: &mut egui::Ui, name: &str, bytes: Option<usize>) -> 
                     }
                     if editable && ui.button("Edit").clicked() {
                         chosen = Some(FileAction::Edit);
+                    }
+                    if ui.button("File history").clicked() {
+                        chosen = Some(FileAction::History);
                     }
                     if ui.button("Download…").clicked() {
                         chosen = Some(FileAction::Download);

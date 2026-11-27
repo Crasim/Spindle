@@ -2525,9 +2525,16 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
             r#"- Create a file: {{"name":"create","args":{{"path":"{file}","content":"whole file"}}}}"#
         ),
         format!(
-            r#"- Edit a file: {{"name":"patch","args":{{"path":"{file}","find":"exact text","replace":"new text","hash":"hash from read"}}}}"#
+            r#"- Edit in place: {{"name":"patch","args":{{"path":"{file}","find":"exact text","replace":"new text","hash":"hash from read"}}}}"#
         ),
     ];
+    if mentions(&["file_history", "file history", "revision", "previous version", "earlier version", "older version",
+        "file version", "versions of", "what changed", "how did you change", "diff", "compare versions", "restore", "undo", "roll back"])
+    {
+        tools.push(format!(
+            r#"- Check saved file versions: {{"name":"file_history","args":{{"path":"{file}"}}}}. Add revision with a listed ID for the diff. Use applied:true for the project file instead of its sandbox copy. The user restores versions in File history."#
+        ));
+    }
     if browser {
         tools.push(format!(r#"- Test a local page and see errors: {{"name":"browser","args":{{"path":"{page}"}}}}. Optional script runs in the page."#));
         if !state.preferences.block_web {
@@ -3618,7 +3625,8 @@ fn route_resolved_call(
     let browser_tab = matches!(env.call, crate::tools::Call::BrowserTab(_));
     let host_access = matches!(env.call, crate::tools::Call::HostShell { .. } | crate::tools::Call::DesktopControl(_));
     let connector = matches!(env.call, crate::tools::Call::ConnectorRead { .. } | crate::tools::Call::SearchNotes { .. });
-    let tools_root = if sandboxed && project_chat && !is_bobbin && !catalog_lookup && !browser_tab && !connector && !host_access && !matches!(&env.call, crate::tools::Call::TestBinary { .. } | crate::tools::Call::LoadTool { .. }) {
+    let applied_history = matches!(&env.call, crate::tools::Call::FileHistory { applied: true, .. });
+    let tools_root = if sandboxed && project_chat && !is_bobbin && !catalog_lookup && !browser_tab && !connector && !host_access && !applied_history && !matches!(&env.call, crate::tools::Call::TestBinary { .. } | crate::tools::Call::LoadTool { .. }) {
         match crate::workcopy::ensure(&crate::runtime::data_dir(), chat, &root) {
             Ok(copy) => copy,
             Err(e) => {
@@ -3847,7 +3855,7 @@ Error: {detail}",
     if remote.is_none() && target.exists() && (replacement.is_some_and(|bytes| std::fs::read(&target).ok().as_deref() != Some(bytes))
         || matches!(env.call, crate::tools::Call::Image { .. } | crate::tools::Call::Speak { .. })) {
         risk = crate::policy::Risk::Destructive;
-        preview = format!("Replace the existing file at {}? This tool does not keep a backup of that version.", target.display());
+        preview = format!("Replace the existing file at {}? Spindle keeps previous versions of files up to 32 MiB.", target.display());
     }
     if let crate::tools::Call::Patch { find, replace, .. } = &env.call
         && preview.is_empty()
@@ -7509,8 +7517,14 @@ mod tests {
         engine.command("Work in this conversation", false).unwrap();
         assert!(matches!(engine.state.queue[0].mode, Mode::Chat));
         engine.command("/new", false).unwrap();
-        engine.command("Work in a new conversation", false).unwrap();
+        engine.command("Show file history for notes.md", false).unwrap();
         assert!(matches!(engine.state.queue[1].mode, Mode::Chat));
+        let (_, messages) = request(&engine.state, &engine.state.queue[1]).unwrap();
+        let system = &messages[0].content;
+        assert!(system.contains("Edit in place"));
+        assert!(crate::tools::offered(system).iter().any(|definition| {
+            definition["function"]["name"] == "file_history"
+        }));
     }
 
     #[test]

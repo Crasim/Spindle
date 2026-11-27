@@ -43,6 +43,14 @@ pub enum Call {
         #[serde(default)]
         lines: Option<usize>,
     },
+    #[serde(rename = "file_history")]
+    FileHistory {
+        path: String,
+        #[serde(default)]
+        revision: Option<String>,
+        #[serde(default)]
+        applied: bool,
+    },
     Search {
         query: String,
         #[serde(default)]
@@ -180,6 +188,7 @@ impl Call {
         match self {
             Call::List { .. } => "list",
             Call::Read { .. } => "read",
+            Call::FileHistory { .. } => "file_history",
             Call::Search { .. } => "search",
             Call::Patch { .. } => "patch",
             Call::Create { .. } => "create",
@@ -212,7 +221,7 @@ impl Call {
             Call::List { path } | Call::Search { path, .. } | Call::Test { path } => {
                 path.as_deref().unwrap_or(".")
             }
-            Call::Read { path, .. } | Call::Patch { path, .. } | Call::Create { path, .. } => path,
+            Call::Read { path, .. } | Call::FileHistory { path, .. } | Call::Patch { path, .. } | Call::Create { path, .. } => path,
             Call::Python { file, .. } => file,
             Call::RemoteJob{path,..} | Call::BuildBinary { path, .. } => path,
             Call::TestBinary { .. } | Call::BuildApk { .. } | Call::ReadSkill { .. } => ".",
@@ -262,6 +271,7 @@ impl Call {
         match self {
             Call::List { .. } => format!("List {p}"),
             Call::Read { .. } => format!("Read {p}"),
+            Call::FileHistory { .. } => format!("Review file history for {p}"),
             Call::Search { query, .. } => format!("Search {p} for \"{}\"", short(query, 40)),
             Call::Patch { .. } => format!("Edit {p}"),
             Call::Create { content, .. } => {
@@ -524,6 +534,16 @@ pub fn definitions() -> serde_json::Value {
             "Search files for literal text.",
             serde_json::json!({"query": s("Text to find"), "path": s("Folder to search")}),
             &["query"]
+        ),
+        f(
+            "file_history",
+            "List previous versions of a file, or compare a saved revision to the current file. Read-only.",
+            serde_json::json!({
+                "path": s("File path inside the working folder"),
+                "revision": s("Optional revision ID from the list"),
+                "applied": {"type": "boolean", "description": "Use the applied project file instead of the sandbox copy"}
+            }),
+            &["path"]
         ),
         f(
             "patch",
@@ -1146,6 +1166,7 @@ fn normalize(value: &mut serde_json::Value) {
         let known: &[&str] = match tool.as_str() {
             "list" => &["path"],
             "read" => &["path", "start", "lines"],
+            "file_history" => &["path", "revision", "applied"],
             "search" => &["query", "path"],
             "patch" => &["path", "find", "replace", "hash"],
             "create" => &["path", "content"],
@@ -1441,6 +1462,10 @@ pub fn classify(root: &Path, call: &Call, sandboxed: bool) -> Result<(Risk, Path
 
 /// Classify a filesystem target already resolved by the caller's scope checks.
 pub(crate) fn classify_resolved(root: &Path, call: &Call, sandboxed: bool, path: PathBuf, inside: bool) -> Result<(Risk, PathBuf)> {
+    if matches!(call, Call::FileHistory { .. }) {
+        ensure!(inside && !crate::policy::protected(&path), "Choose a file inside this working folder");
+        return Ok((Risk::Read, path));
+    }
     if matches!(call, Call::PreviewHtml { .. }) {
         ensure!(inside && path.is_file(), "Choose an HTML file inside this working folder");
         ensure!(crate::html_preview::is_html(&path), "Choose a .html or .htm file");
@@ -1640,6 +1665,21 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
             }
             text
         }
+        Call::FileHistory { revision, .. } => {
+            let (working, inside) = resolve(root, call.raw_path())?;
+            ensure!(inside && working == path && !crate::policy::protected(path), "Choose a file inside this working folder");
+            let history = crate::file_history::History::for_path(path)?;
+            if let Some(id) = revision {
+                format!("{} · saved revision {id} → current\n{}", rel(root, path), history.compare(id)?.description())
+            } else {
+                let versions = history.versions()?;
+                let mut text = format!("{} · {} saved versions\n", rel(root, path), versions.len());
+                for id in versions.iter().take(20) {
+                    text.push_str(&format!("{id} · {}\n", crate::file_history::label(id)));
+                }
+                text
+            }
+        }
         Call::Search { query, .. } => {
             ensure!(
                 !query.is_empty() && query.len() <= 200,
@@ -1732,7 +1772,7 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 )
             })?;
             let next = format!("{}{}{}", &body[..range.start], replace, &body[range.end..]);
-            write_atomic(path, next.as_bytes())?;
+            let saved = crate::file_history::write(path, next.as_bytes(), true)?;
             // Show the file as it is now: all of a short file, or the edited lines with a
             // little around them, so the model sees what is (and isn't) changed yet.
             let lines: Vec<&str> = next.lines().collect();
@@ -1747,9 +1787,10 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 .map(|n| format!("{:>5}  {}\n", n + 1, lines[n]))
                 .collect();
             format!(
-                "Edited {} · new hash {}\nLines {}-{} of {} now:\n{shown}",
+                "Edited {} · new hash {}{}\nLines {}-{} of {} now:\n{shown}",
                 rel(root, path),
                 hash(next.as_bytes()),
+                if saved { " · previous version saved (file_history)" } else { "" },
                 from + 1,
                 to,
                 lines.len()
@@ -1771,12 +1812,13 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_generated(path, content.as_bytes(), replace_file)?;
+            let saved = crate::file_history::write(path, content.as_bytes(), replace_file)?;
             format!(
-                "{} {} · hash {}",
+                "{} {} · hash {}{}",
                 if existed { "Replaced" } else { "Created" },
                 rel(root, path),
-                hash(content.as_bytes())
+                hash(content.as_bytes()),
+                if saved { " · previous version saved (file_history)" } else { "" },
             )
         }
         Call::Test { .. }
@@ -1981,13 +2023,9 @@ fn locate(
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_generated(path, bytes, true)
-}
-
 pub(crate) fn write_generated(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     use std::io::Write;
-    let dir = path.parent().context("No parent folder")?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;

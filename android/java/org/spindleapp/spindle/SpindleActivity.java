@@ -451,7 +451,7 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
         return android.os.Build.VERSION.SDK_INT >= 28 ? info.getLongVersionCode() : info.versionCode;
     }
 
-    public String downloadApk(String name, byte[] bytes) throws Exception {
+    public String downloadFile(String name, byte[] bytes) throws Exception {
         if (!name.matches("[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}[.](apk|exe|elf)")) {
             throw new IllegalArgumentException("Invalid executable download name");
         }

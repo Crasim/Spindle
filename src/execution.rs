@@ -238,7 +238,7 @@ pub(crate) fn spec(runtime: &crate::runtime::Runtime, work: PathBuf, call: &Call
                 let (path, inside) = crate::tools::resolve(&work, file)?;
                 ensure!(inside, "Scripts must be inside the working folder");
                 if std::fs::read(&path).ok().as_deref() != Some(code.as_bytes()) {
-                    crate::tools::write_generated(&path, code.as_bytes(), replace)?;
+                    crate::file_history::write(&path, code.as_bytes(), replace)?;
                 }
             }
             let args = args.clone().unwrap_or_default();
@@ -1135,8 +1135,8 @@ impl Engine {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
                 let (text, note, ok) = match result {
-                    Ok(Heard::Spoken(wav)) => match crate::tools::write_generated(&p.target, &wav, p.confirmed_change()) {
-                        Ok(()) => {
+                    Ok(Heard::Spoken(wav)) => match crate::file_history::write(&p.target, &wav, p.confirmed_change()) {
+                        Ok(_) => {
                             if p.project.is_none() {
                                 crate::engine::produced(
                                     &mut self.state,
@@ -1361,7 +1361,7 @@ fn save_images(target: &std::path::Path, images: &[Vec<u8>], replace: bool) -> R
     let mut paths = Vec::with_capacity(images.len());
     for (index, image) in images.iter().enumerate() {
         let path = if index == 0 { target.to_owned() } else { unused(target) };
-        crate::tools::write_generated(&path, image, index == 0 && replace)?;
+        crate::file_history::write(&path, image, index == 0 && replace)?;
         paths.push(path);
     }
     Ok(paths)

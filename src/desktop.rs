@@ -17,6 +17,7 @@ mod message_edit;
 mod notes;
 mod notebook;
 mod chat_search;
+mod file_versions;
 mod bobbins;
 mod paste;
 mod submission;
@@ -2130,6 +2131,7 @@ impl Desktop {
                 let mut action=None;
                 let mut open_file=None;
                 let mut open_document=None;
+                let mut file_versions=None;
                 let state=&self.view.state;
                 if let Some(work)=state.sync.as_ref().and_then(|p|p.remote_work.get(&state.chat_id)) {
                     ui.weak(format!("Last activity on another device · {work}"));
@@ -2363,6 +2365,10 @@ impl Desktop {
                             reader::FileAction::Open if crate::documents::readable(&name) => open_document=Some((disk.clone(),name.clone(),file.text.clone(),false)),
                             reader::FileAction::Open | reader::FileAction::Source => open_file=Some((name.clone(),source(),true,disk.clone())),
                             reader::FileAction::Edit => open_document=Some((disk.clone(),name.clone(),file.text.clone(),true)),
+                            reader::FileAction::History => match disk {
+                                Some(path) => file_versions=Some(path),
+                                None => self.notice="Save this chat snapshot as a file to track its versions.".into(),
+                            },
                             reader::FileAction::Download => {
                                 self.notice=match super_download(&name,disk.as_deref(),&file.text) {
                                     Ok(Some(path))=>format!("Downloaded to {}",crate::projects::display_path(&path)),
@@ -2425,6 +2431,7 @@ impl Desktop {
                     else { let settings=self.speech_settings(); self.voice.speak(ui.ctx(),settings,text,at); }
                 }
                 if let Some(key)=toggle_steps { if !self.open_steps.remove(&key) {self.open_steps.insert(key);} }
+                if let Some(path)=file_versions { self.open_file_history(path); }
                 if let Some((name,source,raw,disk))=open_file {
                     if raw {
                         self.reader.open_output(name, source);
@@ -2873,6 +2880,7 @@ impl Desktop {
 
     fn close_reader(&mut self) {
         self.reader.open = false;
+        self.reader.history = None;
         self.reader.preview.hide();
         self.reader.browser.hide();
     }
@@ -3107,6 +3115,7 @@ impl eframe::App for Desktop {
                 settings::ComposerMenu::dismiss(ctx);
             }
             if v.state.chat_id != self.view.state.chat_id {
+                self.reader.history = None;
                 if matches!(self.execution_panel, Some(crate::sync::placement::Scope::Chat(_))) {
                     self.execution_panel = None;
                 }
@@ -3355,7 +3364,8 @@ impl eframe::App for Desktop {
             let browser_chat = (self.view.state.chat_id, self.view.browser_fallbacks.as_slice(),
                 !self.view.busy && self.view.job.is_none() && !self.view.state.preferences.block_web);
             self.reader.show(ctx, frame, &self.root, &mut attachment, plan,
-                &self.view.state.preferences.browser_path, browser_chat);
+                &self.view.state.preferences.browser_path, browser_chat,
+                !self.view.busy && self.view.job.is_none() && self.view.state.requests.is_empty());
         }
         match self.reader.picked.take() {
             #[cfg(windows)]
@@ -3426,6 +3436,7 @@ impl eframe::App for Desktop {
                     self.notice = format!("Could not open the folder: {e}");
                 }
             }
+            Some(side_tabs::Pick::History(path)) => self.open_file_history(path),
             None => {}
         }
         if std::mem::take(&mut self.reader.preview_requested) {
@@ -3509,10 +3520,13 @@ fn super_download(
     snapshot: &str,
 ) -> anyhow::Result<Option<PathBuf>> {
     #[cfg(target_os = "android")]
-    if name.ends_with(".apk") {
-        let path = disk.ok_or_else(|| anyhow::anyhow!("This APK is unavailable on this device"))?;
-        let bytes = std::fs::read(path)?;
-        return crate::android::download_apk(name, &bytes).map(|path| Some(path.into()));
+    if name.ends_with(".apk") || name.ends_with(".diff") {
+        let bytes = match disk {
+            Some(path) => std::fs::read(path)?,
+            None if name.ends_with(".diff") => snapshot.as_bytes().to_vec(),
+            None => anyhow::bail!("This APK is unavailable on this device"),
+        };
+        return crate::android::download_file(name, &bytes).map(|path| Some(path.into()));
     }
     let bytes = match disk {
         Some(path) => std::fs::read(path)?,
@@ -3535,12 +3549,26 @@ fn super_download(
     let Some(target) = target else {
         return Ok(None);
     };
+    #[cfg(target_os = "linux")]
+    if name.ends_with(".diff") {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        crate::tools::write_generated(&target, &bytes, false)?;
+        return Ok(Some(target));
+    }
     std::fs::write(&target, bytes)?;
     Ok(Some(target))
 }
 
 /// Open a folder in the system file manager.
 impl Desktop {
+    fn open_file_history(&mut self, path: PathBuf) {
+        if let Err(error) = self.reader.open_history(path) {
+            self.notice = format!("{error:#}");
+        }
+    }
+
     /// Speech settings, with models picked from what Ollama reports.
     fn speech_settings(&self) -> crate::speech::Settings {
         let local = |set: &std::collections::BTreeSet<String>| -> Vec<String> {

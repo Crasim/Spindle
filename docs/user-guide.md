@@ -131,6 +131,14 @@ Opening a document previews it locally. **Excerpt to chat** attaches up to 6,000
 
 **Edit** opens Markdown, text, CSV/TSV, Word, Excel (XLSX) and RTF files for editing in the side panel. Markdown has Edit and Preview tabs, a formatting toolbar and word and line counts. Spreadsheets open as a grid with sheet tabs. Right-click a row number or column letter to insert or delete rows and columns. **Save** writes over the original and refuses if the file changed on disk since you opened it. **Save as** always writes a new file. Spindle's Word and Excel writer keeps text and cell values only, so saving over a .docx or .xlsx first warns that fonts, styles, formulas, charts and images will be lost. RTF, XLS, XLSM, XLSB and DOC save only as a new file.
 
+### File history
+
+Choose **History** beside a file in **Panel → Files** or **Library**, or choose **More → File history** on a file card. Select a saved version to compare it with the file on disk. Copy the comparison or save a `.diff` file for UTF-8 text up to 1 MiB. **Restore this version** asks for confirmation and saves the current contents first, so you can switch back.
+
+Spindle saves previous contents when its file tools, document editor, or sandbox apply replace files up to 32 MiB. These snapshots stay encrypted on this device. History starts with changes made after the update. Edits made outside Spindle have their own history.
+
+Ask the model to compare file versions or explain what changed. It can call the read-only `file_history` tool within its working folder and request the applied file's history for a project. For revisions to an existing file, ask it to keep editing the same path.
+
 ## Review council
 
 Use `/council` to get independent feedback on the latest response, or `/council <question or material>` to focus the review. An approved attachment can supply the material. The council calls its saved reviewers sequentially, with no execution tools, and returns each model's feedback under its own heading. Use `/council roster` to inspect the panel and **Settings → Preferences** to change it. The initial roster prefers local `qwen3.5:9b` and `Maternion/spark-x2.6:4b` when installed.
