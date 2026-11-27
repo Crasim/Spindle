@@ -1184,8 +1184,15 @@ pub(super) fn markdown(ui: &mut egui::Ui, text: &str, actions: bool) -> Option<C
 
 enum Piece {
     Job(egui::text::LayoutJob),
-    File(String),
+    File { path: String, label: Option<String> },
     Url(String, String),
+}
+
+fn relative_html_link(path: &str) -> bool {
+    crate::html_preview::is_html(Path::new(path))
+        && !path.contains([':', '\\', '?', '#'])
+        && !path.chars().any(char::is_control)
+        && path.split('/').all(|part| !part.is_empty() && !part.starts_with('.'))
 }
 
 struct Block {
@@ -1417,7 +1424,8 @@ impl MarkdownBlock {
                             hard_breaks += job.text.bytes().filter(|&ch| ch == b'\n').count();
                             size = job.sections.iter().map(|s| s.format.font_id.size).fold(size, f32::max);
                         }
-                        Piece::File(name) | Piece::Url(name, _) => columns_used += name.len(),
+                        Piece::File { path, label } => columns_used += label.as_ref().unwrap_or(path).len(),
+                        Piece::Url(name, _) => columns_used += name.len(),
                     }
                 }
                 let lines = (columns_used.div_ceil(columns)).max(hard_breaks + 1);
@@ -1450,11 +1458,12 @@ impl MarkdownBlock {
                     for piece in pieces {
                         match piece {
                             Piece::Job(job) => { selection.label(ui, job.clone(), false); }
-                            Piece::File(name) => {
-                                if selection.label(ui, Text::new(name).monospace().color(accent()), true)
+                            Piece::File { path, label } => {
+                                let text = label.as_ref().map_or_else(|| Text::new(path).monospace(), Text::new);
+                                if selection.label(ui, text.color(accent()), true)
                                     .on_hover_text("Open in the side panel").clicked()
                                 {
-                                    *action = Some(CodeAction::OpenFile(name.clone()));
+                                    *action = Some(CodeAction::OpenFile(path.clone()));
                                 }
                             }
                             Piece::Url(label, url) => {
@@ -1664,6 +1673,8 @@ fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String], images: bool) ->
                         });
                         if let Some(file) = file {
                             link = Some((file.clone(), String::new(), true));
+                        } else if relative_html_link(local) {
+                            link = Some((local.to_owned(), String::new(), true));
                         } else if url.starts_with("https://") || url.starts_with("http://") {
                             link = Some((url, String::new(), false));
                         } else {
@@ -1699,7 +1710,7 @@ fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String], images: bool) ->
                     if let Some((url, label, file)) = link.take() {
                         block.split();
                         block.pieces.push(if file {
-                            Piece::File(url)
+                            Piece::File { path: url, label: (!label.is_empty()).then_some(label) }
                         } else {
                             Piece::Url(if label.is_empty() { url.clone() } else { label }, url)
                         });
@@ -1742,7 +1753,7 @@ fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String], images: bool) ->
                 if !files.is_empty() { paragraph.push_str(&t); }
                 if files.iter().any(|f| **f == *t) && link.is_none() {
                     block.split();
-                    block.pieces.push(Piece::File(t.to_string()));
+                    block.pieces.push(Piece::File { path: t.to_string(), label: None });
                 } else if let Some((_, label, _)) = &mut link {
                     label.push_str(&t);
                 } else {

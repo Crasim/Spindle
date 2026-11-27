@@ -8,6 +8,7 @@
 - Every chat can use Spindle's workspace and image tools. Tool permissions still apply.
 - Choose **Draft a plan** or enter `/plan <task>`. Use `/plan revise <change>` and `/plan accept <revision>` to work from a specific draft. `/goal <objective>` sets a continuing objective for the chat.
 - While the conversation is working, **Enter** steers the next model request and **Ctrl+Enter** queues a follow-up. Swap these shortcuts in **Settings → Preferences → Conversation**. Both messages appear in the chat. An in-progress tool can finish before the model receives your steer. **Stop** cancels inference and holds remaining work. The Work queue lets you remove or promote a waiting message.
+- Adjust the per-request tool budget in **Settings → Preferences → Tool step limits**. Conversations default to 30 steps and Bobbins to 12.
 - **Ask two models** lets you choose each worker's role and model. Workers run sequentially and the coordinator synthesizes their findings. From any chat, use `/swarm Check boundary conditions --worker reviewer=qwen3.5:9b` for one worker or append a second `--worker role=model`. Use `/steer --worker reviewer <correction>` for one role.
 - **Attach file** previews a workspace file for approval. The harness sends the approved snapshot with the next submitted task. The native picker supports UTF-8 text files up to 6,000 bytes. You can ask for analysis or a proposed patch.
 - In **Skills**, create a named draft from a brief, inspect its Markdown, try an example, and install it. Invoke it as `/<name> <task>`. The first-pass package format is one UTF-8 `SKILL.md` with simple front matter containing `name` and `description`, followed by its instructions. Installing from the workspace copies that definition into the local registry. Reinstall to update.
@@ -130,7 +131,7 @@ Use `/council` to get independent feedback on the latest response, or `/council 
 
 ## Images (ComfyUI)
 
-Spindle tries ComfyUI on this device at port 8188 when the address is blank. For another device, set the address in **Settings › Models › Image generation**, or use `/image server http://model-host.local:8188`. **Refresh models** lists checkpoints and separate diffusion models.
+Spindle tries ComfyUI on this device at port 8188 when the address is blank. For another device, use the host's reachable LAN or VPN address in **Settings › Models › Image generation**, or use `/image server http://model-host.local:8188`. A bare hostname uses port 8188. **Refresh models** lists checkpoints and separate diffusion models and reports any unreadable part of the catalog.
 
 - `/image a red fox in the snow` generates a PNG. Models can also generate pictures with the `image` tool.
 - Attach a PNG or JPEG and send `/image edit make the sky violet`, or use `/image edit "red fox.png" -- make the sky violet` with a workspace file or an image created in this chat. The edit saves a separate file.

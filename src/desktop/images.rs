@@ -73,11 +73,16 @@ impl ImagesForm {
                             ""
                         }
                     );
+                    if !catalog.missing.is_empty() {
+                        self.status.push_str(&format!(" · Could not read {}", catalog.missing.join(" or ")));
+                    } else if catalog.model_count() == 0 {
+                        self.status.push_str(" · This server reports no installed image models");
+                    }
                     self.catalog = Some(catalog);
                     self.checking = None;
                 }
                 Ok(Err(e)) => {
-                    self.status = e.to_string();
+                    self.status = format!("{e:#}");
                     self.checking = None;
                 }
                 Err(mpsc::TryRecvError::Empty) => ui
@@ -95,6 +100,7 @@ impl ImagesForm {
             });
             if self.backend == Backend::ComfyUi {
                 ui.label("ComfyUI address");
+                ui.weak("Leave blank for this device, or enter the LAN or VPN address of the ComfyUI host.");
                 if ui.add(egui::TextEdit::singleline(&mut self.url).hint_text("http://localhost:8188")).changed() {
                     self.catalog = None;
                     self.checking = None;

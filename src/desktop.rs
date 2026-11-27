@@ -2332,8 +2332,17 @@ impl Desktop {
                         });
                     }
                     for (name,choice) in chosen {
-                        let Some(file)=files().find(|f|f.path==name) else {continue};
                         let files_root=state.files_root(&self.root,state.chat_id);
+                        let Some(file)=files().find(|f|f.path==name) else {
+                            if let Some(path) = preview_disk(state, &self.root, &name).or_else(|| {
+                                crate::artifacts::existing_file(&files_root, state.chat_id, &name).ok()
+                            }) {
+                                open_document = Some((Some(path), name, String::new(), false));
+                            } else {
+                                self.notice = format!("HTML preview file is unavailable: {name}");
+                            }
+                            continue;
+                        };
                         let local=if user {true} else {turn.is_some_and(|t|t.files.contains(&file.path))};
                         let disk=if previews.iter().any(|a| a.path == file.path) {
                             preview_disk(state, &self.root, &file.path)
@@ -3764,6 +3773,43 @@ mod transcript_tests {
         let texture_id = app.transcript.file_images["generated.png"].as_ref().unwrap().id();
         assert!(visible_text(&output, "https://example.com/guide").is_some());
         assert!(output.shapes.iter().any(|shape| shape.shape.texture_id() == texture_id));
+    }
+
+    #[test]
+    fn html_link_opens_the_preview_even_without_attachment_metadata() {
+        use egui::{Event, Modifiers, PointerButton};
+        let dir = tempfile::tempdir().unwrap();
+        for attached in [false, true] {
+            let (ctx, mut app) = fixture(dir.path(), 0);
+            let chat = app.view.state.chat_id;
+            let root = app.view.state.files_root(dir.path(), chat);
+            let name = "snake game.html";
+            let contents = "<title>Snake</title>";
+            if attached {
+                app.view.state.thread.turns.insert(0, crate::state::Turn {
+                    html_previews: vec![crate::state::Attachment {
+                        path: name.into(), text: contents.into(),
+                    }],
+                    ..Default::default()
+                });
+            } else {
+                let folder = crate::artifacts::folder(&root, chat).unwrap();
+                std::fs::write(folder.join(name), contents).unwrap();
+            }
+            app.view.state.history.push(crate::ollama::Message::new(
+                "assistant", "[Open HTML preview](snake%20game.html)",
+            ));
+            draw_at_width(&ctx, &mut app, 0, vec![], 400.);
+            let output = draw_at_width(&ctx, &mut app, 1, vec![], 400.);
+            let pos = visible_text(&output, "Open HTML preview").unwrap();
+            for (frame, pressed) in [(2, true), (3, false)] {
+                draw_at_width(&ctx, &mut app, frame, vec![Event::PointerMoved(pos), Event::PointerButton {
+                    pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                }], 400.);
+            }
+            assert!(app.reader.open && app.reader.preview.active());
+            assert!(app.reader.tab == side_tabs::Tab::Viewer);
+        }
     }
 
     #[test]

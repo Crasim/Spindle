@@ -2801,9 +2801,6 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
     text
 }
 
-/// The most tool actions one request may lead to before Spindle stops and reports back.
-const MAX_STEPS: u32 = 30;
-
 pub(crate) fn set_tool_note(state: &mut State, chat: u64, summary: String, status: &str) {
     let len = if chat == state.chat_id {
         state.history.len()
@@ -3464,13 +3461,14 @@ fn route_resolved_call(
     call: std::result::Result<crate::tools::Envelope, String>, chat_read_only: bool,
 ) {
     let is_bobbin = state.bobbins.runs.contains_key(&chat);
-    if steps >= if is_bobbin { 12 } else { MAX_STEPS } {
+    let limit = state.preferences.tool_steps.for_run(is_bobbin);
+    if steps >= limit {
         crate::diagnostics::log(state, chat, model, "tool_call", crate::diagnostics::Reason::ToolLimit, false);
         set_tool_note(
             state,
             chat,
             "Tool call".into(),
-            "Stopped: the step limit for one request was reached",
+            &format!("Stopped: this request reached its tool step limit ({limit})"),
         );
         return;
     }
@@ -5001,6 +4999,7 @@ fn finish_turn(
     history.push(Message::new("assistant", &shown));
     state.note_thread_update(origin);
     let attempted_tool = call.is_some();
+    let can_continue = task.steps < state.preferences.tool_steps.for_run(is_bobbin);
     if repeated && (matches!(task.mode, Mode::Chat) || call.is_some()) {
         let model = task.actual.clone().unwrap_or_else(|| task.model.clone());
         let summary = match &call {
@@ -5022,7 +5021,7 @@ fn finish_turn(
                 },
             };
             route_call(state, origin, &model, task.steps, root, Ok(call), false);
-        } else if call.is_none() && !was_repeat_note {
+        } else if call.is_none() && !was_repeat_note && can_continue {
             continue_with(
                 state,
                 origin,
@@ -5087,7 +5086,7 @@ fn finish_turn(
             matches!(task.mode, Mode::Conversation),
         );
     } else if !is_bobbin && matches!(task.mode, Mode::Chat)
-        && task.steps < MAX_STEPS
+        && can_continue
         && !was_auto_read
         && let Some(path) = implied_read(state, origin, root, &answer)
     {
@@ -5103,9 +5102,9 @@ fn finish_turn(
             },
         };
         route_call(state, origin, &model, task.steps, root, Ok(call), false);
-    } else if !is_bobbin && matches!(task.mode, Mode::Chat) && task.steps < MAX_STEPS {
+    } else if !is_bobbin && matches!(task.mode, Mode::Chat) {
         let model = task.actual.clone().unwrap_or_else(|| task.model.clone());
-        match follow_up(state, origin, &answer, was_nudge) {
+        match can_continue.then(|| follow_up(state, origin, &answer, was_nudge)).flatten() {
             Some(note) => continue_with(state, origin, &model, task.steps + 1, note, false),
             None if state.preferences.auto_apply => auto_apply(state, origin),
             None => {}
@@ -5519,6 +5518,47 @@ mod tests {
 
     fn bobbin_action(engine: &mut Engine, value: serde_json::Value) -> Result<String> {
         engine.command(&format!("/bobbin {value}"), false)
+    }
+
+    #[test]
+    fn configured_tool_limits_stop_conversations_and_bobbins_independently() -> Result<()> {
+        let mut serialized = serde_json::to_value(crate::state::Preferences::default())?;
+        serialized.as_object_mut().unwrap().remove("tool_steps");
+        let mut preferences: crate::state::Preferences = serde_json::from_value(serialized)?;
+        assert_eq!(preferences.tool_steps.for_run(false), 30);
+        assert_eq!(preferences.tool_steps.for_run(true), 12);
+        preferences.tool_steps.conversation = 1;
+        preferences.tool_steps.bobbins = 2;
+
+        let root = tempfile::tempdir()?;
+        let mut engine = fixture(root.path());
+        engine.state.preferences = serde_json::from_value(serde_json::to_value(preferences)?)?;
+        let call = r#"{"name":"list","args":{"path":"."}}"#;
+        engine.command("Check the files", false)?;
+        engine.state.queue.front_mut().unwrap().steps = 1;
+        finish_turn(&mut engine.state, call.into(), Turn::default(), Some(root.path()))?;
+        assert!(engine.state.requests.is_empty());
+        assert!(engine.state.thread.turns[&1].tool.as_ref().unwrap().status.contains("tool step limit (1)"));
+
+        let draft = crate::bobbins::Draft {
+            name: "Review".into(), purpose: "Review files".into(), model: "one".into(),
+            output_files: true, ..Default::default()
+        };
+        bobbin_action(&mut engine, serde_json::json!({"action":"save","draft":draft}))?;
+        let id = engine.state.bobbins.profiles.keys().next().unwrap().clone();
+        bobbin_action(&mut engine, serde_json::json!({"action":"run","id":id,"prompt":"List files"}))?;
+        let chat = engine.state.queue[0].origin.unwrap();
+        engine.state.queue.front_mut().unwrap().steps = 1;
+        finish_turn(&mut engine.state, call.into(), Turn::default(), Some(root.path()))?;
+        engine.dispatch_ready(false)?;
+        assert_eq!(engine.state.queue[0].steps, 2);
+        let second = r#"{"name":"list","args":{"path":"other"}}"#;
+        finish_turn(&mut engine.state, second.into(), Turn::default(), Some(root.path()))?;
+        assert!(engine.state.requests.is_empty());
+        let (thread, _) = engine.state.thread_data(chat).unwrap();
+        let status = &thread.turns.values().next_back().unwrap().tool.as_ref().unwrap().status;
+        assert!(status.contains("tool step limit (2)"), "{status}");
+        Ok(())
     }
 
     #[test]

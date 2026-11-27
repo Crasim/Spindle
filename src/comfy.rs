@@ -113,6 +113,9 @@ impl Settings {
             if models.checkpoints.is_empty() && models.diffusion.is_empty() {
                 lines.push("ComfyUI responded and listed no checkpoint or diffusion model files.".into());
             }
+            if !models.missing.is_empty() {
+                lines.push(format!("Catalog incomplete: could not read {}.", models.missing.join(" or ")));
+            }
             lines.push(format!(
                 "Built-in transparent PNG: {}",
                 if models.alpha() {
@@ -442,7 +445,13 @@ pub(crate) fn address(input: &str) -> Result<String> {
     } else if input.contains("://") {
         crate::local_servers::address(input)
     } else {
-        crate::local_servers::address(&format!("http://{input}"))
+        let mut url = reqwest::Url::parse(&format!("http://{input}"))
+            .context("Enter a ComfyUI hostname or HTTP address")?;
+        let authority = input.split('/').next().unwrap_or(input);
+        if !authority.rsplit(']').next().is_some_and(|host| host.contains(':')) {
+            let _ = url.set_port(Some(8188));
+        }
+        crate::local_servers::address(url.as_str())
     }
 }
 
@@ -454,12 +463,15 @@ pub struct Catalog {
     vaes: Vec<String>,
     background: Vec<String>,
     reference: bool,
+    pub missing: Vec<&'static str>,
 }
+
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(8);
 
 async fn object(http: &reqwest::Client, url: &str, node: &str) -> Result<Value> {
     let value: Value = http
         .get(format!("{url}/object_info/{node}"))
-        .timeout(Duration::from_secs(5))
+        .timeout(CATALOG_TIMEOUT)
         .send()
         .await?
         .error_for_status()?
@@ -468,12 +480,15 @@ async fn object(http: &reqwest::Client, url: &str, node: &str) -> Result<Value> 
     Ok(value.get(node).cloned().unwrap_or_default())
 }
 
+fn choice_options<'a>(node: &'a Value, field: &str) -> Option<&'a Vec<Value>> {
+    ["required", "optional"].into_iter().find_map(|section| {
+        let specs = &node["input"][section][field];
+        specs[0].as_array().or_else(|| specs[1]["options"].as_array())
+    })
+}
+
 fn choices(node: &Value, field: &str) -> Vec<String> {
-    let specs = &node["input"]["required"][field];
-    specs[0]
-        .as_array()
-        .or_else(|| specs[1]["options"].as_array())
-        .into_iter()
+    choice_options(node, field).into_iter()
         .flatten()
         .filter_map(|v| v.as_str().map(str::to_owned))
         .collect()
@@ -481,7 +496,7 @@ fn choices(node: &Value, field: &str) -> Vec<String> {
 
 async fn model_files(http: &reqwest::Client, url: &str, folder: &str) -> Result<Vec<String>> {
     Ok(http.get(format!("{url}/models/{folder}"))
-        .timeout(Duration::from_secs(5)).send().await?.error_for_status()?
+        .timeout(CATALOG_TIMEOUT).send().await?.error_for_status()?
         .json::<Vec<String>>().await?)
 }
 
@@ -494,38 +509,87 @@ fn model_choices(node: &Value, input: &str, files: Result<Vec<String>>) -> Vec<S
 }
 
 pub async fn catalog(url: &str) -> Result<Catalog> {
-    let url = address(url)?;
-    let url = url.as_str();
     let http = client()?;
+    catalog_endpoint(&http, &address(url)?).await.map(|(_, catalog)| catalog)
+}
+
+fn alternate_api(url: &str) -> Option<String> {
+    (!url.ends_with("/api")).then(|| format!("{url}/api"))
+}
+
+async fn catalog_endpoint(http: &reqwest::Client, url: &str) -> Result<(String, Catalog)> {
+    let first = catalog_at(http, url).await;
+    if first.as_ref().is_ok_and(|catalog| catalog.missing.is_empty() && catalog.model_count() > 0) {
+        return Ok((url.to_owned(), first?));
+    }
+    if let Some(other) = alternate_api(url)
+        && let Ok(catalog) = catalog_at(http, &other).await
+        && first.as_ref().map_or(true, |first|
+            (catalog.model_count() > 0, catalog.missing.is_empty(), catalog.model_count())
+                > (first.model_count() > 0, first.missing.is_empty(), first.model_count()))
+    {
+        return Ok((other, catalog));
+    }
+    Ok((url.to_owned(), first?))
+}
+
+async fn catalog_at(http: &reqwest::Client, url: &str) -> Result<Catalog> {
     let (checkpoints, diffusion, clip, vae, background, reference, checkpoint_files, diffusion_files, encoder_files, vae_files) = tokio::join!(
-        object(&http, url, "CheckpointLoaderSimple"),
-        object(&http, url, "UNETLoader"),
-        object(&http, url, "CLIPLoader"),
-        object(&http, url, "VAELoader"),
-        object(&http, url, "LoadBackgroundRemovalModel"),
-        object(&http, url, "ReferenceLatent"),
-        model_files(&http, url, "checkpoints"),
-        model_files(&http, url, "diffusion_models"),
-        model_files(&http, url, "text_encoders"),
-        model_files(&http, url, "vae"),
+        object(http, url, "CheckpointLoaderSimple"),
+        object(http, url, "UNETLoader"),
+        object(http, url, "CLIPLoader"),
+        object(http, url, "VAELoader"),
+        object(http, url, "LoadBackgroundRemovalModel"),
+        object(http, url, "ReferenceLatent"),
+        model_files(http, url, "checkpoints"),
+        model_files(http, url, "diffusion_models"),
+        model_files(http, url, "text_encoders"),
+        model_files(http, url, "vae"),
     );
+    let mut missing = vec![];
+    for (label, node, field, files) in [
+        ("checkpoints", &checkpoints, "ckpt_name", &checkpoint_files),
+        ("diffusion models", &diffusion, "unet_name", &diffusion_files),
+    ] {
+        if files.is_err() && node.as_ref().ok().and_then(|node| choice_options(node, field)).is_none() {
+            missing.push(label);
+        }
+    }
+    let checkpoints = model_choices(&checkpoints.unwrap_or_default(), "ckpt_name", checkpoint_files);
+    let diffusion = model_choices(&diffusion.unwrap_or_default(), "unet_name", diffusion_files);
     ensure!(
-        checkpoints.as_ref().is_ok_and(Value::is_object)
-            || diffusion.as_ref().is_ok_and(Value::is_object)
-            || checkpoint_files.is_ok() || diffusion_files.is_ok(),
-        "Couldn't read ComfyUI models at {url}. Check that the server is running and review its address in Settings › Models › Image generation."
+        missing.is_empty() || !checkpoints.is_empty() || !diffusion.is_empty(),
+        "Couldn't read the ComfyUI catalog at {url} (missing {}). If ComfyUI is on another device, use its reachable LAN or VPN address in Settings › Models › Image generation.",
+        missing.join(" and "),
     );
     Ok(Catalog {
-        checkpoints: model_choices(&checkpoints.unwrap_or_default(), "ckpt_name", checkpoint_files),
-        diffusion: model_choices(&diffusion.unwrap_or_default(), "unet_name", diffusion_files),
+        checkpoints,
+        diffusion,
         encoders: model_choices(&clip.unwrap_or_default(), "clip_name", encoder_files),
         vaes: model_choices(&vae.unwrap_or_default(), "vae_name", vae_files),
         background: choices(&background.unwrap_or_default(), "bg_removal_name"),
         reference: reference.is_ok_and(|node| !node.is_null()),
+        missing,
     })
 }
 
+async fn prompt_endpoint(http: &reqwest::Client, url: &str) -> Result<String> {
+    for endpoint in std::iter::once(url.to_owned()).chain(alternate_api(url)) {
+        let Ok(response) = http.get(format!("{endpoint}/prompt"))
+            .timeout(CATALOG_TIMEOUT).send().await.and_then(reqwest::Response::error_for_status)
+        else { continue; };
+        if response.json::<Value>().await.is_ok_and(|value| value["exec_info"].is_object()) {
+            return Ok(endpoint);
+        }
+    }
+    bail!("Couldn't reach the ComfyUI prompt API at {url}. Check the address and that the server is reachable from this device.")
+}
+
 impl Catalog {
+    pub(crate) fn model_count(&self) -> usize {
+        self.checkpoints.len() + self.diffusion.len()
+    }
+
     pub fn alpha(&self) -> bool {
         !self.background.is_empty()
     }
@@ -838,10 +902,10 @@ pub async fn run(
     if settings.backend == Backend::StableDiffusion {
         return stable_diffusion(&settings.url, r, source, cancel).await;
     }
-    let url = &address(&settings.url)?;
+    let address = address(&settings.url)?;
     let http = client()?;
     let selected = workflow(settings, r, source.is_some())?;
-    let (graph, checkpoint) = if let Some((workflow_path, profile)) = selected {
+    let (url, graph, checkpoint) = if let Some((workflow_path, profile)) = selected {
         let text = std::fs::read_to_string(workflow_path)
             .with_context(|| format!("Couldn't read the workflow {workflow_path}"))?;
         let workflow: Value = serde_json::from_str(&text)
@@ -882,28 +946,32 @@ pub async fn run(
             }
             request.parameters = options;
         }
-        if text.contains("{{model}}") {
+        let url = if text.contains("{{model}}") {
             let name = r.model.as_deref().unwrap_or(&settings.checkpoint);
-            request.model = Some(catalog(url).await?.model(name)?);
+            let (url, models) = catalog_endpoint(&http, &address).await?;
+            request.model = Some(models.model(name)?);
+            url
         } else {
             ensure!(
                 r.model.is_none(),
                 "Add {{{{model}}}} to the workflow input to switch its model"
             );
-        }
-        let uploaded = upload(&http, url, r.seed, source).await?;
+            prompt_endpoint(&http, &address).await?
+        };
+        let uploaded = upload(&http, &url, r.seed, source).await?;
         let name = std::path::Path::new(workflow_path)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         (
+            url,
             fill(&workflow, &request, uploaded.as_deref()),
             profile.map_or(name, |p| p.name.clone()),
         )
     } else {
-        let models = catalog(url).await?;
+        let (url, models) = catalog_endpoint(&http, &address).await?;
         let checkpoint = models.model(r.model.as_deref().unwrap_or(&settings.checkpoint))?;
-        let uploaded = upload(&http, url, r.seed, source).await?;
+        let uploaded = upload(&http, &url, r.seed, source).await?;
         let mut graph = if models.diffusion.contains(&checkpoint) {
             flux_graph(&checkpoint, &models, r, uploaded.as_deref())?
         } else {
@@ -912,7 +980,7 @@ pub async fn run(
         if r.transparent {
             transparent_output(&mut graph, &models)?;
         }
-        (graph, checkpoint)
+        (url, graph, checkpoint)
     };
     ensure!(!cancel.load(Ordering::Relaxed), "Stopped");
     let started = Instant::now();
@@ -1262,6 +1330,28 @@ mod tests {
         assert_eq!(models.diffusion, ["flux3_klein.safetensors"]);
         assert_eq!(models.encoders, ["qwen.safetensors"]);
         assert_eq!(address("image-server:8188")?, "http://image-server:8188");
+        assert_eq!(address("image-server")?, "http://image-server:8188");
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_uses_the_proxy_api_and_reports_incomplete_results() -> Result<()> {
+        use axum::{Json, Router, routing::get};
+        let router = Router::new()
+            .route("/models/checkpoints", get(|| async { Json(Vec::<String>::new()) }))
+            .route("/api/models/diffusion_models", get(|| async { Json(vec!["flux3_klein.safetensors"]) }))
+            .route("/api/prompt", get(|| async { Json(json!({"exec_info":{"queue_remaining":0}})) }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async { axum::serve(listener, router).await.unwrap() });
+        let http = client()?;
+        assert!(catalog_at(&http, &url).await.is_err());
+        let (endpoint, models) = catalog_endpoint(&http, &url).await?;
+        assert_eq!(endpoint, format!("{url}/api"));
+        assert_eq!(models.diffusion, ["flux3_klein.safetensors"]);
+        assert_eq!(models.missing, ["checkpoints"]);
+        assert_eq!(prompt_endpoint(&http, &url).await?, endpoint);
         server.abort();
         Ok(())
     }

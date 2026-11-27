@@ -347,6 +347,25 @@ impl Tuning {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolStepLimits {
+    pub conversation: u32,
+    pub bobbins: u32,
+}
+
+impl Default for ToolStepLimits {
+    fn default() -> Self {
+        Self { conversation: 30, bobbins: 12 }
+    }
+}
+
+impl ToolStepLimits {
+    pub(crate) fn for_run(&self, bobbin: bool) -> u32 {
+        if bobbin { self.bobbins } else { self.conversation }.max(1)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Preferences {
     #[serde(default)]
     pub compaction: crate::compaction::Policy,
@@ -358,6 +377,8 @@ pub struct Preferences {
     pub enter_sends: bool,
     #[serde(default = "crate::memory::enabled")]
     pub enter_steers: bool,
+    #[serde(default)]
+    pub tool_steps: ToolStepLimits,
     #[serde(default)]
     pub nerd_stats: bool,
     #[serde(default)]
@@ -495,6 +516,7 @@ impl Default for Preferences {
             sidebar_width: None,
             enter_sends: true,
             enter_steers: true,
+            tool_steps: ToolStepLimits::default(),
             nerd_stats: false,
             over_18: false,
             text_size: 16,

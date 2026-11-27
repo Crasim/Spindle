@@ -95,7 +95,7 @@ pub async fn discover(host: &str) -> Result<Vec<Server>> {
         tasks.spawn(async move {
             if kind == ComfyUi {
                 let catalog = crate::comfy::catalog(&url).await.ok()?;
-                return Some((order, Server { name, kind, url, models: catalog.checkpoints.len() + catalog.diffusion.len() }));
+                return Some((order, Server { name, kind, url, models: catalog.model_count() }));
             }
             let mut response = http
                 .get(format!("{url}{catalog}"))

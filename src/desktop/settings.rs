@@ -712,6 +712,19 @@ impl Desktop {
                     changed |= ui.radio_value(&mut prefs.enter_steers, false, "Enter queues · Ctrl+Enter steers").changed();
                 });
             ui.add_space(14.);
+            ui.heading("Tool step limits");
+            ui.weak("Maximum number of tool steps per request before Spindle stops.");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Conversations");
+                changed |= ui.add(egui::DragValue::new(&mut prefs.tool_steps.conversation)
+                    .range(1..=u32::MAX)).changed();
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Bobbins");
+                changed |= ui.add(egui::DragValue::new(&mut prefs.tool_steps.bobbins)
+                    .range(1..=u32::MAX)).changed();
+            });
+            ui.add_space(14.);
             ui.heading("Appearance");
             ui.add_space(5.);
             changed |= ui.checkbox(&mut prefs.nerd_stats, "Show nerd stats").changed();
