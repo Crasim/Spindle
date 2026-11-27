@@ -1513,8 +1513,13 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 let (chat, branch) = split(rest);
                 let chat: u64 = chat
                     .parse()
-                    .context("Use /branch main|delete CHAT BRANCH")?;
+                    .context("Use /branch merge|main|delete CHAT BRANCH")?;
                 match action {
+                    "merge" => {
+                        let count = crate::sync::adapter::merge_branch(&mut self.state, chat, branch)?;
+                        Ok(if count == 1 { "Merged 1 message into this chat".into() }
+                            else { format!("Merged {count} messages into this chat") })
+                    }
                     "main" => {
                         crate::sync::adapter::make_main(&mut self.state, chat, branch)?;
                         Ok("That branch is now the main one; the old main is a branch".into())
@@ -1523,7 +1528,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                         crate::sync::adapter::delete_branch(&mut self.state, chat, branch)?;
                         Ok("Branch deleted on every device".into())
                     }
-                    _ => bail!("Use /branch main|delete CHAT BRANCH"),
+                    _ => bail!("Use /branch merge|main|delete CHAT BRANCH"),
                 }
             }
             "/help" => Ok(HELP.into()),

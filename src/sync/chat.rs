@@ -62,6 +62,13 @@ pub struct Placed {
     pub clock: Hlc,
 }
 
+/// A turn copied onto another line by a merge. It counts only while the copy is on main.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MergeCopy {
+    pub source: String,
+    pub copy: String,
+}
+
 /// A branch other than the main one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Branch {
@@ -69,6 +76,8 @@ pub struct Branch {
     pub device: String,
     /// How many turns it shares with the main branch.
     pub fork: usize,
+    /// The first message that isn't already on main through a merge.
+    pub new_from: usize,
     /// The whole line, from the first turn.
     pub turns: Vec<Placed>,
 }
@@ -77,7 +86,7 @@ impl Branch {
     /// The branch's identity: its first turn after the fork.
     pub fn id(&self) -> &str {
         self.turns
-            .get(self.fork)
+            .get(self.new_from)
             .map(|t| t.turn.h.as_str())
             .unwrap_or("")
     }
@@ -107,9 +116,13 @@ pub fn view(
         .map(|r| r.1.clock.clone())
         .max();
     let mut turns: BTreeMap<String, Placed> = BTreeMap::new();
+    let mut copies = BTreeSet::<MergeCopy>::new();
     for (_, e, b) in records {
         if since.as_ref().is_some_and(|s| e.clock <= *s) {
             continue;
+        }
+        if let Some(entries) = b.value["merges"].as_array() {
+            copies.extend(entries.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()));
         }
         let Some(list) = b.value.get("turns").and_then(|t| t.as_array()) else {
             continue;
@@ -196,6 +209,25 @@ pub fn view(
         .clone();
     let main_line = follow(&first, origin);
     let on_main: BTreeSet<&str> = main_line.iter().map(|t| t.turn.h.as_str()).collect();
+    let mut sources: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for entry in &copies {
+        if let (Some(original), Some(copy)) = (turns.get(&entry.source), turns.get(&entry.copy))
+            && original.turn.role == copy.turn.role
+            && original.turn.content == copy.turn.content
+            && original.turn.images == copy.turn.images
+        {
+            sources.entry(&entry.copy).or_default().push(&entry.source);
+        }
+    }
+    let mut included = BTreeSet::new();
+    let mut represented: Vec<_> = sources.keys().copied().filter(|hash| on_main.contains(hash)).collect();
+    while let Some(copy) = represented.pop() {
+        for &source in sources.get(copy).into_iter().flatten() {
+            if included.insert(source) {
+                represented.push(source);
+            }
+        }
+    }
     let mut branches = vec![];
     // Forks at the root and after each main turn.
     let mut parents: Vec<(usize, String)> = vec![(0, String::new())];
@@ -210,14 +242,29 @@ pub fn view(
             if on_main.contains(kid.as_str()) {
                 continue;
             }
-            let device = turns[kid].device.clone();
-            let mut line: Vec<Placed> = main_line[..fork].to_vec();
-            line.extend(follow(kid, &device));
-            branches.push(Branch {
-                device,
-                fork,
-                turns: line,
-            });
+            // A device may extend an already merged branch while offline. Find the first
+            // unmerged turn on each continuation, without hiding the new work or copying
+            // the merged prefix again.
+            let mut pending = vec![kid.as_str()];
+            while let Some(start) = pending.pop() {
+                if included.contains(start) {
+                    pending.extend(children.get(start).into_iter().flatten().rev().map(String::as_str));
+                    continue;
+                }
+                let device = turns[start].device.clone();
+                let mut prefix = Vec::new();
+                let mut at = turns[start].turn.p.as_str();
+                while at != parent {
+                    let earlier = &turns[at];
+                    prefix.push(earlier.clone());
+                    at = earlier.turn.p.as_str();
+                }
+                let new_from = fork + prefix.len();
+                let mut line = main_line[..fork].to_vec();
+                line.extend(prefix.into_iter().rev());
+                line.extend(follow(start, &device));
+                branches.push(Branch { device, fork, new_from, turns: line });
+            }
         }
     }
     View {

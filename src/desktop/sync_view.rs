@@ -1218,21 +1218,22 @@ impl Desktop {
 
 
 
-    /// Branches from other devices: a bar above the chat with View, Make main and Delete.
+    /// Branches from other devices and the ways to resolve them.
     pub(super) fn branch_bar(&mut self, ui: &mut egui::Ui) {
         let state = &self.view.state;
         let Some(list) = state
             .space
             .as_ref()
             .and_then(|s| s.branches.get(&state.chat_id))
-            .cloned()
         else {
             return;
         };
         let chat = state.chat_id;
+        let merge_ready = !state.queue.iter().any(|task| task.origin.unwrap_or(chat) == chat);
         let mut send = None;
-        for b in &list {
-            egui::Frame::new()
+        for b in list {
+            let new = b.messages.len().saturating_sub(b.merge_from());
+            ui.push_id(&b.id, |ui| egui::Frame::new()
                 .stroke(egui::Stroke::new(1_f32, line()))
                 .corner_radius(8)
                 .inner_margin(8)
@@ -1240,17 +1241,18 @@ impl Desktop {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(Text::new(format!("Branch from {}", b.device_name)).strong());
                         ui.weak(format!(
-                            "after message {} · {} message{}",
-                            b.fork,
-                            b.messages.len().saturating_sub(b.fork),
-                            if b.messages.len().saturating_sub(b.fork) == 1 {
-                                ""
-                            } else {
-                                "s"
-                            }
+                            "after message {} · {new} to merge",
+                            b.fork
                         ));
                         if ui.small_button("View").clicked() {
                             self.sync_form.reading = Some((chat, b.id.clone()));
+                        }
+                        if ui.add_enabled(merge_ready && new > 0, egui::Button::new("Merge").small())
+                            .on_hover_text("Keep the current chat and append this branch’s new messages")
+                            .on_disabled_hover_text("Finish the queued work in this chat before merging")
+                            .clicked()
+                        {
+                            send = Some(format!("/branch merge {chat} {}", b.id));
                         }
                         if ui
                             .small_button("Make main")
@@ -1269,7 +1271,7 @@ impl Desktop {
                             send = Some(format!("/branch delete {chat} {}", b.id));
                         }
                     });
-                });
+                }));
             ui.add_space(4.);
         }
         if let Some((c, id)) = self.sync_form.reading.clone() {
@@ -1285,12 +1287,12 @@ impl Desktop {
                             .max_height(480.)
                             .show(ui, |ui| {
                                 for (i, m) in
-                                    b.messages.iter().enumerate().skip(b.fork.saturating_sub(1))
+                                    b.messages.iter().enumerate().skip(b.merge_from().saturating_sub(1))
                                 {
                                     ui.label(
                                         Text::new(if m.role == "user" { "You" } else { "Reply" })
                                             .strong()
-                                            .color(if i < b.fork { muted() } else { accent() }),
+                                            .color(if i < b.merge_from() { muted() } else { accent() }),
                                     );
                                     reader::markdown(ui, &m.content, m.role != "user");
                                     ui.add_space(6.);

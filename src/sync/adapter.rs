@@ -132,6 +132,18 @@ pub struct BranchInfo {
     /// How many messages it shares with the main branch.
     pub fork: usize,
     pub messages: Vec<Message>,
+    /// Messages before this position were already merged into the active history.
+    #[serde(default)]
+    pub new_from: usize,
+    /// Syncable tool notes, results and attachments, keyed by position in this history.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub info: BTreeMap<usize, Value>,
+}
+
+impl BranchInfo {
+    pub fn merge_from(&self) -> usize {
+        self.fork.max(self.new_from)
+    }
 }
 
 /// Everything this device keeps about sync (inside Spindle's encrypted state).
@@ -187,9 +199,14 @@ pub struct SyncState {
     /// A branch the user made main, per synced chat (published with the chat).
     #[serde(default)]
     pub main: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pending_main: BTreeSet<String>,
     /// Turns hidden with Delete branch, per synced chat.
     #[serde(default)]
     pub dropped: BTreeMap<String, BTreeSet<String>>,
+    /// Merge receipts waiting to be published together with the copied messages.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_merges: BTreeMap<String, BTreeSet<chat::MergeCopy>>,
     #[serde(default)]
     pub status: Status,
     /// Sync and remote work paused from the tray or Settings.
@@ -255,8 +272,12 @@ pub struct DetachedSpace {
     chat_fingerprints: BTreeMap<String, String>,
     #[serde(default)]
     main: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pending_main: BTreeSet<String>,
     #[serde(default)]
     dropped: BTreeMap<String, BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pending_merges: BTreeMap<String, BTreeSet<chat::MergeCopy>>,
     #[serde(default)]
     provider_host: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -291,7 +312,9 @@ pub fn disconnect(state: &mut State) {
                     .filter(|(key, _)| key.starts_with("chat:"))
                     .collect(),
                 main: sync.main,
+                pending_main: sync.pending_main,
                 dropped: sync.dropped,
+                pending_merges: sync.pending_merges,
                 provider_host: sync.provider_host,
                 peer_dns: sync.peer_dns,
                 imported_providers: sync.imported_providers,
@@ -315,7 +338,9 @@ pub fn reconnect(state: &mut State, identity: Identity) -> SyncState {
         sync.base = previous.project_base;
         sync.seen = previous.chat_fingerprints;
         sync.main = previous.main;
+        sync.pending_main = previous.pending_main;
         sync.dropped = previous.dropped;
+        sync.pending_merges = previous.pending_merges;
         sync.provider_host = previous.provider_host;
         sync.peer_dns = previous.peer_dns;
         sync.imported_providers = previous.imported_providers;
@@ -350,7 +375,9 @@ impl SyncState {
             base: BTreeMap::new(),
             branches: BTreeMap::new(),
             main: BTreeMap::new(),
+            pending_main: BTreeSet::new(),
             dropped: BTreeMap::new(),
+            pending_merges: BTreeMap::new(),
             status: Status::default(),
             paused: false,
             activity: vec![],
@@ -924,7 +951,14 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
             .first()
             .map(|r| r.1.device.clone())
             .unwrap_or_else(|| device.clone());
-        let main = sync.main.get(&gid).cloned();
+        let before = space.value(Kind::Chat, &gid);
+        let saved_main = || sync.main.get(&gid).cloned();
+        let main = if sync.pending_main.contains(&gid) || sync.pending_merges.contains_key(&gid) {
+            saved_main()
+        } else {
+            before.as_ref().and_then(|v| v["main"].as_str()).map(str::to_owned).or_else(saved_main)
+        };
+        let pending_merge = sync.pending_merges.get(&gid);
         let dropped_now = sync.dropped.get(&gid).cloned().unwrap_or_default();
         let merged = chat::view(
             &space.item(Kind::Chat, &gid),
@@ -933,9 +967,11 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
             &dropped_now,
         );
         let mut dropped = dropped_now;
-        for t in merged.main.iter().filter(|t| t.device == device) {
-            if !local.contains(t.turn.h.as_str()) && turns.len() <= merged.main.len() {
-                dropped.insert(t.turn.h.clone());
+        if pending_merge.is_none() && !sync.pending_main.contains(&gid) {
+            for t in merged.main.iter().filter(|t| t.device == device) {
+                if !local.contains(t.turn.h.as_str()) && turns.len() <= merged.main.len() {
+                    dropped.insert(t.turn.h.clone());
+                }
             }
         }
         sync.dropped.insert(gid.clone(), dropped.clone());
@@ -943,7 +979,7 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
         let model_provider = legacy_provider_id(scope)
             .and_then(|_| state.providers.iter().find(|p| p.id == scope))
             .map(|p| json!({"model": thread.model, "connection": provider_fingerprint(p)}));
-        let value = json!({
+        let mut value = json!({
             "title": thread.title,
             "model": thread.model,
             "model_provider": model_provider,
@@ -957,12 +993,17 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
         });
         let key = format!("chat:{gid}");
         let f = fingerprint(&value);
-        if sync.seen.get(&key) == Some(&f) {
+        if pending_merge.is_none() && sync.seen.get(&key) == Some(&f) {
             continue;
         }
-        let before = space.value(Kind::Chat, &gid);
+        if let Some(copies) = pending_merge {
+            value["merges"] = serde_json::to_value(copies)?;
+        }
         let changed = super::core::changed_fields(before.as_ref(), &value);
         space.put_chat(&gid, value, changed)?;
+        sync.pending_main.remove(&gid);
+        sync.pending_merges.remove(&gid);
+        if let Some(main) = main { sync.main.insert(gid, main); }
         sync.seen.insert(key, f);
         n += 1;
     }
@@ -1358,6 +1399,9 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         {
             continue;
         }
+        if sync.pending_merges.contains_key(&gid) || sync.pending_main.contains(&gid) {
+            continue;
+        }
         // In a project waiting for its folder here: wait with it (not loose in Chats).
         if v["project"].as_str().is_some_and(|p| policies.blocked(project_sync::resolved(&sync.project_aliases, p))) {
             continue;
@@ -1378,6 +1422,7 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
             .as_str()
             .map(str::to_owned)
             .or_else(|| sync.main.get(&gid).cloned());
+        if let Some(main) = &main { sync.main.insert(gid.clone(), main.clone()); }
         let mut dropped: BTreeSet<String> = sync.dropped.get(&gid).cloned().unwrap_or_default();
         for r in &records {
             if let Some(list) = r.2.value["dropped"].as_array() {
@@ -1387,8 +1432,8 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         let view = chat::view(&records, &origin, main.as_deref(), &dropped);
         let fp = fingerprint(&json!({
             "main": view.main.iter().map(|t| &t.turn.h).collect::<Vec<_>>(),
-            "branches": view.branches.iter().map(|b| b.turns.iter()
-                .map(|t| &t.turn.h).collect::<Vec<_>>()).collect::<Vec<_>>(),
+            "branches": view.branches.iter().map(|b| (b.new_from, b.turns.iter()
+                .map(|t| &t.turn.h).collect::<Vec<_>>())).collect::<Vec<_>>(),
             "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"]],
         }));
         if sync.seen.get(&format!("chatview:{gid}")) == Some(&fp) {
@@ -1429,13 +1474,7 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
             let mut turns = BTreeMap::new();
             let mut results = BTreeSet::new();
             for (i, t) in view.main.iter().enumerate() {
-                if t.turn.info["tool_result"] == true {
-                    results.insert(i);
-                } else if let Ok(turn) =
-                    serde_json::from_value::<crate::state::Turn>(t.turn.info.clone())
-                {
-                    turns.insert(i, turn);
-                }
+                restore_turn(i, &t.turn.info, &mut turns, &mut results);
             }
             *history = messages;
             thread.turns = turns;
@@ -1470,6 +1509,10 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
                     .unwrap_or_else(|| "another device".into()),
                 fork: b.fork,
                 messages: to_messages(&b.turns),
+                new_from: b.new_from,
+                info: b.turns.iter().enumerate().skip(b.fork)
+                    .filter(|(_, t)| !t.turn.info.is_null())
+                    .map(|(index, t)| (index, t.turn.info.clone())).collect(),
             })
             .collect();
         let branches_changed = sync.branches.get(&id).map_or(!branches.is_empty(), |previous| {
@@ -1490,6 +1533,57 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         n += 1;
     }
     Ok(n)
+}
+
+fn restore_turn(index: usize, info: &Value, turns: &mut BTreeMap<usize, crate::state::Turn>,
+    results: &mut BTreeSet<usize>) {
+    if info["tool_result"] == true {
+        results.insert(index);
+    } else if !info.is_null() && let Ok(mut turn) = serde_json::from_value::<crate::state::Turn>(info.clone()) {
+        // A remote Undo entry points at files on a different device.
+        turn.applied = None;
+        turns.insert(index, turn);
+    }
+}
+
+/// Append the branch's unmerged messages and publish which source turns they came from.
+pub fn merge_branch(state: &mut State, chat: u64, branch: &str) -> Result<usize> {
+    anyhow::ensure!(!state.queue.iter().any(|task| task.origin.unwrap_or(state.chat_id) == chat),
+        "Finish or remove this chat's queued work before merging a branch");
+    let sync = state.space.as_ref().context("Sync isn't set up")?;
+    let gid = sync.chats.get(&chat).cloned().context("This chat isn't synced")?;
+    let b = sync.branches.get(&chat).and_then(|list| list.iter().find(|b| b.id == branch))
+        .cloned().context("This branch has already changed or been merged")?;
+    let from = b.merge_from();
+    let (history, thread) = chat_mut(state, chat).context("Chat no longer exists")?;
+    anyhow::ensure!(from < b.messages.len() && b.messages.get(..b.fork).is_some()
+        && history.get(..b.fork) == b.messages.get(..b.fork),
+        "The chat history has changed. Sync and review the branch again before merging");
+
+    let hash = |parent: &str, m: &Message| chat::turn_hash(parent, &m.role, &m.content, &m.images);
+    let mut copy = history.iter().fold(String::new(), |parent, m| hash(&parent, m));
+    let mut source = b.messages[..from].iter().fold(String::new(), |parent, m| hash(&parent, m));
+    let mut receipts = BTreeSet::new();
+    for (offset, message) in b.messages.into_iter().skip(from).enumerate() {
+        source = hash(&source, &message);
+        copy = hash(&copy, &message);
+        receipts.insert(chat::MergeCopy { source: source.clone(), copy: copy.clone() });
+        if let Some(info) = b.info.get(&(from + offset)) {
+            restore_turn(history.len(), info, &mut thread.turns, &mut thread.tool_results);
+        }
+        history.push(message);
+    }
+    let count = receipts.len();
+    let sync = state.space.as_mut().unwrap();
+    sync.main.insert(gid.clone(), copy);
+    sync.pending_merges.entry(gid.clone()).or_default().extend(receipts);
+    if let Some(list) = sync.branches.get_mut(&chat) {
+        list.retain(|b| b.id != branch);
+    }
+    sync.seen.remove(&format!("chatview:{gid}"));
+    sync.wanted = Some(Want::Now);
+    state.note_thread_update(chat);
+    Ok(count)
 }
 
 /// Make a branch the main one (the old main becomes a branch).
@@ -1524,12 +1618,17 @@ pub fn make_main(state: &mut State, chat: u64, branch: &str) -> Result<()> {
         .map(|t| t.h.clone())
         .context("Empty branch")?;
     sync.main.insert(gid.clone(), tip);
+    sync.pending_main.insert(gid.clone());
     sync.seen.remove(&format!("chatview:{gid}"));
     sync.seen.remove(&format!("chat:{gid}"));
     // Show it now; the next sync publishes the choice.
     if let Some((history, thread)) = chat_mut(state, chat) {
         *history = b.messages.clone();
         thread.turns.retain(|i, _| *i < b.fork);
+        thread.tool_results.retain(|i| *i < b.fork);
+        for (index, info) in &b.info {
+            restore_turn(*index, info, &mut thread.turns, &mut thread.tool_results);
+        }
     }
     state.space.as_mut().unwrap().wanted = Some(Want::Now);
     Ok(())
@@ -1846,6 +1945,73 @@ mod tests {
         let bc = &b.chats[&bid];
         assert_eq!(bc.history.last().unwrap().content, "desk question");
         assert_eq!(b.space.as_ref().unwrap().branches[&bid].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn merged_branches_sync_once_and_keep_late_offline_messages() {
+        let transport = [(0, Transport::Memory(Hub::default()))];
+        let mut desktop = Space::create("Desktop", None).unwrap();
+        let mut phone = joined(&mut desktop, "Phone");
+        let mut a = device_state(&desktop);
+        let mut b = device_state(&phone);
+        say(&mut a, "user", "shared question");
+        say(&mut a, "assistant", "shared answer");
+        round(&mut a, &mut desktop, &transport, false).await.unwrap();
+        round(&mut b, &mut phone, &transport, false).await.unwrap();
+        let aid = a.chat_id;
+        let bid = *b.chats.keys().next().unwrap();
+
+        say(&mut a, "user", "desktop question");
+        let alt = b.chats.get_mut(&bid).unwrap();
+        let mut question = Message::new("user", "phone question");
+        question.images.push("example-image".into());
+        alt.history.push(question);
+        alt.history.push(Message::new("assistant", "phone answer"));
+        alt.thread.turns.insert(3, crate::state::Turn {
+            model: "example-model".into(),
+            artifacts: vec![crate::state::Attachment { path: "answer.txt".into(), text: "answer".into() }],
+            ..Default::default()
+        });
+        let offline = alt.clone();
+        round(&mut a, &mut desktop, &transport, false).await.unwrap();
+        round(&mut b, &mut phone, &transport, false).await.unwrap();
+        round(&mut a, &mut desktop, &transport, false).await.unwrap();
+
+        let branch = a.space.as_ref().unwrap().branches[&aid][0].id.clone();
+        assert_eq!(merge_branch(&mut a, aid, &branch).unwrap(), 2);
+        assert!(merge_branch(&mut a, aid, &branch).is_err());
+        assert_eq!(a.history.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            ["shared question", "shared answer", "desktop question", "phone question", "phone answer"]);
+        assert_eq!(a.history[3].images, ["example-image"]);
+        assert_eq!(a.thread.turns[&4].artifacts[0].path, "answer.txt");
+
+        // Pending merges also survive restarting before the first sync.
+        a = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
+        round(&mut a, &mut desktop, &transport, false).await.unwrap();
+        round(&mut b, &mut phone, &transport, false).await.unwrap();
+        assert_eq!(b.chats[&bid].history, a.history);
+        assert_eq!(b.chats[&bid].thread.turns[&4].model, "example-model");
+        assert!(a.space.as_ref().unwrap().branches.get(&aid).is_none());
+        assert!(b.space.as_ref().unwrap().branches.get(&bid).is_none());
+
+        // The phone already had another message in progress on the original branch.
+        let mut delayed = offline;
+        delayed.history.push(Message::new("user", "late phone message"));
+        b.chats.insert(bid, delayed);
+        round(&mut b, &mut phone, &transport, false).await.unwrap();
+        round(&mut a, &mut desktop, &transport, false).await.unwrap();
+        let late = &a.space.as_ref().unwrap().branches[&aid][0];
+        assert_eq!(late.messages.len() - late.merge_from(), 1);
+        assert_eq!(late.messages[late.merge_from()].content, "late phone message");
+        let branch = late.id.clone();
+        assert_eq!(merge_branch(&mut a, aid, &branch).unwrap(), 1);
+        round(&mut a, &mut desktop, &transport, false).await.unwrap();
+        round(&mut b, &mut phone, &transport, false).await.unwrap();
+        assert_eq!(b.chats[&bid].history, a.history);
+        assert_eq!(a.history.len(), 6);
+        assert_eq!(a.history[5].content, "late phone message");
+        assert!(a.space.as_ref().unwrap().branches.get(&aid).is_none());
+        assert!(b.space.as_ref().unwrap().branches.get(&bid).is_none());
     }
 
     /// A project made on one device shows up on another as a project of its own (a folder

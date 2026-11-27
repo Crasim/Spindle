@@ -2472,6 +2472,8 @@ mod tests {
                 device: "x".into(),
                 device_name: "Laptop".into(),
                 fork: 1,
+                new_from: 1,
+                info: Default::default(),
                 messages: vec![
                     crate::ollama::Message::new("user", "hi"),
                     crate::ollama::Message::new("user", "from laptop"),
@@ -2511,6 +2513,8 @@ mod tests {
         assert!((labels["⟳ Local"].y - labels["Settings"].y).abs() < 4.);
         click(&mut app, &ctx, labels["⟳ Local"]);
         assert_eq!(commands.try_recv().unwrap(), "/sync now");
+        click(&mut app, &ctx, labels["Merge"]);
+        assert_eq!(commands.try_recv().unwrap(), format!("/branch merge {chat} b1"));
         click(&mut app, &ctx, labels["Make main"]);
         let sent: Vec<String> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
         assert_eq!(sent, vec![format!("/branch main {chat} b1")]);
@@ -2600,20 +2604,21 @@ mod tests {
         );
         app.page = Page::Chat;
         run(&mut app, &ctx, vec![]);
-        let labels = run(&mut app, &ctx, vec![]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let labels = loop {
+            let labels = run(&mut app, &ctx, vec![]);
+            if labels.contains_key("DOCX · 3.7 KB") || std::time::Instant::now() >= deadline {
+                break labels;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
         assert!(labels.contains_key("why.docx"), "{:?}", labels.keys());
         assert!(
             !labels.keys().any(|k| k.contains("Saved file:")),
             "{:?}",
             labels.keys()
         );
-        assert!(
-            labels
-                .keys()
-                .any(|k| k.contains("3.7 KB") || k.contains("3.6 KB") || k.contains("KB")),
-            "{:?}",
-            labels.keys()
-        );
+        assert!(labels.contains_key("DOCX · 3.7 KB"), "{:?}", labels.keys());
     }
 
     #[test]
