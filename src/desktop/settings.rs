@@ -47,12 +47,91 @@ pub(super) enum ProviderSetup {
     Configure(&'static str),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum ControlsPanel {
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum ComposerMenu {
     Models,
     Thinking,
     PlanUsage,
     Budget,
+}
+
+impl ComposerMenu {
+    const ALL: [Self; 4] = [Self::Models, Self::Thinking, Self::PlanUsage, Self::Budget];
+
+    fn id(self) -> egui::Id {
+        egui::Id::new(("composer-menu", self))
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Models => "Choose a model",
+            Self::Thinking => "Thinking",
+            Self::PlanUsage => "Plan usage",
+            Self::Budget => "API budget",
+        }
+    }
+
+    pub(super) fn current(ctx: &egui::Context) -> Option<Self> {
+        ctx.memory(|mem| Self::ALL.into_iter().find(|menu| mem.is_popup_open(menu.id())))
+    }
+
+    pub(super) fn dismiss(ctx: &egui::Context) -> bool {
+        if Self::current(ctx).is_some() {
+            ctx.memory_mut(|mem| mem.close_popup());
+            true
+        } else {
+            false
+        }
+    }
+
+    fn show(self, ui: &egui::Ui, button: &egui::Response, width: f32, contents: impl FnOnce(&mut egui::Ui, f32)) {
+        if button.clicked() {
+            ui.memory_mut(|mem| mem.toggle_popup(self.id()));
+        }
+        if !ui.memory(|mem| mem.is_popup_open(self.id())) {
+            return;
+        }
+
+        let ctx = ui.ctx();
+        let screen = ctx.screen_rect().shrink(4.);
+        let lane = ui.clip_rect().intersect(screen);
+        let bounds = egui::Rect::from_min_max(
+            egui::pos2(lane.left(), screen.top()),
+            egui::pos2(lane.right(), screen.bottom()),
+        );
+        let frame = egui::Frame::popup(ui.style());
+        let margin = frame.total_margin().sum();
+        let width = width.min(bounds.width()).max(1.);
+        let left = button.rect.left().min(bounds.right() - width).max(bounds.left());
+        let bottom = button.rect.top() - 6.;
+        let max_height = (bottom - bounds.top() - margin.y).max(40.);
+        let menu = egui::Area::new(self.id())
+            .kind(egui::UiKind::Popup)
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(left, bottom))
+            .pivot(egui::Align2::LEFT_BOTTOM)
+            .constrain_to(bounds)
+            .default_width(width)
+            .show(ctx, |ui| {
+                frame.show(ui, |ui| {
+                    ui.set_width((width - margin.x).max(1.));
+                    ui.horizontal(|ui| {
+                        ui.strong(self.title());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if crate::widgets::close_button(ui, "Dismiss menu").clicked() {
+                                Self::dismiss(ctx);
+                            }
+                        });
+                    });
+                    contents(ui, (max_height - 36.).max(28.));
+                });
+            });
+        if ui.input(|input| input.key_pressed(egui::Key::Escape))
+            || (button.clicked_elsewhere() && menu.response.clicked_elsewhere())
+        {
+            Self::dismiss(ctx);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -345,172 +424,163 @@ impl Desktop {
             egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, &full_label)
         });
         let button = button.on_hover_text(format!("{full_label}  ·  Ctrl+K"));
-        if button.clicked() {
-            self.show_models();
+        let menu = ComposerMenu::Models;
+        let open = std::mem::take(&mut self.model_menu_requested);
+        if open || (button.clicked() && ComposerMenu::current(ui.ctx()) != Some(menu)) {
+            self.search.clear();
+            self.select_focus = !cfg!(target_os = "android");
         }
+        if open && !button.clicked() {
+            ui.memory_mut(|mem| mem.open_popup(menu.id()));
+        }
+        menu.show(ui, &button, 420., |ui, height| self.model_menu(ui, height));
     }
 
     pub(super) fn show_models(&mut self) {
-        self.controls_panel = Some(ControlsPanel::Models);
-        self.search.clear();
-        self.select_focus = !cfg!(target_os = "android");
+        self.model_menu_requested = true;
     }
 
-    fn model_panel(&mut self, ui: &mut egui::Ui) {
+    fn model_menu(&mut self, ui: &mut egui::Ui, height: f32) {
         let current = self.view.state.model.clone();
-        let (provider, model) = route(&current);
-        let label = format!("{} / {model}", self.provider_name(provider));
-        let mut open = true;
-        super::detail_panel(ui, "Choose a model", "Back", &mut open, |ui| {
-            let available = ui.available_width();
-            if !model.is_empty() {
-                ui.label(Text::new(label).size(13.).color(muted()));
+        let enter = ui.horizontal(|ui| {
+            symbol(ui, Icon::Search, muted());
+            let width = (ui.available_width() - 42.).max(40.);
+            let enter = ui.memory(|mem| mem.has_focus(ui.make_persistent_id("model-search")))
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            let search = self.android_ime.field(
+                ui,
+                "model-search",
+                &mut self.search,
+                Default::default(),
+                |field| {
+                    field
+                        .desired_width(width)
+                        .hint_text("Search model or provider")
+                },
+            );
+            if self.select_focus && !ui.is_sizing_pass() {
+                search.request_focus();
+                self.select_focus = false;
             }
-            ui.horizontal(|ui| {
-                symbol(ui, Icon::Search, muted());
-                let width = (ui.available_width() - 39.).clamp(40., 212.);
-                let search = self.android_ime.field(
-                    ui,
-                    "model-search",
-                    &mut self.search,
-                    Default::default(),
-                    |field| {
-                        field
-                            .desired_width(width)
-                            .hint_text("Search model or provider")
-                    },
-                );
-                if self.select_focus {
-                    search.request_focus();
-                    self.select_focus = false;
-                }
-                if control(
-                    ui,
-                    Icon::Star,
-                    "",
-                    egui::vec2(29., 27.),
-                    self.favorites_only,
-                )
-                .on_hover_text("Show favorites only")
-                .clicked()
-                {
-                    self.favorites_only = !self.favorites_only;
-                }
-            });
-            ui.separator();
-            let query = self.search.trim().to_lowercase();
-            let mut matches = self
-                .view
-                .models
-                .iter()
-                .filter(|m| {
-                    let (p, name) = route(m);
-                    (name.to_lowercase().contains(&query)
-                        || self.provider_name(p).to_lowercase().contains(&query))
-                        && (!self.favorites_only || self.view.state.favorites.contains(m))
-                        && (!self.view.state.hidden_models.contains(*m)
-                            || **m == self.view.state.model)
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            matches.sort_by_cached_key(|m| {
-                let (p, name) = route(m);
-                (
-                    self.provider_name(p).to_lowercase(),
-                    p.to_owned(),
-                    !self.view.state.favorites.contains(m),
-                    name.to_lowercase(),
-                )
-            });
-            let enter = ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-            let mut chosen = if enter {
-                matches.first().cloned()
-            } else {
-                None
-            };
-            egui::ScrollArea::vertical()
-                .id_salt("model-results")
-                .max_height((ui.available_height() - 52.).max(100.))
-                .show(ui, |ui| {
-                    let mut last = String::new();
-                    for key in &matches {
-                        let (p, tag) = route(key);
-                        if last != p {
-                            ui.add_space(4.);
-                            ui.label(
-                                Text::new(self.provider_name(p))
-                                    .size(12.)
-                                    .strong()
-                                    .color(accent()),
-                            );
-                            last = p.into();
-                        }
-                        ui.horizontal(|ui| {
-                            if control(
-                                ui,
-                                Icon::Star,
-                                "",
-                                egui::vec2(25., 27.),
-                                self.view.state.favorites.contains(key),
-                            )
-                            .on_hover_text("Toggle favorite")
-                            .clicked()
-                            {
-                                self.send(format!("/favorite {key}"));
-                            }
-                            let short: String = tag.chars().take(33).collect();
-                            let label = if short != tag {
-                                format!("{short}…")
-                            } else {
-                                short
-                            };
-                            if ui
-                                .add_sized(
-                                    [(available - 105.).max(85.), 29.],
-                                    egui::Button::new(label).frame(false).truncate(),
-                                )
-                                .on_hover_text(tag)
-                                .clicked()
-                            {
-                                chosen = Some(key.clone());
-                            }
-                            self.capability_icons(ui, key, 14., true);
-                            if key == &current {
-                                symbol(ui, Icon::Check, accent());
-                            }
-                        });
-                    }
-                    if matches.is_empty() {
-                        ui.label("No matching models.");
-                    }
-                });
-            if let Some(m) = chosen {
-                self.send(format!("/model {m}"));
-                self.controls_panel = None;
-                self.focus = !cfg!(target_os = "android");
-            }
-            ui.separator();
             if control(
                 ui,
-                Icon::Plug,
-                "Manage providers",
-                egui::vec2(240., 30.),
-                false,
+                Icon::Star,
+                "",
+                egui::vec2(29., 27.),
+                self.favorites_only,
             )
+            .on_hover_text("Show favorites only")
             .clicked()
             {
-                self.open_settings();
-                self.preferences_tab = false;
-                self.models_tab = false;
-                self.memory_tab = false;
-                self.sandbox_tab = false;
-                self.sync_tab = false;
-                self.integration_tab = None;
-                self.controls_panel = None;
+                self.favorites_only = !self.favorites_only;
             }
+            enter
+        }).inner;
+        ui.separator();
+        let query = self.search.trim().to_lowercase();
+        let mut matches = self
+            .view
+            .models
+            .iter()
+            .filter(|m| {
+                let (p, name) = route(m);
+                (name.to_lowercase().contains(&query)
+                    || self.provider_name(p).to_lowercase().contains(&query))
+                    && (!self.favorites_only || self.view.state.favorites.contains(m))
+                    && (!self.view.state.hidden_models.contains(*m)
+                        || **m == self.view.state.model)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        matches.sort_by_cached_key(|m| {
+            let (p, name) = route(m);
+            (
+                self.provider_name(p).to_lowercase(),
+                p.to_owned(),
+                !self.view.state.favorites.contains(m),
+                name.to_lowercase(),
+            )
         });
-        if !open {
-            self.controls_panel = None;
+        let mut chosen = if enter {
+            matches.first().cloned()
+        } else {
+            None
+        };
+        egui::ScrollArea::vertical()
+            .id_salt("model-results")
+            .max_height((height - 74.).clamp(26., 320.))
+            .show(ui, |ui| {
+                let mut last = String::new();
+                for key in &matches {
+                    let (p, tag) = route(key);
+                    if last != p {
+                        ui.add_space(4.);
+                        let name = self.provider_name(p);
+                        ui.add(egui::Label::new(
+                            Text::new(name)
+                                .size(12.)
+                                .strong()
+                                .color(accent()),
+                        ).truncate()).on_hover_text(name);
+                        last = p.into();
+                    }
+                    ui.horizontal(|ui| {
+                        if control(
+                            ui,
+                            Icon::Star,
+                            "",
+                            egui::vec2(25., 27.),
+                            self.view.state.favorites.contains(key),
+                        )
+                        .on_hover_text("Toggle favorite")
+                        .clicked()
+                        {
+                            self.send(format!("/favorite {key}"));
+                        }
+                        let width = (ui.available_width() - 75.).max(32.);
+                        if ui
+                            .add_sized(
+                                [width, 29.],
+                                egui::Button::new(tag).frame(false).truncate(),
+                            )
+                            .on_hover_text(tag)
+                            .clicked()
+                        {
+                            chosen = Some(key.clone());
+                        }
+                        self.capability_icons(ui, key, 14., true);
+                        if key == &current {
+                            symbol(ui, Icon::Check, accent());
+                        }
+                    });
+                }
+                if matches.is_empty() {
+                    ui.label("No matching models.");
+                }
+            });
+        if let Some(m) = chosen {
+            self.send(format!("/model {m}"));
+            ComposerMenu::dismiss(ui.ctx());
+            self.focus = !cfg!(target_os = "android");
+        }
+        ui.separator();
+        if control(
+            ui,
+            Icon::Plug,
+            "Manage providers",
+            egui::vec2(ui.available_width().min(200.), 30.),
+            false,
+        )
+        .clicked()
+        {
+            self.open_settings();
+            self.preferences_tab = false;
+            self.models_tab = false;
+            self.memory_tab = false;
+            self.sandbox_tab = false;
+            self.sync_tab = false;
+            self.integration_tab = None;
+            ComposerMenu::dismiss(ui.ctx());
         }
     }
 
@@ -724,6 +794,17 @@ impl Desktop {
                 changed |= ui.add(egui::DragValue::new(&mut prefs.tool_steps.bobbins)
                     .range(1..=u32::MAX)).changed();
             });
+            #[cfg(windows)]
+            {
+                ui.add_space(14.);
+                ui.heading("Windows notifications");
+                let notifications = &mut prefs.reply_notifications;
+                changed |= ui.checkbox(&mut notifications.enabled, "Notify when a reply finishes and Spindle is out of focus").changed();
+                changed |= ui.add_enabled(notifications.enabled, egui::Checkbox::new(
+                    &mut notifications.show_text, "Show reply text in notifications",
+                )).changed();
+                ui.weak("Windows can display reply text on the lock screen and in Notification Center.");
+            }
             ui.add_space(14.);
             ui.heading("Appearance");
             ui.add_space(5.);
@@ -2565,38 +2646,8 @@ impl Desktop {
 }
 
 impl Desktop {
-    /// Composer control for models that can reason: a button that opens a stepped
-    /// Off/Low/Medium/High slider. Applies to this model in every chat, the same setting
-    /// as Settings → Models → Advanced.
+    /// Adjust this model's thinking level for all chats.
     pub(super) fn thinking_toggle(&mut self, ui: &mut egui::Ui, compact: bool) {
-        self.thinking_control(ui, compact, false);
-    }
-
-    pub(super) fn controls_panel(&mut self, ui: &mut egui::Ui, panel: ControlsPanel) {
-        if panel == ControlsPanel::Models {
-            self.model_panel(ui);
-            return;
-        }
-        let title = match panel {
-            ControlsPanel::Thinking => "Thinking",
-            ControlsPanel::PlanUsage => "Plan usage",
-            ControlsPanel::Budget => "API budget",
-            ControlsPanel::Models => unreachable!(),
-        };
-        let mut open = true;
-        super::detail_panel(ui, title, "Back", &mut open, |ui| {
-            if panel == ControlsPanel::Thinking {
-                self.thinking_control(ui, false, true);
-            } else {
-                self.composer_usage(ui, Some(panel));
-            }
-        });
-        if !open {
-            self.controls_panel = None;
-        }
-    }
-
-    fn thinking_control(&mut self, ui: &mut egui::Ui, compact: bool, editing: bool) {
         use crate::ollama::ThinkInfo;
         use crate::state::Thinking;
         #[derive(Clone, PartialEq)]
@@ -2605,7 +2656,11 @@ impl Desktop {
             Level(Thinking),
         }
         let model = self.view.state.model.clone();
+        let menu = ComposerMenu::Thinking;
         if !self.view.reasoning.contains(&model) {
+            if ComposerMenu::current(ui.ctx()) == Some(menu) {
+                ComposerMenu::dismiss(ui.ctx());
+            }
             return;
         }
         let mut tuning = self
@@ -2615,7 +2670,6 @@ impl Desktop {
             .get(&model)
             .cloned()
             .unwrap_or_default();
-        let before = (tuning.thinking, tuning.think_value.clone());
         // Use the levels the model reports about itself; otherwise a generic scale.
         let reported = self
             .view
@@ -2651,116 +2705,62 @@ impl Desktop {
             Some(d) => format!("Auto · {}", ThinkInfo::label(d)),
             None => "Auto".into(),
         };
-        let current = selected(&tuning).map_or(auto.clone(), |i| steps[i].0.clone());
-        let set = selected(&tuning).is_some();
+        let index = selected(&tuning);
+        let current = index.map_or(auto.as_str(), |i| steps[i].0.as_str());
+        let set = index.is_some();
         let color = if set { accent() } else { muted() };
         // Leave room for the brain icon painted over the button's left edge.
-        if !editing {
-            let button = if compact {
-                control(ui, Icon::Brain, "", egui::vec2(34., 33.), set)
-            } else {
-                let button = ui.add(egui::Button::new(
-                    Text::new(format!("      {current}")).size(13.).color(color),
-                ));
-                draw(
-                    ui,
-                    Icon::Brain,
-                    egui::Rect::from_center_size(
-                        button.rect.left_center() + egui::vec2(17., 0.),
-                        egui::vec2(17., 17.),
-                    ),
-                    color,
-                );
-                button
-            };
-            let button = button.on_hover_text("How much this model reasons before answering. More thinking is slower and uses more tokens. Applies to this model in every chat.");
-            if button.clicked() {
-                self.controls_panel = Some(ControlsPanel::Thinking);
-            }
-            return;
-        }
-        let index = selected(&tuning);
-        ui.horizontal(|ui| {
-            ui.label(
-                Text::new(index.map_or(auto.clone(), |i| steps[i].0.clone()))
-                    .strong()
-                    .size(16.),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(
-                        index.is_some(),
-                        egui::Button::new(Text::new("Reset").size(12.)).small(),
-                    )
-                    .on_hover_text("Use the model's default")
-                    .clicked()
-                {
-                    tuning.thinking = Thinking::Default;
-                    tuning.think_value = None;
-                }
-            });
-        });
-        ui.add_space(2.);
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(200., 26.), egui::Sense::click_and_drag());
-        let response = response.on_hover_text(
-            "More thinking is slower and uses more tokens. Applies to this model in every chat.",
-        );
-        let track = egui::Rect::from_center_size(rect.center(), egui::vec2(200., 14.));
-        let inset = 8.;
-        let last = steps.len().saturating_sub(1).max(1) as f32;
-        let x_of = |i: usize| track.left() + inset + (track.width() - 2. * inset) * i as f32 / last;
-        let painter = ui.painter();
-        painter.rect_filled(track, 7., raised());
-        if let Some(i) = index {
-            let fill = egui::Rect::from_min_max(
-                track.left_top(),
-                egui::pos2(x_of(i) + inset, track.bottom()),
-            );
-            painter.rect_filled(fill, 7., accent());
-        }
-        for i in 0..steps.len() {
-            let lit = index.is_some_and(|k| i < k);
-            painter.circle_filled(
-                egui::pos2(x_of(i), track.center().y),
-                2.5,
-                if lit {
-                    Color::from_white_alpha(170)
-                } else {
-                    muted()
-                },
-            );
-        }
-        if let Some(i) = index {
-            painter.circle_filled(egui::pos2(x_of(i), track.center().y), 10., Color::WHITE);
-        }
-        if response.clicked() || response.dragged() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let step = if steps.len() > 1 {
-                    ((pos.x - x_of(0)) / (x_of(1) - x_of(0)))
-                        .round()
-                        .clamp(0., last) as usize
-                } else {
-                    0
-                };
-                match &steps[step].1 {
-                    Step::Value(v) => {
-                        tuning.think_value = Some(v.clone());
-                        tuning.thinking = Thinking::Default;
-                    }
-                    Step::Level(l) => {
-                        tuning.thinking = *l;
-                        tuning.think_value = None;
-                    }
-                }
-            }
-        }
-        if (tuning.thinking, tuning.think_value.clone()) != before {
-            let _ = self.tx.send(format!(
-                "/model-tuning {}",
-                serde_json::to_string(&(model, tuning)).expect("Serializable tuning")
+        let button = if compact {
+            control(ui, Icon::Brain, "", egui::vec2(34., 33.), set)
+        } else {
+            let button = ui.add(egui::Button::new(
+                Text::new(format!("      {current}")).size(13.).color(color),
             ));
-        }
+            draw(
+                ui,
+                Icon::Brain,
+                egui::Rect::from_center_size(
+                    button.rect.left_center() + egui::vec2(17., 0.),
+                    egui::vec2(17., 17.),
+                ),
+                color,
+            );
+            button
+        };
+        button.widget_info(|| egui::WidgetInfo::labeled(
+            egui::WidgetType::ComboBox, true, format!("Thinking: {current}"),
+        ));
+        let button = button.on_hover_text("Thinking level for this model in every chat");
+        menu.show(ui, &button, 218., |ui, height| {
+            let chosen = egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                let mut chosen = None;
+                for (label, step, active) in std::iter::once((auto.as_str(), None, !set))
+                    .chain(steps.iter().enumerate().map(|(i, (label, step))| (
+                        label.as_str(), Some(step), index == Some(i),
+                    )))
+                {
+                    if ui.add_sized([ui.available_width(), 30.], egui::SelectableLabel::new(active, label)).clicked() {
+                        chosen = Some(step);
+                    }
+                }
+                chosen
+            }).inner;
+            if let Some(chosen) = chosen {
+                let before = (tuning.thinking, tuning.think_value.take());
+                (tuning.thinking, tuning.think_value) = match chosen {
+                    Some(Step::Value(value)) => (Thinking::Default, Some(value.clone())),
+                    Some(Step::Level(level)) => (*level, None),
+                    None => (Thinking::Default, None),
+                };
+                if (tuning.thinking, &tuning.think_value) != (before.0, &before.1) {
+                    let _ = self.tx.send(format!(
+                        "/model-tuning {}",
+                        serde_json::to_string(&(model, tuning)).expect("Serializable tuning")
+                    ));
+                }
+                ComposerMenu::dismiss(ui.ctx());
+            }
+        });
     }
 }
 
@@ -2838,40 +2838,35 @@ fn usage_bar(ui: &mut egui::Ui, fill: f32, color: Color) {
 impl Desktop {
     /// Rings beside the composer for the current model: plan windows and the API budget.
     pub(super) fn usage_rings(&mut self, ui: &mut egui::Ui) {
-        self.composer_usage(ui, None);
-    }
-
-    fn composer_usage(&mut self, ui: &mut egui::Ui, panel: Option<ControlsPanel>) {
         let model = self.view.state.model.clone();
         let (scope, tag) = route(&model);
-        let scope = scope.to_owned();
         let windows = crate::meter::windows(&self.view.state, &model);
-        if panel == Some(ControlsPanel::PlanUsage) {
-            for w in &windows {
-                ui.label(format!("{}  {:.0}%", w.name, w.used * 100.));
-                usage_bar(ui, w.used, ring_color(w.used, false));
-                if let Some(t) = w.reset {
-                    ui.weak(format!("Resets {}", crate::automation::local_time(t)));
-                }
-                ui.add_space(6.);
-            }
-            if ui.link("Usage limits…").clicked() {
-                self.tasks.tab = 2;
-                self.page = Page::Automations;
-                self.controls_panel = None;
-            }
-            return;
-        }
-        if panel.is_none()
-            && let Some(top) = windows.first()
-        {
+        if let Some(top) = windows.first() {
             let fill = top.used;
             let ring = usage_ring(ui, fill, ring_color(fill, false), |p, r| {
                 draw_with(p, Icon::Cycle, r.shrink(7.5), muted());
             });
-            if ring.on_hover_text("Show plan usage").clicked() {
-                self.controls_panel = Some(ControlsPanel::PlanUsage);
-            }
+            let ring = ring.on_hover_text("Show plan usage");
+            ring.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Show plan usage"));
+            ComposerMenu::PlanUsage.show(ui, &ring, 280., |ui, height| {
+                egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                    for w in &windows {
+                        ui.label(format!("{}  {:.0}%", w.name, w.used * 100.));
+                        usage_bar(ui, w.used, ring_color(w.used, false));
+                        if let Some(t) = w.reset {
+                            ui.weak(format!("Resets {}", crate::automation::local_time(t)));
+                        }
+                        ui.add_space(6.);
+                    }
+                    if ui.link("Usage limits…").clicked() {
+                        self.tasks.tab = 2;
+                        self.page = Page::Automations;
+                        ComposerMenu::dismiss(ui.ctx());
+                    }
+                });
+            });
+        } else if ComposerMenu::current(ui.ctx()) == Some(ComposerMenu::PlanUsage) {
+            ComposerMenu::dismiss(ui.ctx());
         }
         let Some(provider) = self
             .view
@@ -2879,51 +2874,37 @@ impl Desktop {
             .providers
             .iter()
             .find(|p| p.id == scope && p.metered())
-            .cloned()
         else {
-            return;
-        };
-        let spend = crate::meter::spend(&self.view.state, &scope, crate::automation::now());
-        let fill = spend.fill();
-        let warn = spend.credit_limited();
-        let color = ring_color(fill, warn);
-        let priced = self
-            .view
-            .state
-            .tuning
-            .get(&model)
-            .is_some_and(|t| t.price_in.is_some() && t.price_out.is_some())
-            || provider.price(tag).is_some();
-        if panel.is_none() {
-            let ring = usage_ring(ui, fill, color, |p, r| {
-                p.text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "$",
-                    egui::FontId::proportional(11.),
-                    muted(),
-                );
-            });
-            if ring
-                .on_hover_text(format!(
-                    "{}: ${:.2} of ${:.2} · ${:.2} left",
-                    spend.budget.period.this(),
-                    spend.spent,
-                    spend.budget.dollars,
-                    spend.available()
-                ))
-                .clicked()
-            {
-                self.controls_panel = Some(ControlsPanel::Budget);
+            if ComposerMenu::current(ui.ctx()) == Some(ComposerMenu::Budget) {
+                ComposerMenu::dismiss(ui.ctx());
             }
             return;
-        }
+        };
+        let spend = crate::meter::spend(&self.view.state, scope, crate::automation::now());
+        let fill = spend.fill();
+        let ring = usage_ring(ui, fill, ring_color(fill, spend.credit_limited()), |p, r| {
+            p.text(r.center(), egui::Align2::CENTER_CENTER, "$", egui::FontId::proportional(11.), muted());
+        }).on_hover_text(format!(
+            "{}: ${:.2} of ${:.2} · ${:.2} left",
+            spend.budget.period.this(), spend.spent, spend.budget.dollars, spend.available(),
+        ));
+        ring.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Show API budget"));
+        ComposerMenu::Budget.show(ui, &ring, 320., |ui, height| {
+            let priced = self.view.state.tuning.get(&model)
+                .is_some_and(|t| t.price_in.is_some() && t.price_out.is_some())
+                || provider.price(tag).is_some();
+            egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                self.budget_menu(ui, provider, &spend, priced);
+            });
+        });
+    }
+
+    fn budget_menu(&self, ui: &mut egui::Ui, provider: &crate::providers::Provider, spend: &crate::meter::Spend, priced: bool) {
+        let scope = &provider.id;
+        let fill = spend.fill();
+        let warn = spend.credit_limited();
         let mut changed = None;
-        ui.label(
-            Text::new(format!("API budget · {}", provider.name))
-                .strong()
-                .size(15.),
-        );
+        ui.weak(&provider.name);
         ui.add_space(4.);
         ui.horizontal(|ui| {
             ui.label(format!(
@@ -2933,7 +2914,7 @@ impl Desktop {
                 spend.budget.dollars
             ));
         });
-        usage_bar(ui, fill, color);
+        usage_bar(ui, fill, ring_color(fill, warn));
         ui.weak(format!(
             "Resets {}",
             crate::automation::local_time(spend.reset)

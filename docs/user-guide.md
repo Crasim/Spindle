@@ -55,7 +55,9 @@ The composer shows the latest reported context usage, the active model’s conte
 
 Spindle checks the selected model's published output and context limits when available. Ollama and Claude requests start with up to 16,384 output tokens, with room reserved for the prompt in a known shared context. Ollama Cloud uses the hosted context window. Other providers can manage their own output budget. When a model reaches its output limit, Spindle saves the partial reply in the encrypted local queue and requests the missing text. Every continuation passes the same usage and fallback checks. Generated files are saved after the reply finishes. Repeated cutoffs can still pause a long task, and **Resume** continues from the saved text.
 
-Your prompts appear on the right and model replies on the left. For file deliverables, ask for a file such as “Create a Snake game in snake.html”, or name a format (“as a .csv”). Spindle saves the output in the project's **artifacts** folder or the thread's scratch folder in Windows Temp. Each file appears as a card where the reply placed it, with its name, type and size, a primary **Open** (or **Preview** for HTML), and **More** for View source, Edit, Download, Show in folder, Copy path and Save a copy. A file name mentioned in the reply is a link that opens it. Markdown, spreadsheets, Word, RTF and PDF open in the reader. HTML runs in a sandboxed WebView2 in the resizable right panel. Code blocks that stay in the message have Copy and Save file. **/preview <file>** opens a workspace file in the same panel.
+Your prompts appear on the right and model replies on the left. For file deliverables, ask for a file such as “Create a Snake game in snake.html”, or name a format (“as a .csv”). Spindle saves the output in the project's **artifacts** folder or the thread's scratch folder in Windows Temp. Each file appears as a card where the reply placed it, with its name, type and size, a primary **Open** (or **Preview** for HTML), and **More** for View source, Edit, Download, Show in folder, Copy path and Save a copy. A file name mentioned in the reply is a link that opens it. Markdown, spreadsheets, Word, RTF and PDF open in the Viewer. HTML opens in the built-in **Browser** tab and uses the isolated preview renderer. Code blocks that stay in the message have Copy and Save file. **/preview <file>** opens a workspace file in the same panel.
+
+On Windows, Spindle sends a system notification when a reply finishes and its window is out of focus. **Settings → Preferences → Windows notifications** lets you hide reply text or turn notifications off. Windows can show notifications on the lock screen.
 
 ### Revising work in progress
 
@@ -81,9 +83,11 @@ The sidebar, welcome screen and window icons follow the workspace accent. The Wi
 
 **Settings → Models** lists every connected model with a search box and a provider filter. Clear a model's checkbox to hide it from the picker. **Show all listed** and **Hide all listed** act on the current search and filter, so you can hide a provider's whole catalog and keep a few. Hidden models stay connected, and work already using them continues.
 
+Click the model name or press **Ctrl+K** to search and choose a model above the composer. The usage rings open compact views of plan usage or the API budget while the chat stays visible.
+
 ### Thinking
 
-For models that can reason, a brain button beside the model picker shows the thinking level, for example **Auto** or **High**. Click it to open a stepped slider. When Ollama reports a model's own levels through `/api/show`, the slider uses exactly those. Otherwise it offers Off, Low, Medium and High. **Reset** returns to the model's default. The level applies to that model in every chat.
+For models that can reason, click the brain button beside the model picker to choose a thinking level. Spindle shows the levels the model reports or offers Off, Low, Medium and High. **Auto** uses the model's default. The level applies to that model in every chat.
 
 ### Advanced model settings
 

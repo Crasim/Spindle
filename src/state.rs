@@ -365,6 +365,19 @@ impl ToolStepLimits {
     }
 }
 
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReplyNotifications {
+    pub enabled: bool,
+    pub show_text: bool,
+}
+
+impl Default for ReplyNotifications {
+    fn default() -> Self {
+        Self { enabled: true, show_text: true }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Preferences {
     #[serde(default)]
@@ -379,6 +392,8 @@ pub struct Preferences {
     pub enter_steers: bool,
     #[serde(default)]
     pub tool_steps: ToolStepLimits,
+    #[serde(default)]
+    pub reply_notifications: ReplyNotifications,
     #[serde(default)]
     pub nerd_stats: bool,
     #[serde(default)]
@@ -517,6 +532,7 @@ impl Default for Preferences {
             enter_sends: true,
             enter_steers: true,
             tool_steps: ToolStepLimits::default(),
+            reply_notifications: ReplyNotifications::default(),
             nerd_stats: false,
             over_18: false,
             text_size: 16,

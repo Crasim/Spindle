@@ -66,6 +66,8 @@ mod tools;
 mod host_shell;
 mod computer_use;
 mod tray;
+#[cfg(windows)]
+mod windows_notifications;
 mod usage;
 mod vault;
 mod widgets;
@@ -848,10 +850,21 @@ fn main() -> Result<()> {
     let forward_control = control.clone();
     let desktop_context = std::sync::Arc::new(std::sync::OnceLock::<eframe::egui::Context>::new());
     let repaint = desktop_context.clone();
+    #[cfg(windows)]
+    let notification_workspace = (args.is_empty() || service).then(|| root.clone());
     thread::spawn(move || {
         #[cfg(target_os = "android")]
         let mut delivered_notice = String::new();
+        #[cfg(windows)]
+        let mut notifications = windows_notifications::Notifications::default();
         for view in engine_views {
+            #[cfg(windows)]
+            if let Some(workspace) = &notification_workspace
+                && let Some((chat, index)) = view.completed_reply
+                && let Some(reply) = view.state.thread_data(chat).and_then(|(_, history)| history.get(index))
+            {
+                notifications.reply(workspace, view.state.preferences.reply_notifications, &reply.content);
+            }
             if let Some(c) = &forward_control {
                 c.publish(&view);
             }

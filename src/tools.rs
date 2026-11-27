@@ -363,13 +363,8 @@ pub fn extract(answer: &str) -> (String, Option<std::result::Result<Envelope, St
         // The whole reply is an attempted call that isn't valid JSON (typically unescaped
         // quotes inside a long code string). Recover it if possible, otherwise ask again.
         if attempted(answer) {
-            let call = match salvage(answer) {
-                Some(json) => parse(&json),
-                None => Err(format!(
-                    "The tool call wasn't valid JSON, usually because quotes or line breaks inside a long string weren't escaped. Send it again as one valid JSON tool call. You sent: {}",
-                    answer.trim().chars().take(200).collect::<String>()
-                )),
-            };
+            let body = answer.trim().trim_start_matches("```json").trim_start_matches("```").trim_start();
+            let call = parse(body.trim_end_matches('`').trim_end());
             return (String::new(), Some(call));
         }
         // The label arrived but the call itself didn't: ask for it again.
@@ -898,12 +893,8 @@ fn loose_call(answer: &str) -> Option<std::ops::Range<usize>> {
         from = open;
     }
     // A call attempt with broken JSON after some prose: everything from its start is the call.
-    for marker in ["{\"name\":", "{\"tool\":", "{ \"name\":", "{ \"tool\":"] {
-        if let Some(at) = answer.find(marker)
-            && attempted(&answer[at..])
-        {
-            return Some(at..answer.trim_end().len());
-        }
+    if let Some((at, _)) = answer.match_indices('{').find(|(at, _)| attempted(&answer[*at..])) {
+        return Some(at..answer.trim_end().len());
     }
     None
 }
@@ -1200,18 +1191,52 @@ fn attempted(answer: &str) -> bool {
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_start();
-    let head: String = t.chars().take(60).collect::<String>().replace(' ', "");
-    t.starts_with('{')
-        && (head.starts_with("{\"name\":")
-            || head.starts_with("{\"tool\":")
-            || head.starts_with("{\"v\":"))
+    t.strip_prefix('{').is_some_and(|head| {
+        ["\"name\"", "\"tool\"", "\"v\""].into_iter().any(|field| {
+            head.trim_start().strip_prefix(field).is_some_and(|rest| rest.trim_start().starts_with(':'))
+        })
+    })
         && (t.contains("\"args\"") || t.contains("\"arguments\""))
+}
+
+/// Repair punctuation outside quoted values and encode literal whitespace inside them.
+fn repair_json_syntax(body: &str) -> String {
+    let mut fixed = String::with_capacity(body.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    for (at, ch) in body.char_indices() {
+        match ch {
+            _ if escaped => {
+                fixed.push(ch);
+                escaped = false;
+            }
+            '\\' if quoted => {
+                fixed.push(ch);
+                escaped = true;
+            }
+            '"' => {
+                quoted = !quoted;
+                fixed.push(ch);
+            }
+            '\n' if quoted => fixed.push_str("\\n"),
+            '\r' if quoted => fixed.push_str("\\r"),
+            '\t' if quoted => fixed.push_str("\\t"),
+            ',' if !quoted
+                && body[at + 1..].trim_start_matches([' ', '\t', '\r', '\n']).starts_with(['}', ']']) => {}
+            _ => fixed.push(ch),
+        }
+    }
+    fixed
 }
 
 /// Rebuild a call whose JSON broke on a long `code` or `content` string. The string is taken
 /// from its opening quote to the last place a following field or the closing brace starts, and
 /// unescaped leniently. The result goes through the normal strict parse.
 fn salvage(text: &str) -> Option<String> {
+    let text = text.trim_end();
+    if !text.ends_with('}') {
+        return None;
+    }
     let field = |hay: &str, key: &str| -> Option<String> {
         let at = hay.find(&format!("\"{key}\""))?;
         let rest = hay[at + key.len() + 2..]
@@ -1239,12 +1264,9 @@ fn salvage(text: &str) -> Option<String> {
     .filter_map(|m| tail.rfind(m))
     .max()
     .or_else(|| {
-        tail.trim_end()
-            .trim_end_matches('`')
-            .trim_end()
-            .trim_end_matches('}')
-            .trim_end()
-            .rfind('"')
+        let quote = tail.rfind('"')?;
+        tail[quote + 1..].chars().filter(|c| !c.is_ascii_whitespace()).eq("}}".chars())
+            .then_some(quote)
     })?;
     let raw = &tail[..close];
     let mut body = String::with_capacity(raw.len());
@@ -1257,18 +1279,24 @@ fn salvage(text: &str) -> Option<String> {
         match chars.next() {
             Some('n') => body.push('\n'),
             Some('t') => body.push('\t'),
-            Some('r') => {}
+            Some('r') => body.push('\r'),
+            Some('b') => body.push('\u{0008}'),
+            Some('f') => body.push('\u{000c}'),
+            Some(other @ ('"' | '\\' | '/')) => body.push(other),
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
-                body.push(
-                    u32::from_str_radix(&hex, 16)
-                        .ok()
-                        .and_then(char::from_u32)
-                        .unwrap_or('?'),
-                );
+                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    body.push(ch);
+                } else {
+                    body.push_str("\\u");
+                    body.push_str(&hex);
+                }
             }
-            Some(other) => body.push(other),
-            None => {}
+            Some(other) => {
+                body.push('\\');
+                body.push(other);
+            }
+            None => body.push('\\'),
         }
     }
     let outside = format!("{} {}", &text[..open], &tail[close..]);
@@ -1283,23 +1311,29 @@ fn salvage(text: &str) -> Option<String> {
 }
 
 fn parse(body: &str) -> std::result::Result<Envelope, String> {
-    if serde_json::from_str::<serde_json::Value>(body).is_err() {
-        let unnested = unnest(body);
-        if serde_json::from_str::<serde_json::Value>(&unnested).is_ok() {
-            return parse(&unnested);
-        }
-        if let Some(fixed) = salvage(&unnested) {
-            return parse(&fixed);
-        }
-    }
     let sent: String = body.chars().take(300).collect();
     let invalid = |e: String| {
         format!(
             "The tool call isn't valid: {e}. Send one JSON object in a spindle-tool block, then wait for the result. To inspect the workspace use {{\"name\":\"list\",\"args\":{{\"path\":\".\"}}}}; to create a file use {{\"name\":\"create\",\"args\":{{\"path\":\"main.rs\",\"content\":\"file text\"}}}}. You sent: {sent}"
         )
     };
-    let mut value: serde_json::Value =
-        serde_json::from_str(body).map_err(|e| invalid(e.to_string()))?;
+    let mut value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(_) => {
+            let unnested = unnest(body);
+            let fixed = repair_json_syntax(&unnested);
+            match serde_json::from_str(&fixed) {
+                Ok(value) => value,
+                Err(error) if error.is_eof() || (attempted(&fixed) && !fixed.trim_end().ends_with('}')) => {
+                    return Err("The tool call ended before its JSON object closed. Resend one complete call. For a large file, create a small valid file first and then patch it in sections.".into());
+                }
+                Err(error) => match salvage(&unnested) {
+                    Some(json) => serde_json::from_str(&json).map_err(|_| invalid(error.to_string()))?,
+                    None => return Err(invalid(error.to_string())),
+                },
+            }
+        }
+    };
     normalize(&mut value);
     let map = value
         .as_object()
@@ -1331,6 +1365,22 @@ fn parse(body: &str) -> std::result::Result<Envelope, String> {
         id: id.to_owned(),
         call,
     })
+}
+
+#[cfg(test)]
+#[test]
+fn tool_call_repairs_keep_source_intact_and_reject_incomplete_writes() {
+    let reply = "I'll create the script.\n{ \"name\" : \"create\", \"args\": {\"path\": \"game.js\", \"content\": \"let x = [1,];\n\tlet y = 2 * x[0];\",},}";
+    let (text, call) = extract(reply);
+    assert_eq!(text, "I'll create the script.");
+    assert!(matches!(
+        call.unwrap().unwrap().call,
+        Call::Create { path, content } if path == "game.js" && content == "let x = [1,];\n\tlet y = 2 * x[0];"
+    ));
+    let partial = r#"First, create game.js:{"name":"create","args":{"path":"game.js","content":"const x = \"game\";\nctx.translate("#;
+    let (text, call) = extract(partial);
+    assert_eq!(text, "First, create game.js:");
+    assert!(call.unwrap().unwrap_err().contains("ended before its JSON object closed"));
 }
 
 /// Resolve a tool path against the project folder, without touching the disk for files that

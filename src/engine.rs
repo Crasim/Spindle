@@ -46,6 +46,8 @@ pub struct View {
     pub web_region_prompt: Option<(u64, crate::location::WebRegionPrompt)>,
     pub composer_receipt: Option<(u64, bool)>,
     pub import_panel: Option<String>,
+    #[cfg(windows)]
+    pub completed_reply: Option<(u64, usize)>,
 }
 
 pub struct Engine {
@@ -4564,7 +4566,7 @@ fn accept_segment(
 }
 
 /// The model saved a final answer instead of asking for a tool or another turn.
-#[cfg(any(target_os = "android", test))]
+#[cfg(any(windows, target_os = "android", test))]
 fn finished_reply(state: &State, chat: u64, previous_messages: usize) -> bool {
     let Some((thread, history)) = state.thread_data(chat) else {
         return false;
@@ -5684,7 +5686,7 @@ mod tests {
     }
 
     #[test]
-    fn only_complete_model_replies_are_eligible_for_an_android_notice() -> Result<()> {
+    fn only_complete_model_replies_are_eligible_for_a_notification() -> Result<()> {
         let root = tempfile::tempdir()?;
         let mut engine = fixture(root.path());
         let chat = engine.state.chat_id;
@@ -8211,7 +8213,7 @@ impl Engine {
         let mut cpu = crate::android_background::Work::default();
         #[cfg(target_os = "android")]
         let mut needs_resume = false;
-        #[cfg(target_os = "android")]
+        #[cfg(any(windows, target_os = "android"))]
         let mut completed_reply = None;
         loop {
             #[cfg(not(target_os = "android"))]
@@ -8568,7 +8570,7 @@ impl Engine {
                 store.save(&self.state)?;
             }
             #[cfg(target_os = "android")]
-            if let Some(chat) = completed_reply.take() {
+            if let Some((chat, _)) = completed_reply.take() {
                 crate::android_background::reply_ready(chat);
             }
             if background && self.state.held {
@@ -8622,6 +8624,8 @@ impl Engine {
                     web_region_prompt,
                     composer_receipt: composer_receipt.take(),
                     import_panel: self.jobs.import_panel.take(),
+                    #[cfg(windows)]
+                    completed_reply: completed_reply.take(),
                 })
                 .is_err()
             {
@@ -8797,7 +8801,7 @@ impl Engine {
                 }
                 result = async {active.as_mut().unwrap().await}, if active.is_some() => {
                     active = None;
-                    #[cfg(target_os = "android")]
+                    #[cfg(any(windows, target_os = "android"))]
                     let reply = self.state.queue.front().and_then(|task| {
                         let chat = task.origin.unwrap_or(self.state.chat_id);
                         self.state.thread_data(chat).map(|(_, history)| (chat, history.len()))
@@ -8837,12 +8841,11 @@ impl Engine {
                     });
                     match outcome {
                         Ok(msg) => {
-                            #[cfg(target_os = "android")]
+                            #[cfg(any(windows, target_os = "android"))]
                             if let Some((chat, len)) = reply
-                                && crate::android_background::activity().notify_reply()
                                 && finished_reply(&self.state, chat, len)
                             {
-                                completed_reply = Some(chat);
+                                completed_reply = Some((chat, len + 1));
                             }
                             notice = msg;
                         }

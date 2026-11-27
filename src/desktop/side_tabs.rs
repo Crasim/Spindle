@@ -1,8 +1,7 @@
 //! The right panel's other tabs: this chat's files, the project library, and a browser.
 //!
-//! The Viewer tab (documents and HTML previews) lives in `reader.rs`; this file holds the
-//! rest. Tabs hand back what the user picked as a [`Pick`], and the desktop opens it in the
-//! Viewer the same way a file card in the chat would.
+//! Tabs hand back what the user picked as a [`Pick`]. The desktop opens HTML in the
+//! Browser and other documents in the Viewer.
 
 use super::*;
 
@@ -18,7 +17,7 @@ pub(super) enum Tab {
 
 impl Tab {
     pub const ALL: [(Tab, &'static str, &'static str); 5] = [
-        (Tab::Viewer, "Viewer", "Documents and previews"),
+        (Tab::Viewer, "Viewer", "Documents and source"),
         (
             Tab::Files,
             "Files",
@@ -29,7 +28,7 @@ impl Tab {
             "Library",
             "Every file in this chat's project or workspace",
         ),
-        (Tab::Browser, "Browser", "Browse the web beside the chat"),
+        (Tab::Browser, "Browser", "Browse the web and preview HTML"),
         (Tab::Plan, "Plan", "View and edit this conversation’s plan"),
     ];
 }
@@ -127,7 +126,7 @@ fn file_row(
                     .frame(false)
                     .truncate(),
             )
-            .on_hover_text(format!("{name}\nOpen in the viewer"));
+            .on_hover_text(name);
         if open.clicked() {
             action = Some(RowAction::Open);
         }
@@ -282,6 +281,7 @@ impl Default for BrowserPane {
 enum BrowserSource {
     Public { chat: u64, address: String },
     Linked { chat: u64 },
+    Local { name: String, disk: Option<PathBuf> },
 }
 
 #[derive(Default)]
@@ -293,6 +293,7 @@ struct BrowserTab {
     error: String,
     model_page: Option<(String, String)>,
     activity: Option<crate::execution::BrowserActivity>,
+    local: Option<html_preview::HtmlPreview>,
     #[cfg(windows)]
     web: Option<wry::WebView>,
     #[cfg(windows)]
@@ -355,6 +356,49 @@ pub(super) fn to_url(typed: &str) -> String {
 }
 
 impl BrowserPane {
+    fn new_tab_for(&mut self, source: BrowserSource) -> usize {
+        if let Some(index) = self.tabs.iter().position(|tab| tab.source.is_none() && tab.address.is_empty()) {
+            self.tabs[index].source = Some(source);
+            index
+        } else {
+            self.tabs.push(BrowserTab { source: Some(source), ..Default::default() });
+            self.tabs.len() - 1
+        }
+    }
+
+    pub fn open_html(&mut self, name: String, text: String, disk: Option<PathBuf>) {
+        let source = BrowserSource::Local { name: name.clone(), disk: disk.clone() };
+        let index = self.tabs.iter().position(|tab| tab.source.as_ref() == Some(&source))
+            .unwrap_or_else(|| self.new_tab_for(source));
+        self.select(index);
+        let tab = &mut self.tabs[index];
+        tab.address.clone_from(&name);
+        tab.local.get_or_insert_with(Default::default).load_with_path(name, text, disk);
+    }
+
+    pub fn showing_html(&self) -> bool {
+        self.tabs[self.selected].local.is_some()
+    }
+
+    pub fn close_html_tabs(&mut self) {
+        for index in (0..self.tabs.len()).rev() {
+            if self.tabs[index].local.is_some() {
+                self.close(index);
+            }
+        }
+    }
+
+    pub fn focus_chat(&self) {
+        let tab = &self.tabs[self.selected];
+        if let Some(page) = &tab.local {
+            page.focus_chat();
+        }
+        #[cfg(windows)]
+        if let Some(web) = &tab.web {
+            let _ = web.focus_parent();
+        }
+    }
+
     /// Opening and linking may select a tab. Finishing a background load only updates it.
     pub fn present(&mut self, page: crate::execution::BrowserPanel, foreground: bool) -> bool {
         use crate::execution::BrowserActivity;
@@ -368,15 +412,7 @@ impl BrowserPane {
         };
         let index = match self.tabs.iter().position(|tab| tab.source.as_ref() == Some(&source)) {
             Some(index) => index,
-            None if starting => {
-                if let Some(index) = self.tabs.iter().position(|tab| tab.source.is_none() && tab.address.is_empty()) {
-                    self.tabs[index].source = Some(source);
-                    index
-                } else {
-                    self.tabs.push(BrowserTab { source: Some(source), ..Default::default() });
-                    self.tabs.len() - 1
-                }
-            }
+            None if starting => self.new_tab_for(source),
             None => return false,
         };
         self.tabs[index].present(page);
@@ -419,6 +455,7 @@ impl BrowserPane {
     }
 
     fn close(&mut self, index: usize) {
+        self.tabs[index].hide();
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.tabs.push(BrowserTab::default());
@@ -535,6 +572,9 @@ impl BrowserTab {
     }
 
     fn hide(&mut self) {
+        if let Some(local) = &mut self.local {
+            local.hide();
+        }
         #[cfg(windows)]
         if self.visible
             && let Some(web) = &self.web
@@ -545,6 +585,10 @@ impl BrowserTab {
 
     fn show(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame,
         retry: Option<&(u64, String)>, ready: bool, browser_path: &str) -> Option<Pick> {
+        if let Some(local) = &mut self.local {
+            local.show(ui, frame, browser_path);
+            return None;
+        }
         #[cfg(windows)]
         let _ = browser_path;
         #[cfg(not(windows))]

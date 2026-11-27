@@ -352,7 +352,7 @@ pub struct Desktop {
     favorites_only: bool,
     select_focus: bool,
     /// Open the model picker on the next frame (from /model).
-    controls_panel: Option<settings::ControlsPanel>,
+    model_menu_requested: bool,
     execution_panel: Option<crate::sync::placement::Scope>,
     /// Images waiting to go with the next message: name, bytes and a thumbnail.
     image_drafts: Vec<submission::ImageDraft>,
@@ -1138,7 +1138,7 @@ impl Desktop {
             search: String::new(),
             favorites_only: false,
             select_focus: false,
-            controls_panel: None,
+            model_menu_requested: false,
             execution_panel: None,
             image_drafts: vec![],
             images_by_thread: Default::default(),
@@ -1692,13 +1692,14 @@ impl Desktop {
                     ui.label(format!("Attached for next task: {}", file.path));
                 }
                 let id = ui.make_persistent_id("prompt");
-                if std::mem::take(&mut self.focus) || typing_into_chat(ui, id) {
+                let menu_open = settings::ComposerMenu::current(ctx).is_some() || self.model_menu_requested;
+                if !menu_open && (std::mem::take(&mut self.focus) || typing_into_chat(ui, id)) {
                     ui.memory_mut(|m| m.request_focus(id));
                 }
                 self.paste_chips(ui,id);
                 self.image_chips(ui);
                 let has_pastes=self.paste_drafts.files.contains_key(&self.view.state.chat_id);
-                let commands = if ui.memory(|m| m.has_focus(id)) && self.draft != self.commands_dismissed {
+                let commands = if !menu_open && ui.memory(|m| m.has_focus(id)) && self.draft != self.commands_dismissed {
                     command_matches(&self.draft, &self.view.state.skills)
                 } else {
                     vec![]
@@ -1731,7 +1732,7 @@ impl Desktop {
                 let active = self.view.can_steer;
                 let prefs = &self.view.state.preferences;
                 let plain = !has_pastes && self.image_drafts.is_empty() && !self.draft.trim_start().starts_with('/');
-                let key_submission = ui.memory(|memory| memory.has_focus(id))
+                let key_submission = (!menu_open && ui.memory(|memory| memory.has_focus(id)))
                     .then(|| ui.input_mut(|input| composer_enter(input, active, plain, prefs))).flatten();
                 let mut submit = key_submission.is_some();
                 let mut steer = key_submission == Some(true);
@@ -1766,8 +1767,12 @@ impl Desktop {
                             ui, id, id.with(self.view.state.chat_id), &mut self.draft,
                             hint,
                         );
-                        if response.clicked() {
-                            self.reader.preview.focus_chat();
+                        if response.clicked() && self.reader.open {
+                            if self.reader.tab == side_tabs::Tab::Browser {
+                                self.reader.browser.focus_chat();
+                            } else {
+                                self.reader.preview.focus_chat();
+                            }
                         }
                         ui.horizontal(|ui| {
                             let compact = narrow(ctx) || ui.available_width() < 520.;
@@ -1781,6 +1786,8 @@ impl Desktop {
                                 && self.voice.recording().is_none() && ui.available_width() >= 202.)
                             {
                                 self.usage_rings(ui);
+                            } else if matches!(settings::ComposerMenu::current(ctx), Some(settings::ComposerMenu::PlanUsage | settings::ComposerMenu::Budget)) {
+                                settings::ComposerMenu::dismiss(ctx);
                             }
                             if !compact {
                                 ui.separator();
@@ -2419,9 +2426,13 @@ impl Desktop {
                 }
                 if let Some(key)=toggle_steps { if !self.open_steps.remove(&key) {self.open_steps.insert(key);} }
                 if let Some((name,source,raw,disk))=open_file {
-                    self.reader.open_output(name,source);
-                    self.reader.preview.set_disk(disk);
-                    if raw {self.reader.preview.show_source();}
+                    if raw {
+                        self.reader.open_output(name, source);
+                        self.reader.preview.set_disk(disk);
+                        self.reader.preview.show_source();
+                    } else {
+                        self.reader.open_html(name, source, disk);
+                    }
                 }
                 if let Some((disk,name,text,edit))=open_document {
                     match disk {
@@ -2435,8 +2446,9 @@ impl Desktop {
                     match cmd {
                         reader::CodeAction::OpenFile(_)=>{}
                         reader::CodeAction::Preview(info,body)=>{
-                            let name=crate::artifacts::name(&info,&prompt).unwrap_or_else(||"HTML preview".into());
-                            self.reader.open_output(name,body);self.page=Page::Chat;
+                            let name=crate::artifacts::name(&info,&prompt).unwrap_or_else(||"index.html".into());
+                            self.reader.open_html(name, body, None);
+                            self.page=Page::Chat;
                         }
                         reader::CodeAction::Save(info,body)=>{
                             if let Some(name)=crate::artifacts::name(&info,&prompt) {
@@ -2842,7 +2854,6 @@ impl Desktop {
             || self.details
             || self.builder
             || self.swarm
-            || self.controls_panel.is_some()
             || self.execution_panel.is_some()
             || self.tuning_editor.is_some()
             || self.threads.has_editor()
@@ -2875,6 +2886,9 @@ impl Desktop {
     }
 
     fn go_back(&mut self, ctx: &egui::Context) {
+        if settings::ComposerMenu::dismiss(ctx) {
+            return;
+        }
         if self.drawer {
             self.drawer = false;
             self.drawer_at = None;
@@ -2894,8 +2908,9 @@ impl Desktop {
     }
 
     #[cfg(target_os = "android")]
-    fn update_system_back(&mut self) {
-        let enabled = self.drawer || self.reader.open || self.has_detail_panel() || self.page != Page::Chat;
+    fn update_system_back(&mut self, ctx: &egui::Context) {
+        let enabled = self.drawer || self.reader.open || self.has_detail_panel() || self.page != Page::Chat
+            || settings::ComposerMenu::current(ctx).is_some();
         if enabled != self.handles_system_back {
             crate::android::set_back_navigation(enabled);
             self.handles_system_back = enabled;
@@ -2916,8 +2931,6 @@ impl Desktop {
             self.project_dialogs(ui);
         } else if self.threads.has_editor() {
             self.thread_windows(ui);
-        } else if let Some(panel) = self.controls_panel {
-            self.controls_panel(ui, panel);
         } else if let Some(scope) = self.execution_panel.clone() {
             self.render_execution_panel(ui, scope);
         } else if self.tuning_editor.is_some() {
@@ -2988,6 +3001,7 @@ impl eframe::App for Desktop {
             self.request_exit(ctx);
         }
         if self.page == Page::Chat
+            && !self.has_detail_panel() && !self.drawer
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::K))
         {
             self.show_models();
@@ -3089,6 +3103,9 @@ impl eframe::App for Desktop {
                     );
                 });
             }
+            if v.state.chat_id != self.view.state.chat_id || v.state.model != self.view.state.model {
+                settings::ComposerMenu::dismiss(ctx);
+            }
             if v.state.chat_id != self.view.state.chat_id {
                 if matches!(self.execution_panel, Some(crate::sync::placement::Scope::Chat(_))) {
                     self.execution_panel = None;
@@ -3100,6 +3117,10 @@ impl eframe::App for Desktop {
                     self.reader.preview = Default::default();
                     self.reader.open = false;
                 }
+                if self.reader.tab == side_tabs::Tab::Browser && self.reader.browser.showing_html() {
+                    self.close_reader();
+                }
+                self.reader.browser.close_html_tabs();
 
                 self.drafts_by_thread
                     .insert(self.view.state.chat_id, std::mem::take(&mut self.draft));
@@ -3269,6 +3290,8 @@ impl eframe::App for Desktop {
         }
         if narrow(ctx) {
             if self.drawer {
+                settings::ComposerMenu::dismiss(ctx);
+                self.model_menu_requested = false;
                 // The drawer covers the screen; choosing anything in it closes it.
                 let now = (std::mem::discriminant(&self.page), self.view.state.chat_id);
                 let at = *self.drawer_at.get_or_insert(now);
@@ -3285,7 +3308,7 @@ impl eframe::App for Desktop {
                 self.report_view(None);
                 #[cfg(target_os = "android")]
                 {
-                    self.update_system_back();
+                    self.update_system_back(ctx);
                     self.android_ime.finish_frame(ctx);
                 }
                 return;
@@ -3300,6 +3323,10 @@ impl eframe::App for Desktop {
             self.close_reader();
         }
         let detail = self.has_detail_panel();
+        if detail || self.page != Page::Chat || (narrow(ctx) && self.reader.open) {
+            settings::ComposerMenu::dismiss(ctx);
+            self.model_menu_requested = false;
+        }
         if detail {
             self.reader.preview.hide();
             self.reader.browser.hide();
@@ -3354,8 +3381,8 @@ impl eframe::App for Desktop {
                         .unwrap_or_else(|| text.clone())
                 };
                 if html {
-                    self.reader.open_output(name.clone(), source());
-                    self.reader.preview.set_disk(disk);
+                    let body = source();
+                    self.reader.open_html(name, body, disk);
                     self.page = Page::Chat;
                 } else if crate::documents::readable(&name) {
                     match disk {
@@ -3371,8 +3398,9 @@ impl eframe::App for Desktop {
             Some(side_tabs::Pick::Path(path)) => {
                 let name = path.to_string_lossy().into_owned();
                 if crate::documents::readable(&name) {
+                    let html = crate::html_preview::is_html(&path);
                     self.reader.load(path);
-                    if self.reader.preview.active() {
+                    if html {
                         self.page = Page::Chat;
                     }
                 } else {
@@ -3468,7 +3496,7 @@ impl eframe::App for Desktop {
         self.report_view(viewing.then_some(self.view.state.chat_id));
         #[cfg(target_os = "android")]
         {
-            self.update_system_back();
+            self.update_system_back(ctx);
             self.android_ime.finish_frame(ctx);
         }
     }
@@ -3719,6 +3747,86 @@ mod transcript_tests {
     }
 
     #[test]
+    fn composer_controls_open_above_the_toolbar_and_keep_the_chat_visible() {
+        use egui::{Event, Pos2, PointerButton, Modifiers, Key};
+        let dir = tempfile::tempdir().unwrap();
+        for (width, height) in [(360., 430.), (1150., 760.)] {
+            let (ctx, mut app) = fixture(dir.path(), 0);
+            let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+            app.tx = tx;
+            app.draft = "Keep this draft".into();
+            app.view.state.history.push(crate::ollama::Message::new("assistant", "Keep this conversation visible"));
+            app.view.state.model = "@test/reasoning-model".into();
+            app.view.models = vec![app.view.state.model.clone(), "@test/second-model".into()];
+            app.view.reasoning.insert(app.view.state.model.clone());
+            app.view.state.providers.push(serde_json::from_value(serde_json::json!({
+                "id": "test", "name":"Test provider", "base":"https://example.com/v1",
+                "protocol":"Responses", "models":["reasoning-model", "second-model"]
+            })).unwrap());
+            app.view.state.automation.rules.push(crate::automation::Rule {
+                scope:"test".into(), period:18000, cap:10, percent:90, used:3, reset:0, pause:false,
+            });
+            let frame = |app: &mut Desktop, events| {
+                let mut anchors = [Pos2::ZERO; 4];
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(width, height))),
+                    events, ..Default::default()
+                }, |ctx| {
+                    egui::TopBottomPanel::bottom("composer-control-test").show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            anchors[0] = ui.cursor().min + egui::vec2(16., 15.);
+                            app.model_picker(ui, width < NARROW);
+                            anchors[1] = ui.cursor().min + egui::vec2(16., 13.);
+                            app.thinking_toggle(ui, width < NARROW);
+                            anchors[2] = ui.cursor().min + egui::vec2(13., 13.);
+                            anchors[3] = anchors[2] + egui::vec2(26. + ui.spacing().item_spacing.x, 0.);
+                            app.usage_rings(ui);
+                        });
+                    });
+                    egui::CentralPanel::default().show(ctx, |ui| app.conversation(ui));
+                });
+                (output, anchors)
+            };
+            let click = |app: &mut Desktop, pos| {
+                for pressed in [true, false] {
+                    frame(app, vec![Event::PointerMoved(pos), Event::PointerButton {
+                        pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                    }]);
+                }
+            };
+            for (index, title) in ["Choose a model", "Thinking", "Plan usage", "API budget"].into_iter().enumerate() {
+                let (_, anchors) = frame(&mut app, vec![]);
+                click(&mut app, anchors[index]);
+                let (out, _) = frame(&mut app, vec![]);
+                let place = visible_text(&out, title).unwrap_or_else(|| panic!("{title} did not open at {width}"));
+                assert!(place.y < anchors[index].y && place.x > 0. && place.x < width, "{title} was outside the chat");
+                assert!(visible_text(&out, "Keep this conversation visible").is_some());
+                assert!(app.page == Page::Chat && !app.has_detail_panel());
+                match index {
+                    0 => click(&mut app, visible_text(&out, "second-model").unwrap()),
+                    1 => click(&mut app, visible_text(&out, "High").unwrap()),
+                    2 => app.go_back(&ctx),
+                    _ => {
+                        frame(&mut app, vec![Event::Key {
+                            key: Key::Escape, physical_key: None, pressed: true,
+                            repeat: false, modifiers: Modifiers::NONE,
+                        }]);
+                    }
+                }
+                assert!(settings::ComposerMenu::current(&ctx).is_none());
+            }
+            assert_eq!(app.draft, "Keep this draft");
+            let sent: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok()).collect();
+            assert!(sent.iter().any(|command| command == "/model @test/second-model"));
+            let (model, tuning) = sent.iter().find_map(|command| command.strip_prefix("/model-tuning "))
+                .map(|json| serde_json::from_str::<(String, crate::state::Tuning)>(json).unwrap())
+                .expect("selecting a thinking level should send a change");
+            assert_eq!(model, "@test/reasoning-model");
+            assert_eq!(tuning.thinking, crate::state::Thinking::High);
+        }
+    }
+
+    #[test]
     fn work_card_opens_from_its_whole_row_at_phone_width() {
         use egui::{Event, Modifiers, PointerButton};
         let dir = tempfile::tempdir().unwrap();
@@ -3807,8 +3915,8 @@ mod transcript_tests {
                     pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
                 }], 400.);
             }
-            assert!(app.reader.open && app.reader.preview.active());
-            assert!(app.reader.tab == side_tabs::Tab::Viewer);
+            assert!(app.reader.open && app.reader.browser.showing_html());
+            assert!(app.reader.tab == side_tabs::Tab::Browser);
         }
     }
 

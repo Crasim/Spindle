@@ -56,29 +56,39 @@ fn column(mut n: usize) -> String {
 
 impl ReaderPane {
     pub fn open_output(&mut self, name: String, source: String) {
+        self.browser.hide();
         self.open = true;
         self.tab = side_tabs::Tab::Viewer;
         self.preview.load(name, source);
     }
 
+    pub fn open_html(&mut self, name: String, source: String, disk: Option<PathBuf>) {
+        self.preview.hide();
+        self.open = true;
+        self.tab = side_tabs::Tab::Browser;
+        self.browser.open_html(name, source, disk);
+    }
+
     pub fn load(&mut self, file: PathBuf) {
         if crate::html_preview::is_html(&file) {
+            let error = match crate::artifacts::read_html(&file) {
+                Ok(source) => {
+                    let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                    self.open_html(name, source, Some(file));
+                    return;
+                }
+                Err(error) => format!("Cannot open HTML: {error:#}"),
+            };
             self.preview.hide();
             *self = Self {
                 open: true,
                 width: self.width,
-                file: file.clone(),
+                file,
+                error,
                 browser: std::mem::take(&mut self.browser),
                 library: std::mem::take(&mut self.library),
                 ..Default::default()
             };
-            match crate::artifacts::read_html(&file) {
-                Ok(source) => {
-                    let name = file.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                    self.preview.load_with_path(name, source, Some(file));
-                }
-                Err(error) => self.error = format!("Cannot open HTML: {error:#}"),
-            }
             return;
         }
         self.load_document(file);
@@ -86,6 +96,7 @@ impl ReaderPane {
 
     pub fn load_document(&mut self, file: PathBuf) {
         self.preview.hide();
+        self.browser.hide();
         *self = Self {
             open: true,
             width: self.width,
@@ -105,6 +116,7 @@ impl ReaderPane {
     /// Open a generated file from its thread snapshot when the original path is unavailable.
     pub fn load_snapshot(&mut self, name: String, text: String) {
         self.preview.hide();
+        self.browser.hide();
         let ext = name
             .rsplit_once('.')
             .map(|(_, e)| e.to_owned())
