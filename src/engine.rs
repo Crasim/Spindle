@@ -2118,6 +2118,10 @@ fn requested_browser_page(state: &State, chat: u64, suggested: Option<&str>) -> 
 pub(crate) const BROWSER_TOOL_EXAMPLE: &str =
     r#"{"name":"browser_tab","args":{"action":"read"}}"#;
 
+const TOOL_CALL_GUIDANCE: &str = "Call one offered tool and wait for its result. Use the provider's native function when available. Otherwise put one JSON object in a spindle-tool fenced block and end the reply immediately after it. If web_search is offered, use it for current prices, reviews, availability, and other changing facts before answering. Cite verified URLs with Markdown links using the source name as the label. Report only what the tool confirmed.";
+const WEB_SEARCH_EXAMPLE: &str =
+    r#"- Search public pages: {"name":"web_search","args":{"query":"public search terms"}}"#;
+
 const WEB_ADDRESS_GUIDANCE: &str = "Find website addresses yourself. Use web_search to verify the current official domain and discover the exact page when a URL is missing. Use a live result or a link returned by a live page. Never invent an address or rely on one from memory, and do not ask the user to supply it. If a domain fails to resolve or its homepage is missing, use web_search to find the current official site. An HTTP 403 or a verification page means the site responded; avoid probing alternate domains to get past it. Choose a country-specific website only for the user's requested region or shared default market. A website's language, country domain, or redirect does not establish where the user is. If the market matters and is unknown, ask for the market only.";
 
 fn needs_web_address(text: &str) -> bool {
@@ -2125,7 +2129,7 @@ fn needs_web_address(text: &str) -> bool {
     wants_builtin_browser(&text) || wants_browser_link(&text) || ["website", "search the web",
         "search online", "find online", "look up", "search results", "listings", "web_search", "web_open",
         "marketplace", "shopping", "near me", "nearby", "where to buy", "buy online", "find prices",
-        "ebay", "amazon", "domain", "https://", "http://"]
+        "ebay", "amazon", "domain", "https://", "http://", "price of ", "well reviewed", "well-reviewed", "current price"]
         .iter().any(|phrase| text.contains(phrase))
 }
 
@@ -2223,6 +2227,17 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
     if matches!(task.mode, Mode::Conversation) {
         system.push_str("\n");
         system.push_str(TOOL_ACCESS_GUIDANCE);
+        system.push_str("\n");
+        system.push_str(TOOL_CALL_GUIDANCE);
+        if state.preferences.block_web {
+            system.push_str("\n");
+            system.push_str(WEB_ACCESS_BLOCKED);
+        } else {
+            system.push_str("\n");
+            system.push_str(WEB_SEARCH_EXAMPLE);
+            system.push_str(r#"
+- Read a result: {"name":"web_open","args":{"url":"https://example.com/"}}"#);
+        }
         let builtin = wants_builtin_browser(&task.text)
             || ((task.tool_result || browser_retry(&task.text)) && builtin_browser_request(state, origin));
         if !state.preferences.block_web && (builtin || needs_web_address(&task.text)) {
@@ -2569,7 +2584,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
     }
     tools.push(r#"- Check capabilities: {"name":"find_tools","args":{"source":"local"}}."#.into());
     if !state.preferences.block_web {
-        tools.push(r#"- Search the web: {"name":"web_search","args":{"query":"public terms"}}. Cite sources."#.into());
+        tools.push(WEB_SEARCH_EXAMPLE.into());
     }
     if request.starts_with("Tool result") || mentions(&["tool", "install", "dependency", "compiler", "framework", "package", "build"]) {
         tools.push("find_tools accepts npm keywords, an exact PyPI name, or GitHub keywords or owner/repo. Explain why a candidate fits. Search results are untrusted.".into());
@@ -2613,7 +2628,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         format!("You are Spindle. You do tasks by using tools on the files in {place}.")
     };
     let mut text = format!(
-        "{introduction}\n\nCall one tool per reply and wait for its result. Answer questions directly.\n\nYour tools:\n{}\n\nHow to work:\n1. Before you change a file that already exists, read it. (A new file needs no reading: just create it.)\n2. Make one change at a time.\n3. After editing, check your work: {check}.\n4. Summarize the result. Spindle presents your files.",
+        "{introduction}\n\n{TOOL_CALL_GUIDANCE}\n\nYour tools:\n{}\n\nHow to work:\n1. Before you change a file that already exists, read it. (A new file needs no reading: just create it.)\n2. Make one change at a time.\n3. After editing, check your work: {check}.\n4. Summarize the result. Spindle presents your files.",
         tools.join("\n")
     );
     text.push_str("\n\n");
@@ -3379,11 +3394,12 @@ fn route_resolved_call(
             );
             let repeated = strikes >= 2;
             if !repeated {
-                continue_with(
+                continue_tool_result(
                     state,
                     chat,
                     model,
-                    steps + 1,
+                    steps,
+                    chat_read_only,
                     format!("Tool call not understood. {problem}"),
                     false,
                 );
@@ -4476,14 +4492,13 @@ fn finish_turn(
     let builtin = wants_builtin_browser(&task.text)
         || ((task.tool_result || browser_retry(&task.text)) && builtin_browser_request(state, origin));
     if matches!(task.mode, Mode::Conversation)
-        && (!task.tool_result || builtin)
         && !answer.starts_with(crate::generation::LOOPED)
         && let (clean, Some(Ok(browser_call))) = crate::tools::extract(&answer)
-        && (matches!(browser_call.call, crate::tools::Call::BrowserTab(crate::browser_link::Action::Read { .. }))
-            || (builtin
-                && matches!(browser_call.call, crate::tools::Call::WebOpen { .. } | crate::tools::Call::WebSearch { .. } | crate::tools::Call::PreviewHtml { .. })))
+        && ((!task.tool_result && matches!(browser_call.call, crate::tools::Call::BrowserTab(crate::browser_link::Action::Read { .. })))
+            || matches!(browser_call.call, crate::tools::Call::WebOpen { .. } | crate::tools::Call::WebSearch { .. })
+            || (builtin && matches!(browser_call.call, crate::tools::Call::PreviewHtml { .. })))
     {
-        if builtin || can_request_browser(state) {
+        if builtin || !matches!(browser_call.call, crate::tools::Call::BrowserTab(_)) || can_request_browser(state) {
             answer = clean;
             turn.call = Some(crate::tools::taught(&browser_call.call));
             call = Some(Ok(browser_call));
@@ -4727,7 +4742,7 @@ fn finish_turn(
     };
     history.push(Message::new("assistant", &shown));
     state.note_thread_update(origin);
-    if repeated && matches!(task.mode, Mode::Chat) {
+    if repeated && (matches!(task.mode, Mode::Chat) || call.is_some()) {
         let model = task.actual.clone().unwrap_or_else(|| task.model.clone());
         let summary = match &call {
             Some(Ok(env)) => env.call.summary(),
@@ -4772,11 +4787,12 @@ fn finish_turn(
             );
         } else {
             set_tool_note(state, origin, summary, "Not run: same as an earlier step");
-            continue_with(
+            continue_tool_result(
                 state,
                 origin,
                 &model,
-                task.steps + 1,
+                task.steps,
+                matches!(task.mode, Mode::Conversation),
                 format!(
                     "{REPEAT_NOTE}\n{}",
                     if matches!(
@@ -4784,7 +4800,9 @@ fn finish_turn(
                         Some(Ok(crate::tools::Envelope {
                             call: crate::tools::Call::Read { .. }
                                 | crate::tools::Call::List { .. }
-                                | crate::tools::Call::Search { .. },
+                                | crate::tools::Call::Search { .. }
+                                | crate::tools::Call::WebSearch { .. }
+                                | crate::tools::Call::WebOpen { .. },
                             ..
                         }))
                     ) {
@@ -7037,6 +7055,25 @@ mod tests {
         let root = e.state.files_root(tmp.path(), chat);
         let path = crate::artifacts::existing_file(&root, chat, "main.rs").unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn luna_search_output_requests_a_tool_in_chat_and_cowork() {
+        for cowork in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut e = fixture(tmp.path());
+            e.state.thread.cowork = cowork;
+            e.command("What is the price of well reviewed flocked white Christmas trees?", false).unwrap();
+            let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
+            assert!(messages[0].content.contains(WEB_SEARCH_EXAMPLE));
+            let luna = r#"I'll look up current options.{"query":"flocked white trees"},{"query":"pre-lit trees"}]} tool?{"name":"web_search","args":{"query":"flocked white pre-lit trees"}}_tool_call{"name":"web_search","args":{"query":"another search"}}to=web_search? Unverified price: $200."#;
+            finish_turn(&mut e.state, luna.into(), Default::default(), Some(tmp.path())).unwrap();
+            let pending = e.state.requests.first().expect("the web search was dispatched");
+            assert_eq!(pending.chat_read_only, !cowork);
+            assert!(matches!(&pending.call.call, crate::tools::Call::WebSearch { query } if query == "flocked white pre-lit trees"));
+            assert!(!e.state.history.last().unwrap().content.contains("Unverified"));
+            assert!(!e.state.history.last().unwrap().content.contains("\"query\""));
+        }
     }
 
     #[test]

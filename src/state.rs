@@ -717,7 +717,11 @@ pub const APK_SKILL_NAME: &str = "android-apk";
 pub const APK_SKILL: &str = include_str!("../skills/android-apk/SKILL.md");
 pub const BROWSER_SKILL_NAME: &str = "browser-use";
 pub const BROWSER_SKILL: &str = include_str!("../skills/browser-use/SKILL.md");
-pub const BUILTIN_SKILLS: [(&str, &str); 2] = [(APK_SKILL_NAME, APK_SKILL), (BROWSER_SKILL_NAME, BROWSER_SKILL)];
+pub const BUILTIN_SKILLS: [(&str, &str); 3] = [
+    (APK_SKILL_NAME, APK_SKILL),
+    (BROWSER_SKILL_NAME, BROWSER_SKILL),
+    ("spindle", include_str!("../skills/spindle/SKILL.md")),
+];
 
 impl State {
     pub(crate) fn current_plan(&self, chat: u64) -> Option<(u64, String)> {

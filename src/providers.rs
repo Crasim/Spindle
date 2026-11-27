@@ -609,6 +609,15 @@ impl Provider {
         {
             body["tools"] = json!([definition]);
         }
+        if matches!(self.protocol, Protocol::Responses | Protocol::ChatGpt)
+            && let Some(system) = messages.first().filter(|m| m.role == "system")
+        {
+            let offered = response_tools(&system.content);
+            if !offered.is_empty() {
+                body["tools"] = json!(offered);
+                body["parallel_tool_calls"] = json!(false);
+            }
+        }
         let mut tool_name = String::new();
         let mut tool_arguments = String::new();
         let mut reasoning = false;
@@ -622,7 +631,16 @@ impl Provider {
         {
             request = request.timeout(Duration::from_secs(3600));
         }
-        let response = request.send().await?;
+        let mut response = request.send().await?;
+        if matches!(self.protocol, Protocol::Responses | Protocol::ChatGpt)
+            && body.get("tools").is_some() && matches!(response.status().as_u16(), 400 | 422)
+        {
+            // Some Responses-compatible servers only support the text protocol.
+            body.as_object_mut().unwrap().remove("tools");
+            body.as_object_mut().unwrap().remove("parallel_tool_calls");
+            response = self.authorize(client.post(format!("{}/{path}", self.base)), &key)
+                .json(&body).send().await?;
+        }
         obs.http(&response, threshold);
         let mut response = response.error_for_status()?;
         let mut buffer = Vec::new();
@@ -705,6 +723,11 @@ impl Provider {
                                 .pointer("/response/usage/output_tokens")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(0);
+                            if !obs.output_limited && body.get("tools").is_some()
+                                && let Some(block) = response_tool_call(&event["response"])
+                            {
+                                return complete(block, false);
+                            }
                             return complete(answer, obs.output_limited);
                         }
                         Some("response.failed" | "response.incomplete" | "error") => {
@@ -820,6 +843,20 @@ impl Provider {
 }
 /// Messages in each protocol's format. Text-only messages stay plain strings; images
 /// become the protocol's content parts.
+fn response_tools(system: &str) -> Vec<Value> {
+    crate::tools::offered(system).into_iter().map(|definition| {
+        let mut function = definition["function"].clone();
+        function["type"] = json!("function");
+        function["strict"] = json!(false);
+        function
+    }).collect()
+}
+
+fn response_tool_call(response: &Value) -> Option<String> {
+    let call = response["output"].as_array()?.iter().find(|item| item["type"] == "function_call")?;
+    crate::tools::from_native(std::slice::from_ref(call))
+}
+
 fn wire_messages<'a>(
     protocol: Protocol,
     messages: impl Iterator<Item = &'a Message>,
@@ -1015,6 +1052,22 @@ fn complete(answer: String, limited: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responses_use_the_offered_schema_and_return_a_native_tool_call() {
+        let tools = response_tools(r#"{"name":"web_search","args":{"query":"public terms"}}"#);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "web_search");
+        assert_eq!(tools[0]["parameters"]["required"][0], "query");
+        let answer = response_tool_call(&json!({"output":[
+            {"type":"reasoning"},
+            {"type":"function_call","name":"web_search","arguments":r#"{"query":"pre-lit trees"}"#}
+        ]})).unwrap();
+        assert!(matches!(crate::tools::extract(&answer).1,
+            Some(Ok(crate::tools::Envelope { call: crate::tools::Call::WebSearch { query }, .. }))
+                if query == "pre-lit trees"));
+    }
     #[test]
     fn local_servers_report_their_context_in_the_model_list() {
         // Project Maya's /v1/models.

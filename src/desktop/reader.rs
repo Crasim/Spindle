@@ -1194,6 +1194,32 @@ struct Block {
 }
 
 impl Block {
+    fn text(&mut self, text: &str, style: &egui::TextFormat) {
+        if !text.contains("http://") && !text.contains("https://") {
+            self.job.append(text, 0., style.clone());
+            return;
+        }
+        for word in text.split_inclusive(char::is_whitespace) {
+            let candidate = word.trim_start_matches(['(', '[', '"']);
+            let mut url = candidate.trim_end_matches(|c: char| c.is_whitespace() || ".,;!?\u{201d}\"".contains(c));
+            while url.ends_with(')') && url.matches(')').count() > url.matches('(').count() {
+                url = &url[..url.len() - 1];
+            }
+            url = url.trim_end_matches(']');
+            if (url.starts_with("https://") || url.starts_with("http://"))
+                && reqwest::Url::parse(url).is_ok_and(|parsed| parsed.has_host())
+            {
+                let prefix = word.len() - candidate.len();
+                self.job.append(&word[..prefix], 0., style.clone());
+                self.split();
+                self.pieces.push(Piece::Url(url.to_owned(), url.to_owned()));
+                self.job.append(&word[prefix + url.len()..], 0., style.clone());
+            } else {
+                self.job.append(word, 0., style.clone());
+            }
+        }
+    }
+
     fn split(&mut self) {
         if !self.job.text.is_empty() {
             self.pieces.push(Piece::Job(std::mem::take(&mut self.job)));
@@ -1691,7 +1717,7 @@ fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String]) -> Vec<MarkdownB
                 if let Some((_, label, _)) = &mut link {
                     label.push_str(&t);
                 } else {
-                    block.job.append(&t, 0., style.clone());
+                    block.text(&t, &style);
                 }
             }
             Event::Code(t) => {

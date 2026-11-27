@@ -370,7 +370,14 @@ pub fn extract(answer: &str) -> (String, Option<std::result::Result<Envelope, St
         ));
     }
     let mut cleaned = answer.to_owned();
-    cleaned.replace_range(range, "");
+    let start = if matches!(found, Some(Ok(Envelope { call: Call::WebSearch { .. }, .. })))
+        && cut_was_bare(answer, range.start)
+    {
+        answer[..range.start].find("{\"query\":").unwrap_or(range.start)
+    } else {
+        range.start
+    };
+    cleaned.replace_range(start..range.end, "");
     // A label left behind when the call came without its fence.
     let mut cleaned = cleaned.trim_end();
     for label in ["spindle-tool", "```spindle-tool", "```"] {
@@ -381,6 +388,10 @@ pub fn extract(answer: &str) -> (String, Option<std::result::Result<Envelope, St
         }
     }
     (cleaned.to_owned(), found)
+}
+
+fn cut_was_bare(text: &str, at: usize) -> bool {
+    !text[at..].starts_with("```") && !text[at..].starts_with("~~~")
 }
 
 /// Turn tool calls a model made in its own format (Ollama's `message.tool_calls`) into a
@@ -606,6 +617,13 @@ pub fn definitions() -> serde_json::Value {
         ));
     }
     definitions
+}
+
+pub fn offered(system: &str) -> Vec<serde_json::Value> {
+    definitions().as_array().into_iter().flatten()
+        .filter(|definition| definition["function"]["name"].as_str()
+            .is_some_and(|name| system.contains(&format!("\"name\":\"{name}\""))))
+        .cloned().collect()
 }
 
 /// What a patch would change in the file at `path`, as a diff with context, if it applies.

@@ -595,17 +595,7 @@ impl Ollama {
             .is_some_and(|c| c.iter().any(|s| s == "tools"));
         if native_tools && let Some(system) = messages.first().filter(|message| message.role == "system") {
             // Only the tools the instructions offer, so a small model's list stays short.
-            let offered: Vec<Value> = crate::tools::definitions()
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|d| {
-                    d["function"]["name"]
-                        .as_str()
-                        .is_some_and(|n| system.content.contains(&format!("\"name\":\"{n}\"")))
-                })
-                .collect();
+            let offered = crate::tools::offered(&system.content);
             if !offered.is_empty() {
                 body["tools"] = json!(offered);
             }

@@ -507,7 +507,44 @@ struct TranscriptRows {
     groups: Vec<Option<usize>>,
     markdown: std::collections::BTreeMap<usize, reader::Markdown>,
     file_sizes: std::collections::HashMap<String, Option<usize>>,
-    file_metadata: Option<Receiver<Vec<(String, Option<usize>)>>>,
+    file_images: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    file_metadata: Option<Receiver<Vec<ArtifactMetadata>>>,
+}
+
+type ArtifactMetadata = (String, Option<usize>, Option<egui::ColorImage>);
+
+fn image_artifact(name: &str) -> bool {
+    Path::new(name).extension().and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ["png", "jpg", "jpeg"].iter().any(|kind| ext.eq_ignore_ascii_case(kind)))
+}
+
+fn artifact_thumbnail(path: &Path, size: u64) -> Option<egui::ColorImage> {
+    if size > 16 * 1024 * 1024 {
+        return None;
+    }
+    let reader = image::ImageReader::open(path).ok()?;
+    if !matches!(reader.format(), Some(image::ImageFormat::Png | image::ImageFormat::Jpeg)) {
+        return None;
+    }
+    let mut reader = reader;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(4096);
+    limits.max_image_height = Some(4096);
+    limits.max_alloc = Some(72 * 1024 * 1024);
+    reader.limits(limits);
+    let pixels = reader.decode().ok()?.thumbnail(640, 480).to_rgba8();
+    Some(egui::ColorImage::from_rgba_unmultiplied(
+        [pixels.width() as usize, pixels.height() as usize], pixels.as_raw(),
+    ))
+}
+
+fn artifact_card(ui: &mut egui::Ui, name: &str, bytes: Option<usize>, image: Option<&egui::TextureHandle>) -> Option<reader::FileAction> {
+    if let Some(texture) = image {
+        let size = texture.size_vec2();
+        let scale = (ui.available_width() / size.x).min(350. / size.y).min(1.);
+        ui.add(egui::Image::new((texture.id(), size * scale)).alt_text(name));
+    }
+    reader::file_card(ui, name, bytes)
 }
 
 impl TranscriptRows {
@@ -519,9 +556,14 @@ impl TranscriptRows {
         if self.heights.is_empty() { return; }
         if before.thread.project != after.thread.project {
             self.file_sizes.clear();
+            self.file_images.clear();
             self.file_metadata = None;
         }
         let common = before.history.iter().zip(&after.history).take_while(|(a, b)| a == b).count();
+        for name in after.thread.turns.range(common..).flat_map(|(_, turn)| &turn.files) {
+            self.file_sizes.remove(name);
+            self.file_images.remove(name);
+        }
         if common != before.history.len() || common != after.history.len() {
             self.repeated.clear();
             self.groups.clear();
@@ -544,7 +586,10 @@ impl TranscriptRows {
                 *height = None;
                 self.markdown.remove(&index);
                 if let Some(turn) = after.thread.turns.get(&index) {
-                    for file in &turn.files { self.file_sizes.remove(file); }
+                    for file in &turn.files {
+                        self.file_sizes.remove(file);
+                        self.file_images.remove(file);
+                    }
                 }
             }
         }
@@ -567,7 +612,23 @@ impl TranscriptRows {
         if let Some(pending) = &self.file_metadata {
             match pending.try_recv() {
                 Ok(files) => {
-                    self.file_sizes.extend(files);
+                    for (name, size, image) in files {
+                        self.file_sizes.insert(name.clone(), size);
+                        if !image_artifact(&name) {
+                            continue;
+                        }
+                        if self.file_images.len() >= 32 {
+                            self.file_images.retain(|_, image| image.is_some());
+                            if self.file_images.len() >= 32
+                                && let Some(old) = self.file_images.keys().next().cloned()
+                            {
+                                self.file_images.remove(&old);
+                            }
+                        }
+                        self.file_images.insert(name.clone(), image.map(|pixels| {
+                            ui.ctx().load_texture(name, pixels, egui::TextureOptions::LINEAR)
+                        }));
+                    }
                     self.file_metadata = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.file_metadata = None,
@@ -606,11 +667,14 @@ impl TranscriptRows {
         let ctx = ui.ctx().clone();
         std::thread::spawn(move || {
             let root = crate::threads::files_root(&workspace, project.as_deref());
-            let files = names.into_iter().map(|name| {
-                let bytes = crate::artifacts::existing_file(&root, chat, &name).ok()
-                    .and_then(|path| std::fs::metadata(path).ok())
-                    .and_then(|m| m.len().try_into().ok());
-                (name, bytes)
+            let files = names.into_iter().take(32).map(|name| {
+                let (bytes, image) = crate::artifacts::existing_file(&root, chat, &name).ok()
+                    .and_then(|path| {
+                        let bytes = std::fs::metadata(&path).ok()?.len();
+                        let image = image_artifact(&name).then(|| artifact_thumbnail(&path, bytes)).flatten();
+                        Some((bytes.try_into().ok(), image))
+                    }).unwrap_or_default();
+                (name, bytes, image)
             }).collect();
             if tx.send(files).is_ok() { ctx.request_repaint(); }
         });
@@ -2077,7 +2141,11 @@ impl Desktop {
                     };
                     let files = || snapshots.iter().chain(previews).chain(extra.iter());
                     let sizes = &self.transcript.file_sizes;
+                    let images = &self.transcript.file_images;
                     let mut size_of=|f:&crate::state::Attachment| {
+                        if !user && image_artifact(&f.path) && !images.contains_key(&f.path) && !copy_row {
+                            missing_sizes.insert(f.path.clone());
+                        }
                         if !f.text.is_empty() { return Some(f.text.len()); }
                         if !sizes.contains_key(&f.path) && !copy_row { missing_sizes.insert(f.path.clone()); }
                         sizes.get(&f.path).copied().flatten()
@@ -2096,7 +2164,7 @@ impl Desktop {
                             let mut card = |ui: &mut egui::Ui, name: &str| {
                                 if shown.iter().any(|s|s==name) {return;}
                                 let bytes=files().find(|f|f.path==name).and_then(&mut size_of);
-                                if let Some(a)=reader::file_card(ui,name,bytes) {chosen.push((name.to_owned(),a));}
+                                if let Some(a)=artifact_card(ui,name,bytes,images.get(name).and_then(Option::as_ref)) {chosen.push((name.to_owned(),a));}
                                 shown.push(name.to_owned());
                             };
                             if copy_row {
@@ -2129,7 +2197,8 @@ impl Desktop {
                         if shown.contains(&file.path) {continue;}
                         shown.push(file.path.clone());
                         ui.push_id(("file-card",&file.path),|ui|{
-                            if let Some(a)=reader::file_card(ui,&file.path,size_of(file)) {chosen.push((file.path.clone(),a));}
+                            let bytes = size_of(file);
+                            if let Some(a)=artifact_card(ui,&file.path,bytes,images.get(&file.path).and_then(Option::as_ref)) {chosen.push((file.path.clone(),a));}
                         });
                     }
                     for (name,choice) in chosen {
@@ -3496,6 +3565,32 @@ mod transcript_tests {
         let expanded = draw_at_width(&ctx, &mut app, 4, vec![], 400.);
         assert!(visible_text(&expanded, "Checking the folder.").is_some());
         assert!(visible_text(&expanded, "Tool call · Not understood · invalid JSON").is_some());
+    }
+
+    #[test]
+    fn a_saved_png_is_painted_in_the_transcript_with_inline_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 0);
+        let chat = app.view.state.chat_id;
+        let root = app.view.state.files_root(dir.path(), chat);
+        let image_path = crate::artifacts::folder(&root, chat).unwrap().join("generated.png");
+        image::RgbaImage::from_pixel(96, 64, image::Rgba([255, 0, 0, 255]))
+            .save(&image_path).unwrap();
+        app.view.state.history.push(crate::ollama::Message::new("assistant",
+            "Here's the image. More at https://example.com/guide.\n\nSaved file: generated.png"));
+        app.view.state.thread.turns.insert(0, crate::state::Turn {
+            files: vec!["generated.png".into()], ..Default::default()
+        });
+        draw_at_width(&ctx, &mut app, 0, vec![], 400.);
+        let files = app.transcript.file_metadata.take().unwrap()
+            .recv_timeout(Duration::from_secs(2)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(files).unwrap();
+        app.transcript.file_metadata = Some(rx);
+        let output = draw_at_width(&ctx, &mut app, 1, vec![], 400.);
+        let texture_id = app.transcript.file_images["generated.png"].as_ref().unwrap().id();
+        assert!(visible_text(&output, "https://example.com/guide").is_some());
+        assert!(output.shapes.iter().any(|shape| shape.shape.texture_id() == texture_id));
     }
 
     #[test]
