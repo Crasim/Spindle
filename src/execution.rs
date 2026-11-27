@@ -843,6 +843,8 @@ impl Engine {
                 }
                 if let Some(reason) = failure {
                     crate::diagnostics::log(&mut self.state, p.chat, &p.model, p.call.call.name(), reason, offered);
+                } else if matches!(p.call.call, Call::BrowserTab(crate::browser_link::Action::Read { .. })) {
+                    crate::diagnostics::browser_link(&mut self.state, p.chat, true);
                 }
                 crate::engine::record_result(&mut self.state,p.id,&text,ok);
                 crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),if ok{"Finished"}else{"Failed"});

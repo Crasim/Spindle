@@ -411,6 +411,22 @@ impl Engine {
         let lowered = cmd.to_lowercase();
         let cmd = lowered.as_str();
         match cmd {
+            "/diagnostics" => {
+                let now = automation::now();
+                match args {
+                    "start 2" | "start 3" => {
+                        ensure!(!self.state.diagnostic_capture.as_ref().is_some_and(|capture| capture.active(now)), "Stop the active capture first");
+                        let days = if args.ends_with('2') { 2 } else { 3 };
+                        self.state.diagnostic_capture = Some(crate::diagnostics::Capture::start(now, days)?);
+                        Ok(format!("Started a {days}-day troubleshooting capture"))
+                    }
+                    "stop" => {
+                        self.state.diagnostic_capture.as_mut().context("There is no troubleshooting capture")?.finish(now);
+                        Ok("Troubleshooting capture stopped".into())
+                    }
+                    _ => bail!("Use /diagnostics start 2, /diagnostics start 3, or /diagnostics stop"),
+                }
+            }
             "/sync-unlock" => {
                 ensure!(self.state.sync.is_none(), "Project already paired");
                 let pass: String =
@@ -911,6 +927,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     let retry = self.jobs.browser_retries.remove(at);
                     let call = crate::tools::Envelope { v: 1, id: "regular-browser".into(),
                         call: crate::tools::Call::BrowserTab(crate::browser_link::Action::Read { url: Some(retry.address) }) };
+                    crate::diagnostics::browser_link(&mut self.state, chat, false);
                     // The user explicitly chose Browser Link for this read. The usual site
                     // and model approvals still apply.
                     route_resolved_call(&mut self.state, chat, &retry.model, 0, Some(&self.root), Ok(call), retry.read_only);

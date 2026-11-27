@@ -614,6 +614,16 @@ fn main() -> Result<()> {
             Err(error) => eprintln!("Spindle update: {error:#}"),
         }
     }
+    if args.first().is_some_and(|arg| arg == "--troubleshooting-report") {
+        let local = args.get(1).is_some_and(|arg| arg == "--local");
+        anyhow::ensure!(args.len() == 1 || (args.len() == 2 && local), "Use --troubleshooting-report [--local] from the workspace folder");
+        let root = std::env::current_dir()?.canonicalize()?;
+        let saved = state::Store::troubleshooting(&root)?;
+        let text = diagnostics::review_report(&saved.failures, &saved.sync_diagnostics, saved.diagnostic_capture.as_ref(),
+            diagnostics::ReportOptions { now: automation::now(), include_models: local, chat_references: local });
+        print!("{text}");
+        return Ok(());
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     let mut api = Ollama::new()?;
     match args.first().map(String::as_str) {
@@ -629,6 +639,7 @@ fn main() -> Result<()> {
         }
         Some("--help" | "-h") => {
             println!("{}", cli::USAGE);
+            println!("  spindle --troubleshooting-report [--local]        (read the saved report without opening the workspace)");
             println!(
                 "\nOther: spindle [--cli | --eval --model M [--ollama URL | --provider-url URL] [--thinking default|off|low|medium|high] [--dir DIR] [--minutes N] [--goal] [--allow-setup] [--seed DIR] PROMPT | --discover [HOST] | --models | --ask MODEL PROMPT | --read [--section N] FILE | --run-due PROJECT | --setup-python | --probe]\nDefault: open desktop workspace in the current directory."
             );

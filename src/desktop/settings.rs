@@ -1107,27 +1107,78 @@ impl Desktop {
     }
 
     fn troubleshooting(&mut self, ui: &mut egui::Ui) {
-        let failures = &self.view.state.failures;
-        ui.label(format!("{} recorded failures in this workspace", failures.len()));
-        ui.weak("The report contains failure categories and counts. It stays here until you share it.");
+        use crate::diagnostics::{ReportOptions, review_report};
+        let state = &self.view.state;
+        let now = crate::automation::now();
+        let capture = state.diagnostic_capture.as_ref();
+        let active = capture.is_some_and(|capture| capture.active(now));
+        if let Some(capture) = capture.filter(|_| active) {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs((capture.end - now) as u64));
+        }
+        let mut command = None;
+        egui::Frame::new().fill(raised()).corner_radius(8).inner_margin(12).show(ui, |ui| {
+            ui.strong("Troubleshooting capture");
+            if let Some(capture) = capture {
+                ui.label(if active {
+                    format!("Recording until {} · {} events", crate::automation::local_time(capture.end), capture.count())
+                } else {
+                    format!("Finished {} · {} events", crate::automation::local_time(capture.end), capture.count())
+                });
+                if capture.omitted > 0 { ui.weak(format!("{} oldest events omitted at the capture limit", capture.omitted)); }
+            } else {
+                ui.label("Collect a timeline of failures, browser fallbacks, and sync decisions on this device.");
+            }
+            ui.horizontal_wrapped(|ui| {
+                if active {
+                    if ui.button("Stop capture").clicked() { command = Some("/diagnostics stop"); }
+                } else {
+                    let verb = if capture.is_some() { "Replace with" } else { "Start" };
+                    if ui.button(format!("{verb} 2-day capture")).clicked() { command = Some("/diagnostics start 2"); }
+                    if ui.button(format!("{verb} 3-day capture")).clicked() { command = Some("/diagnostics start 3"); }
+                }
+            });
+        });
+        ui.add_space(12.);
+        if let Some(command) = command { self.send(command); }
+        let state = &self.view.state;
+        let failures = &state.failures;
+        let sync_events = &state.sync_diagnostics;
+        let make_report = |include_models| review_report(failures, sync_events, state.diagnostic_capture.as_ref(),
+            ReportOptions { now, include_models, chat_references: false });
+        ui.weak("The report uses the current capture when one exists. Reports stay on this device until you share them.");
         ui.checkbox(&mut self.diagnostic_models, "Include model names in the report");
         ui.horizontal_wrapped(|ui| {
             if ui.button("Copy troubleshooting report").clicked() {
-                ui.ctx().copy_text(crate::diagnostics::report(failures, self.diagnostic_models));
+                ui.ctx().copy_text(make_report(self.diagnostic_models));
                 self.notice = "Troubleshooting report copied".into();
             }
             #[cfg(windows)]
             if ui.button("Save report…").clicked()
                 && let Some(path) = rfd::FileDialog::new().set_file_name("spindle-troubleshooting.txt").save_file()
             {
-                let report = crate::diagnostics::report(failures, self.diagnostic_models);
+                let report = make_report(self.diagnostic_models);
                 self.notice = crate::tools::write_generated(&path, report.as_bytes(), true)
                     .map_or_else(|error| error.to_string(), |()| "Troubleshooting report saved".into());
             }
         });
         ui.add_space(12.);
         let mut open = None;
-        for entry in failures.iter().rev() {
+        if !sync_events.is_empty() { ui.strong("Recent sync decisions"); }
+        for entry in sync_events.iter().rev().take(40) {
+            egui::Frame::new().fill(raised()).corner_radius(7).inner_margin(10).show(ui, |ui| {
+                ui.label(Text::new(entry.decision.label()).strong());
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(crate::automation::local_time(entry.time));
+                    for id in std::iter::once(entry.chat).chain(entry.peers.iter().copied().take(3)) {
+                        if state.thread_data(id).is_some() && ui.small_button(format!("Open chat #{id}")).clicked() {
+                            open = Some(id);
+                        }
+                    }
+                });
+            });
+        }
+        if !failures.is_empty() { ui.strong("Recent failures"); }
+        for entry in failures.iter().rev().take(80) {
             egui::Frame::new().fill(raised()).corner_radius(7).inner_margin(10).show(ui, |ui| {
                 ui.label(Text::new(format!("{} · {}", entry.operation, entry.reason.label())).strong());
                 ui.horizontal_wrapped(|ui| {

@@ -220,6 +220,10 @@ pub struct State {
     /// Local troubleshooting entries. Sync transports send conversation records separately.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub failures: Vec<crate::diagnostics::Failure>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_diagnostics: Vec<crate::diagnostics::SyncEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_capture: Option<crate::diagnostics::Capture>,
     /// Projects whose memory is turned off.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub memory_off: std::collections::BTreeSet<PathBuf>,
@@ -891,6 +895,20 @@ fn resolve_workspace_storage(base: &Path) -> PathBuf {
 }
 
 impl Store {
+    pub(crate) fn troubleshooting(root: &Path) -> Result<crate::diagnostics::SavedDiagnostics> {
+        // The owner publishes session snapshots by atomic replacement. Reading one here
+        // doesn't need the workspace lock and never starts a second owner.
+        Self::troubleshooting_at(&Self::directory(root)?)
+    }
+
+    fn troubleshooting_at(dir: &Path) -> Result<crate::diagnostics::SavedDiagnostics> {
+        let bytes = fs::read(dir.join("session.json"))
+            .context("No saved Spindle session for this workspace")?;
+        let sealed = bytes.strip_prefix(SESSION_MAGIC).context("Open this workspace in Spindle to upgrade its session first")?;
+        let plain = crate::vault::local(sealed, false)?;
+        serde_json::from_slice(&plain).context("Read diagnostics from the saved session")
+    }
+
     pub(crate) fn session_dir(&self) -> &Path {
         self.path.parent().unwrap()
     }
@@ -1080,6 +1098,22 @@ pub fn parse_skill(text: &str) -> Result<String> {
 #[cfg(all(test, windows))]
 mod encryption_tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_can_be_read_without_taking_the_owner_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, mut state) = Store::open_directory(dir.path()).unwrap();
+        state.goal = "Synthetic private conversation".into();
+        state.diagnostic_capture = Some(crate::diagnostics::Capture::start(crate::automation::now(), 2).unwrap());
+        crate::diagnostics::sync(&mut state, 10, crate::diagnostics::SyncDecision::BranchesChanged { before: 0, after: 1, added: 1 }, vec![]);
+        store.save(&state).unwrap();
+        assert!(Store::open_directory(dir.path()).is_err());
+        let saved = Store::troubleshooting_at(dir.path()).unwrap();
+        assert_eq!(saved.diagnostic_capture.unwrap().count(), 1);
+        assert_eq!(saved.sync_diagnostics[0].chat, 10);
+        assert_eq!(state.goal, "Synthetic private conversation");
+        drop(store);
+    }
 
     #[test]
     fn renamed_storage_reuses_existing_encrypted_workspaces() {

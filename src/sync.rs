@@ -336,7 +336,7 @@ fn reconcile(root: &Path, state: &mut State, pair: &mut Pairing) -> Result<usize
             changes += 1;
             continue;
         }
-        let id = r
+        let parent_id = r
             .parent
             .as_ref()
             .and_then(|p| {
@@ -344,14 +344,11 @@ fn reconcile(root: &Path, state: &mut State, pair: &mut Pairing) -> Result<usize
                     .iter()
                     .find(|(_, head)| *head == p)
                     .map(|(id, _)| *id)
-            })
-            .filter(|id| {
-                !state
-                    .queue
-                    .iter()
-                    .any(|t| t.origin.unwrap_or(state.chat_id) == *id)
-            })
-            .unwrap_or_else(|| {
+            });
+        let active_local_work = parent_id.is_some_and(|id| state.queue.iter().any(|t| t.origin.unwrap_or(state.chat_id) == id));
+        let reused = parent_id.filter(|_| !active_local_work);
+        let preserved_conflict = r.parent.is_some() && reused.is_none();
+        let id = reused.unwrap_or_else(|| {
                 state.serial += 1;
                 state.serial
             });
@@ -386,6 +383,12 @@ fn reconcile(root: &Path, state: &mut State, pair: &mut Pairing) -> Result<usize
             state.chats.insert(id, c);
         }
         state.note_thread_update(id);
+        if preserved_conflict {
+            crate::diagnostics::sync(state, id, crate::diagnostics::SyncDecision::PreservedSeparateChat { active_local_work }, parent_id.into_iter().collect());
+        }
+        if reused.is_none() {
+            crate::diagnostics::synced_title(state, id, true);
+        }
         pair.heads.insert(id, rev.clone());
         pair.seen.insert(rev);
         changes += 1;
@@ -486,6 +489,8 @@ mod tests {
         refresh(root.path(), &mut a).unwrap();
         assert_eq!(a.chats.len(), 1);
         assert_eq!(b.chats.len(), 1);
+        assert!(a.sync_diagnostics.iter().chain(&b.sync_diagnostics).any(|event|
+            matches!(event.decision, crate::diagnostics::SyncDecision::PreservedSeparateChat { .. })));
         assert!(a.queue.is_empty() && b.queue.is_empty());
         assert_eq!(refresh(root.path(), &mut a).unwrap(), 0);
         let dir = projects::shared_dir(root.path(), false).unwrap();

@@ -28,6 +28,10 @@ Use **Search chats** in the sidebar or Ctrl+Shift+F to find conversations by tit
 
 **Settings → Troubleshooting** shows the latest model and tool failures on this device, with a jump back to the chat. For eligible public-page failures, the chat offers **Use regular browser** through Browser Link and asks for normal tab access. **Copy troubleshooting report** groups failures by category and tool. The report omits conversation content, URLs, local paths, and model names by default. You can opt in to including model names.
 
+Start a **2-day capture** or **3-day capture** in Troubleshooting and use Spindle normally. It records failures, Browser Link outcomes, and sync decisions while Spindle is running. A capture survives an app restart and stops at the end of its window. It keeps up to 5,000 events and reports any older events omitted at that limit. The report stays available until you replace the capture. Sync entries distinguish branches inside a chat from conflicts preserved as separate chats. A same-title entry counts chats in the same project and notes how many share a history prefix or import identity.
+
+From the workspace folder on desktop, `spindle --troubleshooting-report` reads the saved report while the app is open. For local investigation, add `--local` to include model names and chat numbers. Each device keeps its own capture. On Android, use **Copy troubleshooting report** to bring it to another device.
+
 Sending the first message adds **New chat** to the sidebar immediately. The first completed reply supplies its title. A name you choose while the model is working takes precedence.
 
 New conversations use the last **Chat** or **Cowork** mode you selected. Click a work card to expand its steps and check their results.

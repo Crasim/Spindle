@@ -1480,6 +1480,9 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         let Some((history, thread)) = chat_mut(state, id) else {
             continue;
         };
+        let title_or_project_changed = v["title"].as_str().is_some_and(|title| title != thread.title)
+            || ((project.is_some() || v.get("project").is_some_and(Value::is_null)) && project != thread.project)
+            || (thread.archived && v["archived"].as_bool() == Some(false));
         let messages = to_messages(&view.main);
         let messages_changed = *history != messages;
         if messages_changed {
@@ -1545,6 +1548,10 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
             previous.len() != branches.len() || previous.iter().zip(&branches)
                 .any(|(a, b)| a.id != b.id || a.fork != b.fork || a.messages != b.messages)
         });
+        let previous = sync.branches.get(&id).map_or(&[][..], Vec::as_slice);
+        let before = previous.len();
+        let after = branches.len();
+        let added = branches.iter().filter(|branch| !previous.iter().any(|old| old.id == branch.id)).count();
         if branches.is_empty() {
             sync.branches.remove(&id);
         } else {
@@ -1552,6 +1559,12 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         }
         if messages_changed || branches_changed || local.is_none() {
             state.note_thread_update(id);
+        }
+        if before != after || added > 0 {
+            crate::diagnostics::sync(state, id, crate::diagnostics::SyncDecision::BranchesChanged { before, after, added }, vec![]);
+        }
+        if local.is_none() || title_or_project_changed {
+            crate::diagnostics::synced_title(state, id, local.is_none());
         }
         // What's shown now matches what's published: don't publish it back unchanged.
         let turns = chat_turns(state, id);
@@ -1609,6 +1622,7 @@ pub fn merge_branch(state: &mut State, chat: u64, branch: &str) -> Result<usize>
     sync.seen.remove(&format!("chatview:{gid}"));
     sync.wanted = Some(Want::Now);
     state.note_thread_update(chat);
+    crate::diagnostics::sync(state, chat, crate::diagnostics::SyncDecision::BranchMerged { messages: count }, vec![]);
     Ok(count)
 }
 
@@ -1993,6 +2007,8 @@ mod tests {
         assert_eq!(a.history.last().unwrap().content, "desk question");
         let branches = &a.space.as_ref().unwrap().branches[&a.chat_id];
         assert_eq!(branches.len(), 1);
+        assert!(a.sync_diagnostics.iter().any(|event| event.chat == a.chat_id
+            && matches!(event.decision, crate::diagnostics::SyncDecision::BranchesChanged { before: 0, after: 1, added: 1 })));
         assert_eq!(branches[0].device_name, "Laptop");
         assert_eq!(
             branches[0].messages.last().unwrap().content,
