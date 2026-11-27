@@ -2453,7 +2453,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
             tools.push(format!("- Account access to {} requires a connection in Settings › Connectors.", service.label()));
         }
     }
-    if mentions(&["note", "obsidian", "vault", " tag"]) {
+    if mentions(&["obsidian", "spindle notes", "note library", "my note", "search notes", "find notes", "notes tagged", "notes with tag"]) {
         tools.push(r#"- Search notes: {"name":"search_notes","args":{"library":"spindle","query":"words","tag":"optional-tag"}}. Use spindle or obsidian. Supply text, a tag, or both. Each lookup needs its own approval. An attached note grants access only to the attached snapshot."#.into());
     }
     tools.push(r#"- Load a relevant skill: {"name":"read_skill","args":{"name":"SKILL"}} or omit name to list skills. Tool permissions apply."#.into());
