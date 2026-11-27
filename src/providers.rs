@@ -1,4 +1,4 @@
-use crate::{generation::Limits, ollama::Message};
+use crate::{generation::Limits, ollama::{Message, Ollama}};
 use anyhow::{Context, Result, bail, ensure};
 use reqwest::{Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
@@ -14,11 +14,23 @@ pub enum Protocol {
     Responses,
     ChatGpt,
     ClaudeConsole,
+    Ollama,
 }
 
 impl Protocol {
     pub fn oauth(self) -> bool {
         matches!(self, Self::ChatGpt | Self::ClaudeConsole)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "OpenAI-compatible",
+            Self::Messages => "Claude API",
+            Self::Responses => "OpenAI API",
+            Self::ChatGpt => "OpenAI · Sign in with ChatGPT",
+            Self::ClaudeConsole => "Claude · Console OAuth",
+            Self::Ollama => "Ollama",
+        }
     }
 }
 
@@ -226,7 +238,8 @@ impl Provider {
         client: &Client,
     ) -> Result<Self> {
         ensure!(
-            !form.name.trim().is_empty() && form.name.len() <= 64,
+            !form.name.trim().is_empty() && form.name.chars().count() <= 64
+                && !form.name.chars().any(char::is_control),
             "Choose a provider name (up to 64 characters)"
         );
         let mut provider = Self {
@@ -237,10 +250,19 @@ impl Provider {
             claude_login: None,
             id,
             name: form.name.trim().into(),
-            base: if form.protocol == Protocol::ClaudeConsole {
-                "https://api.anthropic.com/v1".into()
-            } else {
-                endpoint(&form.base)?
+            base: match form.protocol {
+                Protocol::ClaudeConsole => "https://api.anthropic.com/v1".into(),
+                Protocol::Ollama => {
+                    let base = if form.base.trim().is_empty() {
+                        crate::ollama::default_endpoint()
+                    } else if form.base.contains("://") {
+                        form.base.trim().to_owned()
+                    } else {
+                        format!("http://{}", form.base.trim())
+                    };
+                    crate::local_servers::address(&base)?
+                }
+                _ => endpoint(&form.base)?,
             },
             protocol: form.protocol,
             models: vec![],
@@ -277,8 +299,16 @@ impl Provider {
             #[cfg(not(any(windows, target_os = "linux")))]
             bail!("Claude Console sign-in requires the Anthropic CLI on a computer");
         }
+        if form.protocol == Protocol::Ollama {
+            ensure!(form.key.len() <= 4096 && form.key.bytes().all(|b| b.is_ascii_graphic()), "Invalid Ollama API key");
+        }
         provider.refresh_catalog(client, &form.key).await?;
         if !form.key.is_empty() {
+            if form.protocol == Protocol::Ollama {
+                crate::ollama::save_credential(&vault, &form.key)?;
+                provider.credential = Some(vault);
+                return Ok(provider);
+            }
             #[cfg(windows)]
             {
                 keyring::Entry::new("Spindle", &vault)?
@@ -298,6 +328,9 @@ impl Provider {
     }
 
     pub fn key(&self) -> Result<String> {
+        if self.protocol == Protocol::Ollama && let Some(target) = &self.credential {
+            return crate::ollama::load_key(target)?.context("Save the API key for this Ollama connection");
+        }
         if let Some(_target) = &self.credential {
             #[cfg(windows)]
             return keyring::Entry::new("Spindle", _target)?
@@ -334,6 +367,13 @@ impl Provider {
     /// Store an API key that arrived by sync, the way keys typed here are stored.
     pub fn store_key(&mut self, key: &str) -> Result<()> {
         ensure!(!self.protocol.oauth(), "This provider uses browser sign-in");
+        if self.protocol == Protocol::Ollama {
+            let target = self.credential.clone().unwrap_or_else(|| format!("provider-{}", self.id));
+            crate::ollama::save_credential(&target, key)?;
+            self.credential = Some(target);
+            self.needs_auth = true;
+            return Ok(());
+        }
         #[cfg(windows)]
         {
             let target = self
@@ -363,6 +403,9 @@ impl Provider {
     }
 
     pub fn forget_key(&self) -> Result<()> {
+        if self.protocol == Protocol::Ollama && let Some(target) = &self.credential {
+            return crate::ollama::save_credential(target, "");
+        }
         #[cfg(windows)]
         if let Some(target) = &self.credential {
             match keyring::Entry::new("Spindle", target)?.delete_credential() {
@@ -408,6 +451,7 @@ impl Provider {
 
     /// Billed per use: a hosted API rather than a plan sign-in or a local server.
     pub fn metered(&self) -> bool {
+        if self.protocol == Protocol::Ollama { return false; }
         let local = Url::parse(&self.base)
             .ok()
             .is_some_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")));
@@ -498,6 +542,20 @@ impl Provider {
     }
 
     async fn catalog(&self, client: &Client, key: &str) -> Result<BTreeMap<String, Limits>> {
+        if self.protocol == Protocol::Ollama {
+            let base = crate::local_servers::address(&self.base)?;
+            let api = Ollama::with_client(client.clone()).scoped(&self.id, &base, key.into());
+            let models = api.models().await?;
+            let reported = api.capabilities();
+            return Ok(models.into_iter().map(|id| {
+                let supports = |name| reported.get(&id).is_some_and(|values| values.iter().any(|cap| cap == name));
+                let limits = Limits {
+                    vision: supports("vision"), audio: supports("audio"), reasoning: supports("thinking"),
+                    ..Default::default()
+                };
+                (route(&id).1.into(), limits)
+            }).collect());
+        }
         let req = self.authorize(client.get(format!("{}/models", self.base)), key);
         let data: Value = req
             .timeout(Duration::from_secs(12))
@@ -530,10 +588,9 @@ impl Provider {
 
     pub async fn chat(
         &self,
-        client: &Client,
+        api: &Ollama,
         model: &str,
         messages: &[Message],
-        preview: Option<&tokio::sync::watch::Sender<String>>,
         threshold: u32,
         obs: &mut crate::automation::Observation,
     ) -> Result<String> {
@@ -541,7 +598,14 @@ impl Provider {
             self.models.iter().any(|s| s == model),
             "Model is missing from the provider catalog"
         );
+        let client = &api.0;
+        let preview = api.1.as_ref();
         let key = self.access(client).await?;
+        if self.protocol == Protocol::Ollama {
+            let base = crate::local_servers::address(&self.base)?;
+            return api.scoped(&self.id, &base, key)
+                .chat_metered(&format!("@{}/{model}", self.id), messages, threshold, obs).await;
+        }
         let local = matches!(
             Url::parse(&self.base)?.host_str(),
             Some("127.0.0.1" | "localhost" | "[::1]")
@@ -576,6 +640,7 @@ impl Provider {
                 "messages",
                 json!({"model":model,"system":messages.iter().filter(|m|m.role=="system").map(|m|m.content.as_str()).collect::<Vec<_>>().join("\n"),"messages":wire_messages(self.protocol,messages.iter().filter(|m|m.role!="system")),"max_tokens":allowance,"stream":true}),
             ),
+            Protocol::Ollama => unreachable!("native Ollama requests are sent above"),
         };
         if matches!(self.protocol, Protocol::Messages | Protocol::ClaudeConsole) {
             obs.output_budget = Some(allowance);
@@ -777,6 +842,7 @@ impl Provider {
                         );
                         event["delta"]["text"].as_str()
                     }
+                    Protocol::Ollama => unreachable!("native Ollama responses are handled separately"),
                 };
                 if let Some(text) = delta {
                     answer.push_str(text);
@@ -880,6 +946,7 @@ fn wire_messages<'a>(
                 Protocol::ChatCompletions => std::iter::once(json!({"type": "text", "text": m.content}))
                     .chain(m.images.iter().map(|d| json!({"type": "image_url", "image_url": {"url": url(d)}})))
                     .collect(),
+                Protocol::Ollama => unreachable!("native Ollama messages are sent directly"),
             };
             json!({"role": m.role, "content": parts})
         })
@@ -952,30 +1019,12 @@ fn apply_tuning(
                 body["temperature"] = json!(t);
             }
         }
+        Protocol::Ollama => unreachable!("native Ollama tuning is sent with its chat request"),
     }
 }
 
 pub async fn context_window(client: &Client, id: &str, provider: Option<&Provider>) -> Option<u64> {
-    let (scope, tag) = route(id);
-    if scope == "ollama" {
-        let data: Value = client
-            .get(format!("{}/api/ps", crate::ollama::endpoint()))
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-            .ok()?
-            .error_for_status()
-            .ok()?
-            .json()
-            .await
-            .ok()?;
-        return data["models"]
-            .as_array()?
-            .iter()
-            .find(|m| m["name"] == tag || m["model"] == tag)?["context_length"]
-            .as_u64()
-            .filter(|n| *n > 0);
-    }
+    let (_, tag) = route(id);
     let provider = provider?;
     let url = Url::parse(&provider.base).ok()?;
     // Ask servers on this computer or the local network what they are running with now
@@ -1052,6 +1101,47 @@ fn complete(answer: String, limited: bool) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn named_ollama_connections_route_the_same_tag_to_independent_servers() -> Result<()> {
+        use axum::{Json, Router, routing::{get, post}};
+        async fn server(answer: &'static str, cloud: bool) -> Result<(String, tokio::task::JoinHandle<()>)> {
+            let router = Router::new()
+                .route("/api/tags", get(move || async move {
+                    Json(json!({"models":[{"name":"same:latest","remote_model":if cloud { "remote" } else { "" }}]}))
+                }))
+                .route("/api/show", post(|| async { Json(json!({"model_info":{"test.context_length":8192}})) }))
+                .route("/api/ps", get(|| async { Json(json!({"models":[{"name":"same:latest","context_length":8192}]})) }))
+                .route("/api/chat", post(move |Json(body): Json<Value>| async move {
+                    assert_eq!(body["model"], "same:latest");
+                    assert_eq!(body["options"]["num_ctx"].is_null(), cloud);
+                    Json(json!({"message":{"role":"assistant","content":answer},"done":true}))
+                }));
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+            let address = format!("http://{}", listener.local_addr()?);
+            Ok((address, tokio::spawn(async { axum::serve(listener, router).await.unwrap() })))
+        }
+
+        let api = Ollama::new()?;
+        let mut state = crate::state::State::default();
+        state.preferences.ollama_on = true;
+        for (answer, cloud) in [("First server", false), ("Second server", true)] {
+            let (base, fixture) = server(answer, cloud).await?;
+            let name = state.available_provider_name("Ollama");
+            let profile = Provider::connect(Connection { name, base, protocol: Protocol::Ollama, key: String::new() },
+                Provider::new_id()?, String::new(), &api.0).await?;
+            let result = profile.chat(&api, "same:latest", &[Message::new("user","Hello")],
+                100, &mut crate::automation::Observation::default()).await?;
+            assert_eq!(result, answer);
+            state.providers.push(profile);
+            fixture.abort();
+        }
+        assert_ne!(state.providers[0].id, state.providers[1].id);
+        assert_eq!(state.providers[0].name, "Ollama-2");
+        assert_eq!(state.providers[1].name, "Ollama-3");
+        assert_eq!(state.available_provider_name("Remote GPU"), "Remote GPU");
+        Ok(())
+    }
 
     #[test]
     fn responses_use_the_offered_schema_and_return_a_native_tool_call() {
@@ -1279,7 +1369,8 @@ mod tests {
             });
             let mut obs = crate::automation::Observation::default();
             let http = Client::builder().no_proxy().timeout(Duration::from_secs(5)).build().unwrap();
-            let answer = p.chat(&http,"tiny",&[Message::new("user","code")],None,100,&mut obs).await.unwrap();
+            let api = Ollama::with_client(http);
+            let answer = p.chat(&api, "tiny", &[Message::new("user", "code")], 100, &mut obs).await.unwrap();
             assert!(obs.output_limited);
             assert_eq!(obs.output,99);
             assert_eq!(answer,"partial code");

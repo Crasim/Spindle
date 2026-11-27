@@ -996,6 +996,22 @@ fn message_row(ui: &mut egui::Ui, user: bool, contents: impl FnOnce(&mut egui::U
     ui.add_space(8.);
 }
 
+fn pending_user_message(ui: &mut egui::Ui, label: &str, text: &str) {
+    message_row(ui, true, |ui| {
+        ui.strong(label);
+        ui.add(egui::Label::new(text).wrap());
+    });
+}
+
+fn composer_enter(input: &mut egui::InputState, active: bool, plain: bool, prefs: &crate::state::Preferences) -> Option<bool> {
+    if input.modifiers.shift || input.modifiers.alt { return None; }
+    let modified = input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter);
+    if !modified && (!(active || prefs.enter_sends) || !input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) {
+        return None;
+    }
+    Some(active && plain && modified != prefs.enter_steers)
+}
+
 fn typing_into_chat(ui: &egui::Ui, composer: egui::Id) -> bool {
     let typing = ui.input(|i| {
         i.focused
@@ -1712,19 +1728,15 @@ impl Desktop {
                 } else {
                     self.command_index = 0;
                 }
-                let enter = ui.memory(|m| m.has_focus(id))
-                    && ui.input_mut(|i| {
-                        i.consume_key(
-                            if self.view.state.preferences.enter_sends {
-                                egui::Modifiers::NONE
-                            } else {
-                                egui::Modifiers::COMMAND
-                            },
-                            egui::Key::Enter,
-                        )
-                    });
-                let mut submit = enter;
-                let mut steer = false;
+                let active = self.view.can_steer;
+                let prefs = &self.view.state.preferences;
+                let plain = !has_pastes && self.image_drafts.is_empty() && !self.draft.trim_start().starts_with('/');
+                let key_submission = ui.memory(|memory| memory.has_focus(id))
+                    .then(|| ui.input_mut(|input| composer_enter(input, active, plain, prefs))).flatten();
+                let mut submit = key_submission.is_some();
+                let mut steer = key_submission == Some(true);
+                let queue_hint = if prefs.enter_steers { "Queue · Ctrl+Enter" } else { "Queue · Enter" };
+                let steer_hint = if prefs.enter_steers { "Steer · Enter" } else { "Steer · Ctrl+Enter" };
                 if !has_pastes && self.image_drafts.len() == 1
                     && ui.small_button("Edit image").on_hover_text("Compose an image edit").clicked()
                 {
@@ -1824,7 +1836,7 @@ impl Desktop {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    let label = if self.view.busy || self.view.state.held {
+                                    let label = if active || self.view.busy || self.view.state.held {
                                         "Queue"
                                     } else {
                                         "Send"
@@ -1860,10 +1872,15 @@ impl Desktop {
                                             label,
                                         )
                                     });
-                                    submit |= ready && res.on_hover_text(label).clicked();
+                                    if ready && res.on_hover_text(if active { queue_hint } else { label }).clicked() {
+                                        submit = true;
+                                        steer = false;
+                                    }
+                                    if active {
+                                        steer |= ui.add_enabled_ui(!self.awaiting_submission() && plain && !self.draft.trim().is_empty(),
+                                            |ui| small(ui, Icon::Steer, steer_hint)).inner;
+                                    }
                                     if self.view.busy && self.view.state.queue.front().is_some_and(|t|t.origin.unwrap_or(self.view.state.chat_id)==self.view.state.chat_id) {
-                                        steer = ui.add_enabled_ui(!self.awaiting_submission() && !self.draft.trim().is_empty() && !has_pastes && self.image_drafts.is_empty(),
-                                            |ui| small(ui, Icon::Steer, "Steer the running task with this message")).inner;
                                         if small(ui, Icon::Stop, "Stop the running task") {
                                             self.send("/cancel");
                                         }
@@ -2443,6 +2460,9 @@ impl Desktop {
                     if let Some(actual) = t.actual.as_deref() && let Some(from) = t.fallback_from(actual) {
                         self.model_divider(ui, from, actual, true);
                     }
+                    for correction in &t.steering {
+                        pending_user_message(ui, "You · Steered", correction);
+                    }
                     chat_text.message(self.view.state.history.len()+1);
                     message_row(ui,false,|ui|{
                     if self.view.busy {
@@ -2456,9 +2476,6 @@ impl Desktop {
                     if !self.view.busy && !t.continuation.text.is_empty() {
                         ui.weak("Saved reply so far");
                         ui.push_id(("saved-partial",t.id), |ui| reader::markdown_with_files(ui,&crate::artifacts::streaming_text(&t.text,&crate::tools::streaming_view(&t.continuation.text)),false,&[],&mut chat_text,&mut |_,_|{}));
-                    }
-                    if let Some(s) = t.steering.last() {
-                        ui.label(format!("Steering: {s}"));
                     }
                     ui.horizontal(|ui| {
                         if !self.view.state.held {
@@ -2499,6 +2516,17 @@ impl Desktop {
                 }
                 if let Some(change) = pending_selection.filter(|c| active_task.is_some_and(|t| t.model != c.to)) {
                     self.model_divider(ui, &change.from, &change.to, false);
+                }
+                for correction in &self.view.state.thread.pending_steering {
+                    pending_user_message(ui, "You · Steering the next step", correction);
+                }
+                let chat = self.view.state.chat_id;
+                for task in self.view.state.queue.iter().filter(|task| {
+                    task.origin.unwrap_or(chat) == chat && active_task.is_none_or(|active| active.id != task.id)
+                }) {
+                    if !task.tool_result {
+                        pending_user_message(ui, "You · Queued", &task.text);
+                    }
                 }
                 self.chat_selection.update(ui, chat_text, copy_selection);
             });

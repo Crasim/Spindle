@@ -93,6 +93,10 @@ pub async fn discover(host: &str) -> Result<Vec<Server>> {
         let url = url.as_str().trim_end_matches('/').to_owned();
         let http = http.clone();
         tasks.spawn(async move {
+            if kind == ComfyUi {
+                let catalog = crate::comfy::catalog(&url).await.ok()?;
+                return Some((order, Server { name, kind, url, models: catalog.checkpoints.len() + catalog.diffusion.len() }));
+            }
             let mut response = http
                 .get(format!("{url}{catalog}"))
                 .send()
@@ -132,9 +136,7 @@ fn count(kind: Kind, value: &Value) -> Option<usize> {
     match kind {
         Kind::Ollama => count_named(&value["models"], "name"),
         Kind::Compatible => count_named(&value["data"], "id"),
-        Kind::ComfyUi => value["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
-            .as_array()
-            .map(Vec::len),
+        Kind::ComfyUi => unreachable!("ComfyUI uses both model lists"),
         Kind::StableDiffusion => count_named(value, "model_name"),
     }
 }
@@ -168,13 +170,6 @@ mod tests {
         );
         assert_eq!(
             count(Kind::StableDiffusion, &json!([{"model_name":"sdxl"}])),
-            Some(1)
-        );
-        assert_eq!(
-            count(
-                Kind::ComfyUi,
-                &json!({"CheckpointLoaderSimple":{"input":{"required":{"ckpt_name":[["sdxl"]]}}}})
-            ),
             Some(1)
         );
     }

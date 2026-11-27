@@ -184,6 +184,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enter_and_control_enter_swap_steering_and_queueing() {
+        let prefs = crate::state::Preferences::default();
+        let swapped = crate::state::Preferences { enter_steers: false, ..prefs.clone() };
+        let ctx = egui::Context::default();
+        for (prefs, active, plain, modifiers, expected) in [
+            (&prefs, true, true, egui::Modifiers::NONE, Some(true)),
+            (&prefs, true, true, egui::Modifiers::COMMAND, Some(false)),
+            (&swapped, true, true, egui::Modifiers::NONE, Some(false)),
+            (&swapped, true, true, egui::Modifiers::COMMAND, Some(true)),
+            (&prefs, false, true, egui::Modifiers::NONE, Some(false)),
+            (&prefs, true, false, egui::Modifiers::NONE, Some(false)),
+            (&prefs, true, true, egui::Modifiers::SHIFT, None),
+        ] {
+            let _ = ctx.run(egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers,
+                }],
+                ..Default::default()
+            }, |ctx| {
+                assert_eq!(ctx.input_mut(|input| composer_enter(input, active, plain, prefs)), expected);
+            });
+        }
+    }
+
+    #[test]
     fn rejection_restores_the_exact_draft_and_attachments_to_their_chat() {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx);

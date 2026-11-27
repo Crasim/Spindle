@@ -51,7 +51,7 @@ pub(crate) fn endpoint() -> String {
     default_endpoint()
 }
 
-fn default_endpoint() -> String {
+pub(crate) fn default_endpoint() -> String {
     std::env::var("SPINDLE_OLLAMA")
         .ok()
         .filter(|u| u.starts_with("http"))
@@ -72,7 +72,7 @@ fn key_path(target: &str) -> std::path::PathBuf {
     crate::runtime::data_dir().join("credentials").join(target)
 }
 
-fn load_key(target: &str) -> Result<Option<String>> {
+pub(crate) fn load_key(target: &str) -> Result<Option<String>> {
     #[cfg(windows)]
     return match keyring::Entry::new("Spindle", target)?.get_password() {
         Ok(key) => Ok(Some(key)),
@@ -102,12 +102,18 @@ pub(crate) fn store_key(address: &str, key: &str) -> Result<()> {
     ensure!(matches!(url.scheme(), "http" | "https") && url.has_host() && url.username().is_empty()
         && url.password().is_none() && url.query().is_none() && url.fragment().is_none(),
         "Enter a server URL without credentials, a query, or a fragment");
-    ensure!(key.len() <= 4096 && key.bytes().all(|b| b.is_ascii_graphic()), "Invalid Ollama API key");
     let target = credential(&base);
     let mut keys = KEYS.lock().unwrap();
+    save_credential(&target, key)?;
+    keys.insert(base, (!key.is_empty()).then(|| key.to_owned()));
+    Ok(())
+}
+
+pub(crate) fn save_credential(target: &str, key: &str) -> Result<()> {
+    ensure!(key.len() <= 4096 && key.bytes().all(|b| b.is_ascii_graphic()), "Invalid Ollama API key");
     #[cfg(windows)]
     {
-        let entry = keyring::Entry::new("Spindle", &target)?;
+        let entry = keyring::Entry::new("Spindle", target)?;
         if key.is_empty() {
             match entry.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => (),
@@ -120,9 +126,9 @@ pub(crate) fn store_key(address: &str, key: &str) -> Result<()> {
     #[cfg(not(windows))]
     {
         #[cfg(target_os = "android")]
-        let path = crate::oauth::android_key_path(&target)?;
+        let path = crate::oauth::android_key_path(target)?;
         #[cfg(not(target_os = "android"))]
-        let path = key_path(&target);
+        let path = key_path(target);
         if key.is_empty() {
             match std::fs::remove_file(path) {
                 Ok(()) => (),
@@ -131,7 +137,7 @@ pub(crate) fn store_key(address: &str, key: &str) -> Result<()> {
             }
         } else {
             #[cfg(target_os = "android")]
-            crate::oauth::store_android_key(&target, key)?;
+            crate::oauth::store_android_key(target, key)?;
             #[cfg(not(target_os = "android"))]
             {
                 std::fs::create_dir_all(path.parent().context("No credential directory")?)?;
@@ -140,7 +146,6 @@ pub(crate) fn store_key(address: &str, key: &str) -> Result<()> {
             }
         }
     }
-    keys.insert(base, (!key.is_empty()).then(|| key.to_owned()));
     Ok(())
 }
 
@@ -176,10 +181,10 @@ static SIZES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Str
 /// A model's size in billions of parameters, once Spindle has asked Ollama about it.
 pub fn known_size(model: &str) -> Option<f64> {
     let sizes = SIZES.lock().ok()?;
-    sizes
-        .get(model)
-        .or_else(|| sizes.get(crate::providers::route(model).1))
-        .copied()
+    let (scope, tag) = crate::providers::route(model);
+    sizes.get(model).copied().or_else(|| {
+        if matches!(scope, "ollama" | "ollama-cloud") { sizes.get(tag).copied() } else { None }
+    })
 }
 
 /// "2.6B", "360M" from /api/show details, or the parameter count from model_info.
@@ -269,7 +274,7 @@ struct Tag {
 }
 
 impl Tag {
-    fn catalog_id(&self) -> Option<String> {
+    fn catalog_id(&self, provider: Option<&str>) -> Option<(String, bool)> {
         if self
             .capabilities
             .as_ref()
@@ -281,12 +286,21 @@ impl Tag {
             || self.remote_host.as_deref().is_some_and(|s| !s.is_empty())
             || self.name.ends_with(":cloud")
             || self.name.ends_with("-cloud");
-        Some(if remote {
+        let id = if let Some(provider) = provider {
+            format!("@{provider}/{}", self.name)
+        } else if remote {
             format!("@ollama-cloud/{}", self.name)
         } else {
             self.name.clone()
-        })
+        };
+        Some((id, remote))
     }
+}
+
+struct Binding {
+    provider: String,
+    base: String,
+    key: String,
 }
 
 #[derive(Clone)]
@@ -300,6 +314,7 @@ pub struct Ollama(
     Arc<Mutex<HashMap<String, ThinkInfo>>>,
     /// Capabilities reported by /api/tags or /api/show ("vision", "audio", …), by catalog ID.
     Arc<Mutex<HashMap<String, Vec<String>>>>,
+    Option<Arc<Binding>>,
 );
 
 /// A model's thinking levels from /api/show: exact values `think` accepts, in order.
@@ -394,19 +409,19 @@ mod tests {
             serde_json::from_value(json!({"name":"alias:latest","remote_model":"private-cloud"}))
                 .unwrap();
         assert_eq!(
-            remote.catalog_id().as_deref(),
+            remote.catalog_id(None).map(|(id, _)| id).as_deref(),
             Some("@ollama-cloud/alias:latest")
         );
         let local: Tag =
             serde_json::from_value(json!({"name":"model:latest","capabilities":["completion"]}))
                 .unwrap();
-        assert_eq!(local.catalog_id().as_deref(), Some("model:latest"));
+        assert_eq!(local.catalog_id(None).map(|(id, _)| id).as_deref(), Some("model:latest"));
     }
 }
 
 impl Ollama {
     pub fn new() -> Result<Self> {
-        Ok(Self(
+        Ok(Self::with_client(
             Client::builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
@@ -414,26 +429,52 @@ impl Ollama {
                 .read_timeout(Duration::from_secs(180))
                 .timeout(Duration::from_secs(300))
                 .build()?,
+        ))
+    }
+
+    pub(crate) fn with_client(client: Client) -> Self {
+        Self(
+            client,
             None,
             Default::default(),
             Default::default(),
             Default::default(),
             Default::default(),
-        ))
+            None,
+        )
+    }
+
+    pub(crate) fn scoped(&self, provider: &str, base: &str, key: String) -> Self {
+        let mut api = self.clone();
+        api.6 = Some(Arc::new(Binding { provider: provider.into(), base: base.into(), key }));
+        api
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> Result<reqwest::RequestBuilder> {
+        let Some(binding) = &self.6 else { return request(&self.0, method, path); };
+        let request = self.0.request(method, format!("{}/api/{path}", binding.base));
+        Ok(if binding.key.is_empty() { request } else { request.bearer_auth(&binding.key) })
     }
 
     pub async fn models(&self) -> Result<Vec<String>> {
-        if !enabled() {
+        Ok(self.catalog().await?.into_iter().map(|(model, _)| model).collect())
+    }
+
+    async fn catalog(&self) -> Result<Vec<(String, bool)>> {
+        if self.6.is_none() && !enabled() {
             return Ok(vec![]);
         }
         #[derive(Deserialize)]
         struct Tags {
             models: Vec<Tag>,
         }
-        let tags: Tags = request(&self.0, reqwest::Method::GET, "tags")?
+        let tags: Tags = self.request(reqwest::Method::GET, "tags")?
             .send()
             .await
-            .with_context(|| format!("Cannot reach Ollama at {}", endpoint()))?
+            .with_context(|| {
+                let base = self.6.as_ref().map_or_else(endpoint, |binding| binding.base.clone());
+                format!("Cannot reach Ollama at {base}")
+            })?
             .error_for_status()?
             .json()
             .await?;
@@ -443,7 +484,7 @@ impl Ollama {
             .models
             .into_iter()
             .filter_map(|t| {
-                let id = t.catalog_id()?;
+                let (id, remote) = t.catalog_id(self.6.as_ref().map(|binding| binding.provider.as_str()))?;
                 if let Some(c) = &t.capabilities {
                     reported.insert(id.clone(), c.clone());
                 }
@@ -453,10 +494,17 @@ impl Ollama {
                 {
                     thinking.insert(id.clone());
                 }
-                Some(id)
+                Some((id, remote))
             })
             .collect();
-        *self.3.lock().unwrap() = thinking;
+        {
+            let mut known = self.3.lock().unwrap();
+            known.retain(|model| {
+                let scope = crate::providers::route(model).0;
+                self.6.as_ref().map_or(!matches!(scope, "ollama" | "ollama-cloud"), |binding| scope != binding.provider)
+            });
+            known.extend(thinking);
+        }
         self.5.lock().unwrap().extend(reported);
         models.sort();
         Ok(models)
@@ -477,6 +525,15 @@ impl Ollama {
         self.3.lock().unwrap().clone()
     }
 
+    async fn running_context(&self, tag: &str) -> Option<u64> {
+        let data: Value = self.request(reqwest::Method::GET, "ps").ok()?
+            .timeout(Duration::from_secs(2)).send().await.ok()?
+            .error_for_status().ok()?.json().await.ok()?;
+        data["models"].as_array()?.iter()
+            .find(|m| m["name"] == tag || m["model"] == tag)?["context_length"]
+            .as_u64().filter(|n| *n > 0)
+    }
+
     pub(crate) async fn limits(&self, id: &str) -> Limits {
         if let Some((_, limits)) = self
             .2
@@ -489,7 +546,7 @@ impl Ollama {
         }
         let tag = crate::providers::route(id).1;
         let result = async {
-            request(&self.0, reqwest::Method::POST, "show").ok()?
+            self.request(reqwest::Method::POST, "show").ok()?
                 .timeout(Duration::from_secs(2))
                 .json(&json!({"model": tag}))
                 .send()
@@ -508,10 +565,9 @@ impl Ollama {
             .unwrap_or_default();
         if let Some(size) = result.as_ref().and_then(parameter_size) {
             SIZES.lock().unwrap().insert(id.to_owned(), size);
-            SIZES
-                .lock()
-                .unwrap()
-                .insert(crate::providers::route(id).1.to_owned(), size);
+            if self.6.is_none() {
+                SIZES.lock().unwrap().insert(crate::providers::route(id).1.to_owned(), size);
+            }
         }
         if let Some(info) = result.as_ref().and_then(think_info) {
             self.4.lock().unwrap().insert(id.to_owned(), info);
@@ -555,13 +611,11 @@ impl Ollama {
         threshold: u32,
         obs: &mut crate::automation::Observation,
     ) -> Result<String> {
-        ensure!(
-            self.models().await?.iter().any(|m| m == id),
-            "Model changed or is unavailable in this Ollama catalog: {id}"
-        );
-        let (scope, model) = crate::providers::route(id);
+        let (_, remote) = self.catalog().await?.into_iter().find(|(model, _)| model == id)
+            .with_context(|| format!("Model changed or is unavailable in this Ollama catalog: {id}"))?;
+        let model = crate::providers::route(id).1;
         let limits = self.limits(id).await;
-        let local_context = (scope == "ollama").then(|| match obs.tuning.context {
+        let local_context = (!remote).then(|| match obs.tuning.context {
             Some(n) => limits.context.map_or(n, |max| n.min(max)),
             None => limits.context.unwrap_or(16_384).min(16_384),
         });
@@ -640,7 +694,7 @@ impl Ollama {
         }
         let preview_start = self.1.as_ref().map_or(0, |p| p.borrow().len());
         'attempt: loop {
-            let mut response = request(&self.0, reqwest::Method::POST, "chat")?
+            let mut response = self.request(reqwest::Method::POST, "chat")?
                 .timeout(Duration::from_secs(3600))
                 .json(&body)
                 .send()
@@ -730,8 +784,8 @@ impl Ollama {
                             .eval_duration
                             .filter(|n| *n > 0 && obs.output > 0)
                             .map(|n| obs.output as f64 * 1e9 / n as f64);
-                        if crate::providers::route(id).0 == "ollama" {
-                            obs.window = crate::providers::context_window(&self.0, id, None).await;
+                        if !remote {
+                            obs.window = self.running_context(model).await.or(obs.window);
                         }
                         obs.output_limited = reply.done_reason.as_deref() == Some("length");
                         // Only when the reply text doesn't already carry the call.

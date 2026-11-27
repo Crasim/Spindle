@@ -101,6 +101,13 @@ pub struct Jobs {
     pub web_region_fallback: Option<u64>,
 }
 
+impl Jobs {
+    fn track_tool(&mut self, pending: &Pending) {
+        self.catalog_chat = Some(pending.chat);
+        self.running = Some(pending.call.call.summary());
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BrowserPanel {
     pub chat: u64,
@@ -274,7 +281,7 @@ impl Engine {
         let folder = crate::artifacts::folder(&root, pending.chat)?;
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
-        self.jobs.running = Some(pending.call.call.summary());
+        self.jobs.track_tool(&pending);
         self.jobs.started = Some(tokio::task::spawn_blocking(move || {
             let outcome = crate::android_apk::build(
                 &pending.call.call, &pending.root, &folder, pending.id, &cancel,
@@ -293,7 +300,7 @@ impl Engine {
             let data = crate::runtime::data_dir();
             self.jobs.cancel = Arc::new(AtomicBool::new(false));
             let cancel = self.jobs.cancel.clone();
-            self.jobs.running = Some(p.call.call.summary());
+            self.jobs.track_tool(&p);
             self.jobs.started = Some(tokio::task::spawn_blocking(move || {
                 let outcome = crate::native::execute(&data, &workspace, p.chat, &p.root, &p.call.call, &cancel);
                 JobDone::Native { pending: Box::new(p), outcome }
@@ -305,7 +312,7 @@ impl Engine {
         let spec = spec(&runtime, work.clone(), &p.call.call, p.confirmed_change())?;
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
-        self.jobs.running = Some(p.call.call.summary());
+        self.jobs.track_tool(&p);
         let pending = Box::new(p);
         let before = snapshot(&work);
         self.jobs.started = Some(tokio::task::spawn_blocking(move || JobDone::Tool {
@@ -330,7 +337,7 @@ impl Engine {
             script.clone(),
             Duration::from_millis(wait_ms.unwrap_or(1500).clamp(200, 20_000)),
         );
-        self.jobs.running = Some(p.call.call.summary());
+        self.jobs.track_tool(&p);
         let page = p.target.clone();
         let block = self.state.preferences.block_web;
         let pending = Box::new(p);
@@ -382,7 +389,7 @@ impl Engine {
         }).transpose()?;
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
-        self.jobs.running = Some(p.call.call.summary());
+        self.jobs.track_tool(&p);
         let pending = Box::new(p);
         self.jobs.started = Some(tokio::spawn(async move {
             JobDone::Image {
@@ -429,7 +436,7 @@ impl Engine {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        self.jobs.running = Some(p.call.call.summary());
+        self.jobs.track_tool(&p);
         let pending = Box::new(p);
         self.jobs.started = Some(tokio::spawn(async move {
             let result = match job {
@@ -604,12 +611,11 @@ impl Engine {
     }
 
     pub(crate) fn start_catalog(&mut self, pending: Pending) {
-        self.jobs.catalog_chat = Some(pending.chat);
         let local = matches!(&pending.call.call, Call::FindTools { source, .. } if source == "local")
             .then(|| crate::tool_catalog::inventory(&self.state));
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
-        self.jobs.running = Some(pending.call.call.summary());
+        self.jobs.track_tool(&pending);
         let block_web = self.state.preferences.block_web;
         let image_settings = matches!(pending.call.call, Call::ImageModels {}).then(|| crate::comfy::Settings::from(&self.state.preferences));
         #[cfg(windows)]

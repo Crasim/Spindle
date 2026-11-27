@@ -457,9 +457,25 @@ impl Desktop {
         let mut edit = None;
         let mut delete_dialog = None;
         let state = &self.view.state;
+        let families = state.prompt_families();
+        let mut representatives = BTreeMap::new();
+        let mut unread_families = BTreeSet::new();
+        for (&id, &family) in &families {
+            let shown = representatives.entry(family).or_insert(id);
+            if id == state.chat_id || (*shown != state.chat_id && id > *shown) {
+                *shown = id;
+            }
+            if state.unread.contains(&id) {
+                unread_families.insert(family);
+            }
+        }
         let rows: Vec<_> = std::iter::once(state.chat_id)
             .chain(state.chats.keys().copied())
             .filter_map(|id| {
+                let family = families.get(&id);
+                if family.and_then(|family| representatives.get(family)).is_some_and(|shown| *shown != id) {
+                    return None;
+                }
                 let (t, h) = state.thread_data(id)?;
                 let visible = id != state.chat_id
                     || t.started
@@ -477,7 +493,7 @@ impl Desktop {
                         t.archived,
                         t.section.clone(),
                         t.label(h).to_owned(),
-                        state.unread.contains(&id),
+                        state.unread.contains(&id) || family.is_some_and(|family| unread_families.contains(family)),
                         t.project.clone(),
                     )
                 })

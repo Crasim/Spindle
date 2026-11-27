@@ -356,6 +356,8 @@ pub struct Preferences {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
     pub enter_sends: bool,
+    #[serde(default = "crate::memory::enabled")]
+    pub enter_steers: bool,
     #[serde(default)]
     pub nerd_stats: bool,
     #[serde(default)]
@@ -492,6 +494,7 @@ impl Default for Preferences {
             compact_sidebar: false,
             sidebar_width: None,
             enter_sends: true,
+            enter_steers: true,
             nerd_stats: false,
             over_18: false,
             text_size: 16,
@@ -567,6 +570,8 @@ pub struct ThreadInfo {
     /// Prompt position → shared identifier for independently saved versions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prompt_versions: BTreeMap<usize, PromptVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_family: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub edited_messages: std::collections::BTreeSet<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -610,6 +615,9 @@ pub struct ThreadInfo {
     /// User amendments to the active plan, in order of precedence (latest last).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan_changes: Vec<String>,
+    /// Corrections entered while a tool is working. The next model step takes them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_steering: Vec<String>,
     /// Plan edits made by the user, keyed by the number of messages at the time.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub plan_notes: BTreeMap<usize, crate::plan::Update>,
@@ -740,6 +748,20 @@ pub const BUILTIN_SKILLS: [(&str, &str); 3] = [
 ];
 
 impl State {
+    pub(crate) fn available_provider_name(&self, label: &str) -> String {
+        let occupied = |candidate: &str| {
+            let folded = candidate.to_lowercase();
+            (self.preferences.ollama_on && matches!(folded.as_str(), "ollama" | "ollama cloud"))
+                || self.providers.iter().any(|profile| profile.name.to_lowercase() == folded)
+        };
+        if !occupied(label) { return label.to_owned(); }
+        (2..).map(|number| {
+            let suffix = format!("-{number}");
+            let stem: String = label.chars().take(64usize.saturating_sub(suffix.len())).collect();
+            format!("{stem}{suffix}")
+        }).find(|name| !occupied(name)).unwrap()
+    }
+
     pub(crate) fn current_plan(&self, chat: u64) -> Option<(u64, String)> {
         let (thread, saved) = if chat == self.chat_id {
             (&self.thread, &self.plan)

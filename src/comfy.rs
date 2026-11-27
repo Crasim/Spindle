@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 /// How long one image may take before Spindle gives up.
 const LIMIT: Duration = Duration::from_secs(600);
+const LOCAL_COMFYUI: &str = "http://127.0.0.1:8188";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Backend {
@@ -40,15 +41,21 @@ pub struct Settings {
 }
 
 impl Settings {
+    pub fn configured(prefs: &crate::state::Preferences) -> bool {
+        !match prefs.image_backend {
+            Backend::ComfyUi => &prefs.comfyui,
+            Backend::StableDiffusion => &prefs.sd_webui,
+        }.trim().is_empty()
+    }
+
     pub fn from(prefs: &crate::state::Preferences) -> Self {
+        let address = match prefs.image_backend {
+            Backend::ComfyUi if prefs.comfyui.trim().is_empty() => LOCAL_COMFYUI,
+            Backend::ComfyUi => &prefs.comfyui,
+            Backend::StableDiffusion => &prefs.sd_webui,
+        };
         Self {
-            url: match prefs.image_backend {
-                Backend::ComfyUi => &prefs.comfyui,
-                Backend::StableDiffusion => &prefs.sd_webui,
-            }
-            .trim()
-            .trim_end_matches('/')
-            .to_owned(),
+            url: address.trim().trim_end_matches('/').to_owned(),
             checkpoint: prefs.comfy_checkpoint.trim().to_owned(),
             workflow: prefs.comfy_workflow.trim().to_owned(),
             edit_workflow: prefs.comfy_edit_workflow.trim().to_owned(),
@@ -103,6 +110,9 @@ impl Settings {
             );
         } else {
             let models = catalog(&self.url).await?;
+            if models.checkpoints.is_empty() && models.diffusion.is_empty() {
+                lines.push("ComfyUI responded and listed no checkpoint or diffusion model files.".into());
+            }
             lines.push(format!(
                 "Built-in transparent PNG: {}",
                 if models.alpha() {
@@ -425,6 +435,17 @@ fn client() -> Result<reqwest::Client> {
     crate::local_servers::client(Duration::from_secs(60))
 }
 
+pub(crate) fn address(input: &str) -> Result<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        Ok(LOCAL_COMFYUI.into())
+    } else if input.contains("://") {
+        crate::local_servers::address(input)
+    } else {
+        crate::local_servers::address(&format!("http://{input}"))
+    }
+}
+
 #[derive(Default)]
 pub struct Catalog {
     pub checkpoints: Vec<String>,
@@ -458,27 +479,47 @@ fn choices(node: &Value, field: &str) -> Vec<String> {
         .collect()
 }
 
+async fn model_files(http: &reqwest::Client, url: &str, folder: &str) -> Result<Vec<String>> {
+    Ok(http.get(format!("{url}/models/{folder}"))
+        .timeout(Duration::from_secs(5)).send().await?.error_for_status()?
+        .json::<Vec<String>>().await?)
+}
+
+fn model_choices(node: &Value, input: &str, files: Result<Vec<String>>) -> Vec<String> {
+    let mut names = choices(node, input);
+    names.extend(files.unwrap_or_default());
+    names.sort();
+    names.dedup();
+    names
+}
+
 pub async fn catalog(url: &str) -> Result<Catalog> {
-    let url = url.trim().trim_end_matches('/');
-    ensure!(!url.is_empty(), "Set the ComfyUI address in Settings first");
+    let url = address(url)?;
+    let url = url.as_str();
     let http = client()?;
-    let (checkpoints, diffusion, clip, vae, background, reference) = tokio::join!(
+    let (checkpoints, diffusion, clip, vae, background, reference, checkpoint_files, diffusion_files, encoder_files, vae_files) = tokio::join!(
         object(&http, url, "CheckpointLoaderSimple"),
         object(&http, url, "UNETLoader"),
         object(&http, url, "CLIPLoader"),
         object(&http, url, "VAELoader"),
         object(&http, url, "LoadBackgroundRemovalModel"),
         object(&http, url, "ReferenceLatent"),
+        model_files(&http, url, "checkpoints"),
+        model_files(&http, url, "diffusion_models"),
+        model_files(&http, url, "text_encoders"),
+        model_files(&http, url, "vae"),
     );
     ensure!(
-        checkpoints.is_ok() || diffusion.is_ok(),
-        "Couldn't connect to ComfyUI at {url}"
+        checkpoints.as_ref().is_ok_and(Value::is_object)
+            || diffusion.as_ref().is_ok_and(Value::is_object)
+            || checkpoint_files.is_ok() || diffusion_files.is_ok(),
+        "Couldn't read ComfyUI models at {url}. Check that the server is running and review its address in Settings › Models › Image generation."
     );
     Ok(Catalog {
-        checkpoints: choices(&checkpoints.unwrap_or_default(), "ckpt_name"),
-        diffusion: choices(&diffusion.unwrap_or_default(), "unet_name"),
-        encoders: choices(&clip.unwrap_or_default(), "clip_name"),
-        vaes: choices(&vae.unwrap_or_default(), "vae_name"),
+        checkpoints: model_choices(&checkpoints.unwrap_or_default(), "ckpt_name", checkpoint_files),
+        diffusion: model_choices(&diffusion.unwrap_or_default(), "unet_name", diffusion_files),
+        encoders: model_choices(&clip.unwrap_or_default(), "clip_name", encoder_files),
+        vaes: model_choices(&vae.unwrap_or_default(), "vae_name", vae_files),
         background: choices(&background.unwrap_or_default(), "bg_removal_name"),
         reference: reference.is_ok_and(|node| !node.is_null()),
     })
@@ -797,7 +838,7 @@ pub async fn run(
     if settings.backend == Backend::StableDiffusion {
         return stable_diffusion(&settings.url, r, source, cancel).await;
     }
-    let url = &settings.url;
+    let url = &address(&settings.url)?;
     let http = client()?;
     let selected = workflow(settings, r, source.is_some())?;
     let (graph, checkpoint) = if let Some((workflow_path, profile)) = selected {
@@ -1201,6 +1242,29 @@ pub fn file_name(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn catalog_finds_weights_when_node_metadata_is_absent() -> Result<()> {
+        use axum::{Json, Router, extract::Path, routing::get};
+        let router = Router::new().route("/models/{folder}", get(|Path(folder): Path<String>| async move {
+            Json(match folder.as_str() {
+                "checkpoints" => vec!["sdxl.safetensors"],
+                "diffusion_models" => vec!["flux3_klein.safetensors"],
+                "text_encoders" => vec!["qwen.safetensors"],
+                _ => vec![],
+            })
+        }));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = listener.local_addr()?.to_string();
+        let server = tokio::spawn(async { axum::serve(listener, router).await.unwrap() });
+        let models = catalog(&endpoint).await?;
+        assert_eq!(models.checkpoints, ["sdxl.safetensors"]);
+        assert_eq!(models.diffusion, ["flux3_klein.safetensors"]);
+        assert_eq!(models.encoders, ["qwen.safetensors"]);
+        assert_eq!(address("image-server:8188")?, "http://image-server:8188");
+        server.abort();
+        Ok(())
+    }
 
     #[test]
     fn picks_an_sdxl_image_checkpoint() {

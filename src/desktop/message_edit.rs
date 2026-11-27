@@ -31,7 +31,7 @@ impl MessageEditors {
             if e.pending {
                 if thread != view.state.chat_id
                     && view.notice
-                        == format!("Thread #{thread} · Edited prompt sent on a new branch")
+                        == format!("Thread #{thread} · Edited prompt sent as a new version")
                 {
                     return false;
                 }
@@ -101,7 +101,7 @@ impl MessageEditors {
                     response.request_focus();
                 }
             });
-        ui.weak("Send creates a new branch from this message.");
+        ui.weak("Send keeps both versions in this conversation.");
         let conflict = current != e.original;
         if conflict {
             ui.label(

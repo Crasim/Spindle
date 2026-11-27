@@ -41,6 +41,27 @@ pub enum Action {
 }
 
 impl State {
+    /// Group versions from existing edit markers and from the durable family marker.
+    pub(crate) fn prompt_families(&self) -> std::collections::BTreeMap<u64, u64> {
+        fn root(parents: &std::collections::BTreeMap<u64, u64>, mut id: u64) -> u64 {
+            while let Some(next) = parents.get(&id).filter(|next| **next != id) {
+                id = *next;
+            }
+            id
+        }
+        let mut first = std::collections::HashMap::new();
+        let mut parents = std::collections::BTreeMap::new();
+        for (id, thread) in self.chats.iter().map(|(id, c)| (*id, &c.thread)).chain([(self.chat_id, &self.thread)]) {
+            for group in thread.prompt_family.as_deref().into_iter().chain(thread.prompt_versions.values().map(|v| v.group.as_str())) {
+                let other = *first.entry(group).or_insert(id);
+                let (a, b) = (root(&parents, id), root(&parents, other));
+                parents.insert(a.max(b), a.min(b));
+                parents.entry(a.min(b)).or_insert(a.min(b));
+            }
+        }
+        parents.keys().map(|id| (*id, root(&parents, *id))).collect()
+    }
+
     pub(crate) fn prompt_versions(&self, group: &str) -> Vec<u64> {
         let mut ids = self.chats.iter().map(|(id, c)| (*id, &c.thread))
             .chain([(self.chat_id, &self.thread)])
@@ -232,14 +253,24 @@ impl Engine {
                 } else {
                     crate::sync::core::hex(&crate::vault::random::<16>()?)
                 };
+                let family = self.state.thread.prompt_family.clone()
+                    .or_else(|| self.state.thread.prompt_versions.values().next().map(|v| v.group.clone()))
+                    .unwrap_or_else(|| group.clone());
                 let mut version = self.state.conversation(id)?;
                 let title = version.thread.label(&version.history).to_owned();
+                let pinned = version.thread.pinned;
+                let archived = version.thread.archived;
+                let versions = std::mem::take(&mut version.thread.prompt_versions);
                 make_branch(&mut version);
                 version.thread.title = title;
+                version.thread.pinned = pinned;
+                version.thread.archived = archived;
+                version.thread.prompt_family = Some(family.clone());
                 version.history.truncate(index);
                 version.goal.clear();
                 version.plan = None;
                 let thread = &mut version.thread;
+                thread.prompt_versions = versions.into_iter().filter(|(row, _)| *row < index).collect();
                 thread.turns.retain(|k, _| *k < index);
                 thread.edited_messages.retain(|k| *k < index);
                 thread.tool_results.retain(|k| *k < index);
@@ -254,6 +285,7 @@ impl Engine {
                 thread.prompt_versions.insert(index, crate::state::PromptVersion { group: group.clone(), number });
                 thread.steps.clear();
                 thread.plan_changes.clear();
+                thread.pending_steering.clear();
                 thread.goal_done = false;
                 thread.goal_runs = 0;
                 thread.produced.clear();
@@ -278,9 +310,11 @@ impl Engine {
                 let task = self.state.queue.back_mut().unwrap();
                 task.images = images;
                 task.pastes = pastes;
-                self.state.chats.get_mut(&id).unwrap().thread.prompt_versions.entry(index)
+                let previous = &mut self.state.chats.get_mut(&id).unwrap().thread;
+                previous.prompt_family = Some(family);
+                previous.prompt_versions.entry(index)
                     .or_insert(crate::state::PromptVersion { group, number: 0 });
-                "Edited prompt sent on a new branch".into()
+                "Edited prompt sent as a new version".into()
             }
             Action::Edit {
                 title,
@@ -479,6 +513,8 @@ fn make_branch(c: &mut Conversation) {
     c.thread.archived = false;
     c.thread.imported_from = None;
     c.thread.prompt_versions.clear();
+    c.thread.prompt_family = None;
+    c.thread.pending_steering.clear();
     // A scratch branch may get a different artifact directory.
     for turn in c.thread.turns.values_mut() {
         turn.files.clear();

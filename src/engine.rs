@@ -30,6 +30,7 @@ pub struct View {
     pub sync_devices: Vec<(String, String, bool, bool)>,
     pub models: Vec<String>,
     pub busy: bool,
+    pub can_steer: bool,
     pub notice: String,
     pub connecting: bool,
     /// Background work in progress, such as a sandboxed test run.
@@ -1347,16 +1348,6 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 crate::ollama::store_key(&address, &key)?;
                 Ok(if key.is_empty() { "Ollama API key cleared" } else { "Ollama API key saved on this device" }.into())
             }
-            "/ollama-connect" => {
-                let (address, key): (String, String) = serde_json::from_str(args).context("Invalid Ollama configuration")?;
-                if !key.is_empty() {
-                    crate::ollama::store_key(&address, &key)?;
-                }
-                crate::ollama::configure(true, &address);
-                self.state.preferences.ollama_on = true;
-                self.state.preferences.ollama = address;
-                Ok("Ollama connection saved".into())
-            }
             "/preferences" => {
                 let mut pref: Preferences = serde_json::from_str(args)?;
                 ensure!(
@@ -1658,7 +1649,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 let (action, rest) = split(args);
                 match action.to_ascii_lowercase().as_str() {
                     "server" => {
-                        let url = crate::local_servers::address(need(rest, "Use /image server <ComfyUI URL>")?)?;
+                        let url = crate::comfy::address(need(rest, "Use /image server <ComfyUI URL>")?)?;
                         self.state.preferences.comfyui = url.clone();
                         self.state.preferences.image_backend = crate::comfy::Backend::ComfyUi;
                         Ok(format!("ComfyUI server set to {url}"))
@@ -1778,6 +1769,8 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 if action == "steer" {
                     ensure!(busy && idx > 0, "No active target to steer");
                     let item = &self.state.queue[idx];
+                    ensure!(item.origin.unwrap_or(self.state.chat_id) == self.state.chat_id,
+                        "Open the queued message's conversation to steer it");
                     ensure!(
                         matches!(item.mode, Mode::Chat | Mode::Conversation) && item.context.is_empty(),
                         "Only plain follow-ups can steer"
@@ -1801,9 +1794,23 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 ))
             }
             "/steer" => {
-                ensure!(busy, "No active task to steer");
-                self.steer(args)?;
-                Ok("Correction applied; restarting inference".into())
+                let chat = self.state.chat_id;
+                if self.inference_in_chat(chat, busy) {
+                    self.steer(args)?;
+                    Ok("Steering applied to the next model request".into())
+                } else {
+                    ensure!(self.awaiting_tool(chat), "No active task to steer in this conversation");
+                    need(args, "Give a correction")?;
+                    ensure!(!args.starts_with("--worker "), "Steer an individual worker while that swarm is responding");
+                    let thread = &mut self.state.thread;
+                    check_steering_budget(&thread.pending_steering, args)?;
+                    if !self.state.goal.is_empty() || !thread.steps.is_empty() {
+                        crate::plan::check_amendment(&thread.plan_changes, args)?;
+                        thread.plan_changes.push(args.into());
+                    }
+                    thread.pending_steering.push(args.into());
+                    Ok("Steering saved for the next model step".into())
+                }
             }
             "/cancel" => {
                 ensure!(busy, "No active request");
@@ -1936,10 +1943,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
             worker.answer = None;
             return Ok(());
         }
-        ensure!(
-            task.steering.iter().map(String::len).sum::<usize>() + args.len() <= 1500,
-            "Correction budget exceeded"
-        );
+        check_steering_budget(&task.steering, args)?;
         let amends_plan = matches!(task.mode, Mode::Chat | Mode::Plan(_))
             && (!self.state.goal.is_empty() || !self.state.thread.steps.is_empty() || matches!(task.mode, Mode::Plan(_)));
         if amends_plan {
@@ -1956,6 +1960,18 @@ The user denied this action. Continue with other work or explain the denial. Do 
             }
         }
         Ok(())
+    }
+
+    fn awaiting_tool(&self, chat: u64) -> bool {
+        self.jobs.catalog_chat == Some(chat)
+            || self.jobs.after.as_ref().is_some_and(|after| after.chat == chat)
+            || self.jobs.import_request.as_ref().is_some_and(|request| request.chat == chat)
+            || self.state.browser_reads.contains_key(&chat)
+            || self.state.requests.iter().any(|request| request.chat == chat)
+    }
+
+    fn inference_in_chat(&self, chat: u64, busy: bool) -> bool {
+        busy && self.state.queue.front().is_some_and(|task| task.origin.unwrap_or(self.state.chat_id) == chat)
     }
 
     fn skills(&mut self, input: &str) -> Result<String> {
@@ -2035,6 +2051,19 @@ The user denied this action. Continue with other work or explain the denial. Do 
             _ => bail!("Use /skills list, create, show, validate, test, install or remove"),
         }
     }
+}
+
+fn check_steering_budget(changes: &[String], next: &str) -> Result<()> {
+    ensure!(changes.iter().map(String::len).sum::<usize>() + next.len() <= 1500,
+        "Correction budget exceeded");
+    Ok(())
+}
+
+fn contains_image_request(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    ["image", "picture", "photo", "illustration", "drawing", "logo", "icon",
+        "artwork", "wallpaper", "sprite", "render"]
+        .into_iter().any(|word| text.contains(word))
 }
 
 fn can_read_paired_tab(state: &State, chat: u64) -> bool {
@@ -2304,7 +2333,8 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
         system.push_str(TOOL_ACCESS_GUIDANCE);
         system.push_str("\n");
         system.push_str(TOOL_CALL_GUIDANCE);
-        if crate::comfy::Settings::from(&state.preferences).ready() {
+        if crate::comfy::Settings::configured(&state.preferences)
+            || (contains_image_request(&task.text) && crate::comfy::Settings::from(&state.preferences).ready()) {
             system.push_str("\n");
             system.push_str(IMAGE_TOOL_EXAMPLES);
         }
@@ -2548,21 +2578,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         let html = if crate::html_preview::is_html(Path::new(&page)) { page.as_str() } else { "index.html" };
         tools.push(format!(r#"- Present saved HTML: {{"name":"preview_html","args":{{"path":"{html}"}}}}. Link its path in the final answer."#));
     }
-    let wants_image = [
-        "image",
-        "picture",
-        "photo",
-        "illustration",
-        "drawing",
-        "logo",
-        "icon",
-        "artwork",
-        "wallpaper",
-        "sprite",
-        "render",
-    ]
-    .iter()
-    .any(|w| format!("{request} {first_user}").to_lowercase().contains(w));
+    let wants_image = contains_image_request(request) || contains_image_request(&first_user);
     let speech = crate::speech::available();
     if mentions(&[
             "speak", "voice", "aloud", "narrat", "audio", "speech", "say it", "tts", "podcast",
@@ -2591,7 +2607,8 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
             tools.push("- Transcription needs a speech-to-text model. Choose one in Settings › Models › Audio.".into());
         }
     }
-    if crate::comfy::Settings::from(&state.preferences).ready() {
+    if crate::comfy::Settings::configured(&state.preferences)
+        || (wants_image && crate::comfy::Settings::from(&state.preferences).ready()) {
         tools.push(IMAGE_TOOL_EXAMPLES.into());
     } else if wants_image {
         tools.push("- Image generation needs a server. Set one in Settings › Models › Image generation.".into());
@@ -3270,6 +3287,9 @@ fn continue_tool_result(state: &mut State, chat: u64, model: &str, steps: u32, r
 
 fn queue_followup_at(state: &mut State, chat: u64, model: &str, steps: u32, text: String, at: usize) {
     state.serial += 1;
+    let thread = if chat == state.chat_id { Some(&mut state.thread) }
+        else { state.chats.get_mut(&chat).map(|conversation| &mut conversation.thread) };
+    let steering = thread.map_or_else(Vec::new, |thread| std::mem::take(&mut thread.pending_steering));
     let task = Task {
         steps,
         tool_result: true,
@@ -3287,7 +3307,7 @@ fn queue_followup_at(state: &mut State, chat: u64, model: &str, steps: u32, text
         model: model.to_owned(),
         mode: Mode::Chat,
         context: String::new(),
-        steering: vec![],
+        steering,
         skill: None,
     };
     state.queue.insert(at, task);
@@ -7371,10 +7391,11 @@ mod tests {
         let notice = e
             .command(&resend(2, "Name a fruit", "Name a citrus fruit"), false)
             .unwrap();
-        assert!(notice.contains("Edited prompt sent on a new branch"), "{notice}");
+        assert!(notice.contains("Edited prompt sent as a new version"), "{notice}");
         let original = chat;
         let version = e.state.chat_id;
         assert_ne!(original, version);
+        assert_eq!(e.state.prompt_families().get(&version), Some(&original));
         let group = e.state.thread.prompt_versions[&2].group.clone();
         assert_eq!(e.state.prompt_versions(&group), [original, version]);
         assert_eq!(e.state.history.len(), 2);
@@ -7407,6 +7428,12 @@ mod tests {
         e.command(&format!("/open {version}"), false).unwrap();
         assert_eq!(e.state.history[2].content, "Name a citrus fruit");
         assert_eq!(e.state.history[3].content, "Orange.");
+        let third = crate::threads::Action::Resend {
+            index: 0, original: "Name a colour".into(), replacement: "Name a shade".into(),
+        };
+        e.thread_action(version, third).unwrap();
+        assert_eq!(e.state.prompt_families().get(&e.state.chat_id), Some(&original));
+        assert_eq!(e.state.prompt_families().len(), 3);
     }
 
     #[test]
@@ -7827,6 +7854,26 @@ mod tests {
     }
 
     #[test]
+    fn steering_waits_for_running_tools_and_reaches_the_next_model_request() {
+        let mut engine = fixture(Path::new("."));
+        let chat = engine.state.chat_id;
+        engine.jobs.catalog_chat = Some(chat);
+        engine.command("Follow-up after the current work", false).unwrap();
+        let queued = engine.state.queue[0].id;
+        engine.command("/steer Use the new test fixture", false).unwrap();
+        engine.command("/steer Keep the original API", false).unwrap();
+        assert_eq!(engine.state.thread.pending_steering, ["Use the new test fixture", "Keep the original API"]);
+        assert_eq!(engine.state.queue.len(), 1);
+        engine.jobs.catalog_chat = None;
+        continue_with(&mut engine.state, chat, "two", 1, "Tool result: compiled".into(), false);
+        assert!(engine.state.thread.pending_steering.is_empty());
+        assert_eq!(engine.state.queue[1].id, queued);
+        let (_, messages) = request(&engine.state, &engine.state.queue[0]).unwrap();
+        let prompt = &messages.last().unwrap().content;
+        assert!(prompt.contains("Tool result: compiled") && prompt.contains("Use the new test fixture") && prompt.contains("Keep the original API"));
+    }
+
+    #[test]
     fn live_plan_replacement_survives_tool_turns_and_manual_edits() {
         let mut e = fixture(Path::new("."));
         e.command("/goal Make an HTML game", false).unwrap();
@@ -8033,6 +8080,11 @@ impl Engine {
                 return Some(n);
             }
             let provider = provider.as_ref()?;
+            if provider.protocol == crate::providers::Protocol::Ollama {
+                let base = crate::local_servers::address(&provider.base).ok()?;
+                return api.scoped(&provider.id, &base, provider.key().ok()?)
+                    .limits(&model).await.context;
+            }
             crate::providers::context_window(&api.0, &model, Some(provider))
                 .await
                 .or(provider.catalog_window(tag))
@@ -8337,7 +8389,10 @@ impl Engine {
             #[cfg(target_os = "android")]
             let may_work = may_work && crate::android_background::activity().can_work();
             let web_region_prompt = if may_work && active.is_none() && !background { self.web_region_prompt() } else { None };
-            if may_work && active.is_none() && !self.state.held && !checking_cloud && web_region_prompt.is_none() && (!background || admitted_front) {
+            let front_ready = self.state.queue.front().is_some_and(|task| {
+                task.tool_result || !self.awaiting_tool(task.origin.unwrap_or(self.state.chat_id))
+            });
+            if may_work && active.is_none() && front_ready && !self.state.held && !checking_cloud && web_region_prompt.is_none() && (!background || admitted_front) {
                 if let Some(task) = self.state.queue.front() {
                     match request(&self.state, task) {
                         Err(e) => {
@@ -8445,10 +8500,9 @@ impl Engine {
                                                 .await
                                         } else if let Some(p) = provider {
                                             p.chat(
-                                                &api.0,
+                                                &api,
                                                 tag,
                                                 &msgs,
-                                                api.1.as_ref(),
                                                 threshold,
                                                 &mut obs,
                                             )
@@ -8509,6 +8563,8 @@ impl Engine {
                     sync_devices: sync_devices.clone(),
                     models: self.models.clone(),
                     busy: active.is_some(),
+                    can_steer: self.inference_in_chat(self.state.chat_id, active.is_some())
+                        || self.awaiting_tool(self.state.chat_id),
                     notice: notice.clone(),
                     connecting: connecting.is_some(),
                     job: self.jobs.running.clone(),
@@ -8608,9 +8664,16 @@ impl Engine {
                             return Ok("Refreshing Ollama Cloud usage".into());
                         }
                         let (cmd,args)=split(line);
-                        ensure!(!matches!(cmd,"/connect"|"/refresh"|"/disconnect") || connecting.is_none(), "Another provider connection is in progress");
-                        if cmd=="/connect" {
-                            let form: Connection = serde_json::from_str(args).context("Invalid provider configuration")?;
+                        ensure!(!matches!(cmd,"/connect"|"/ollama-connect"|"/refresh"|"/disconnect") || connecting.is_none(), "Another provider connection is in progress");
+                        if matches!(cmd, "/connect" | "/ollama-connect") {
+                            let mut form: Connection = if cmd == "/ollama-connect" {
+                                let (base, key) = serde_json::from_str(args).context("Invalid Ollama configuration")?;
+                                Connection { base, key, protocol: crate::providers::Protocol::Ollama, ..Default::default() }
+                            } else {
+                                serde_json::from_str(args).context("Invalid provider configuration")?
+                            };
+                            let name = form.name.trim();
+                            form.name = self.state.available_provider_name(if name.is_empty() { form.protocol.label() } else { name });
                             use std::hash::{DefaultHasher, Hash, Hasher};
                             let mut hash=DefaultHasher::new();self.root.hash(&mut hash);
                             let id=Provider::new_id()?;
@@ -8648,6 +8711,8 @@ impl Engine {
                             }
                         }
                         let previous_task=self.state.queue.front().map(|q|q.id);
+                        let steer_active = cmd.eq_ignore_ascii_case("/steer")
+                            && self.inference_in_chat(self.state.chat_id, active.is_some());
                         let message = self.command(line,active.is_some())?;
                         if cmd.eq_ignore_ascii_case("/open") {
                             sync_after_open = tokio::time::Instant::now() + std::time::Duration::from_millis(350);
@@ -8658,11 +8723,13 @@ impl Engine {
                         if matches!(cmd, "/sync-unlock" | "/sync-toggle") {
                             next_sync = std::time::Instant::now();
                         }
-                        if matches!(cmd, "/ollama-key" | "/ollama-connect") {
+                        if cmd == "/ollama-key" {
                             self.refresh_ollama().await?;
                         }
                         if previous_task!=self.state.queue.front().map(|q|q.id) || (cmd.eq_ignore_ascii_case("/plan-steps") && message == "Plan updated" && self.state.queue.front().is_some_and(|q| q.origin.unwrap_or(self.state.chat_id) == self.state.chat_id))
-                            || matches!(cmd.to_ascii_lowercase().as_str(),"/steer"|"/cancel"|"/defer") || (cmd == "/queue" && split(args).0 == "steer") {
+                            || matches!(cmd.to_ascii_lowercase().as_str(),"/cancel"|"/defer")
+                            || steer_active
+                            || (cmd == "/queue" && split(args).0 == "steer") {
                             if let Some(handle)=active.take() {handle.abort(); let _ = handle.await;}
                         }
                         Ok(message)

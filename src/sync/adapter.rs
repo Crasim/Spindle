@@ -1004,6 +1004,9 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
         if !versions.is_empty() {
             value["prompt_versions"] = json!(versions);
         }
+        if let Some(family) = &thread.prompt_family {
+            value["prompt_family"] = json!(family);
+        }
         let key = format!("chat:{gid}");
         let f = fingerprint(&value);
         if pending_merge.is_none() && sync.seen.get(&key) == Some(&f) {
@@ -1447,7 +1450,7 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
             "main": view.main.iter().map(|t| &t.turn.h).collect::<Vec<_>>(),
             "branches": view.branches.iter().map(|b| (b.new_from, b.turns.iter()
                 .map(|t| &t.turn.h).collect::<Vec<_>>())).collect::<Vec<_>>(),
-            "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"], &v["prompt_versions"], &v["imported_from"]],
+            "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"], &v["prompt_versions"], &v["prompt_family"], &v["imported_from"]],
         }));
         if sync.seen.get(&format!("chatview:{gid}")) == Some(&fp) {
             continue;
@@ -1503,6 +1506,9 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         }
         if let Some(origin) = v["imported_from"].as_str().filter(|id| id.len() <= 150) {
             thread.imported_from = Some(origin.to_owned());
+        }
+        if let Some(family) = v["prompt_family"].as_str().filter(|id| !id.is_empty() && id.len() <= 100) {
+            thread.prompt_family = Some(family.to_owned());
         }
         thread.pinned = v["pinned"].as_bool().unwrap_or(thread.pinned);
         thread.archived = v["archived"].as_bool().unwrap_or(thread.archived);

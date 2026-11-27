@@ -56,7 +56,7 @@ impl ImagesForm {
                 .map(WorkflowForm::from)
                 .collect();
             self.default_profile.clone_from(&prefs.comfy_profile);
-            if self.backend == Backend::ComfyUi && !self.url.is_empty() {
+            if self.backend == Backend::ComfyUi {
                 self.scan();
             }
         }
@@ -97,8 +97,10 @@ impl ImagesForm {
                 ui.label("ComfyUI address");
                 if ui.add(egui::TextEdit::singleline(&mut self.url).hint_text("http://localhost:8188")).changed() {
                     self.catalog = None;
+                    self.checking = None;
+                    self.status.clear();
                 }
-                if ui.add_enabled(self.checking.is_none() && !self.url.trim().is_empty(), egui::Button::new("Refresh models")).clicked() {
+                if ui.add_enabled(self.checking.is_none(), egui::Button::new("Refresh models")).clicked() {
                     self.scan();
                 }
                 if self.checking.is_some() { ui.spinner(); }
@@ -138,8 +140,7 @@ impl ImagesForm {
 
     fn scan(&mut self) {
         let (tx, rx) = mpsc::channel();
-        let address = super::side_tabs::to_url(&self.url);
-        self.url.clone_from(&address);
+        let address = self.url.clone();
         self.checking = Some(rx);
         self.status = "Connecting…".into();
         std::thread::spawn(move || {
@@ -279,7 +280,7 @@ impl ImagesForm {
             updated.sd_webui = address(&self.stable_diffusion)?;
             return Ok(updated);
         }
-        updated.comfyui = address(&self.url)?;
+        updated.comfyui = if self.url.trim().is_empty() { String::new() } else { crate::comfy::address(&self.url)? };
         updated.comfy_checkpoint.clone_from(&self.checkpoint);
         updated.comfy_workflow = self.workflow.trim().to_owned();
         updated.comfy_edit_workflow = self.edit_workflow.trim().to_owned();

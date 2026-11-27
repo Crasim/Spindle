@@ -7,7 +7,7 @@
 - Start a conversation, select a model, and type a message. Enter sends it and Shift+Enter inserts a line break. Responses appear as Ollama generates them. Recent chats reopen from the sidebar.
 - Every chat can use Spindle's workspace and image tools. Tool permissions still apply.
 - Choose **Draft a plan** or enter `/plan <task>`. Use `/plan revise <change>` and `/plan accept <revision>` to work from a specific draft. `/goal <objective>` sets a continuing objective for the chat.
-- While a response is running, **Queue** adds a follow-up and **Steer** applies a correction to the active request. **Stop** cancels inference and holds remaining work. The Work queue lets you remove or promote a waiting message. After an interrupted session, **Resume** releases the saved queue.
+- While the conversation is working, **Enter** steers the next model request and **Ctrl+Enter** queues a follow-up. Swap these shortcuts in **Settings → Preferences → Conversation**. Both messages appear in the chat. An in-progress tool can finish before the model receives your steer. **Stop** cancels inference and holds remaining work. The Work queue lets you remove or promote a waiting message.
 - **Ask two models** lets you choose each worker's role and model. Workers run sequentially and the coordinator synthesizes their findings. From any chat, use `/swarm Check boundary conditions --worker reviewer=qwen3.5:9b` for one worker or append a second `--worker role=model`. Use `/steer --worker reviewer <correction>` for one role.
 - **Attach file** previews a workspace file for approval. The harness sends the approved snapshot with the next submitted task. The native picker supports UTF-8 text files up to 6,000 bytes. You can ask for analysis or a proposed patch.
 - In **Skills**, create a named draft from a brief, inspect its Markdown, try an example, and install it. Invoke it as `/<name> <task>`. The first-pass package format is one UTF-8 `SKILL.md` with simple front matter containing `name` and `description`, followed by its instructions. Installing from the workspace copies that definition into the local registry. Reinstall to update.
@@ -36,7 +36,7 @@ Sending the first message adds **New chat** to the sidebar immediately. The firs
 
 New conversations use the last **Chat** or **Cowork** mode you selected. Click a work card to expand its steps and check their results.
 
-Use the pencil beside one of your prompts to edit it. **Send** starts a new branch with the earlier context and keeps the original conversation. Use the arrows beside the prompt to switch between versions.
+Use the pencil beside one of your prompts to edit it. **Send** creates another version with the earlier context. Both versions share one sidebar entry. Use the arrows beside the prompt to switch between them.
 
 Use **Import conversations** beside **Chats**, or `/import-chat`. On desktop, select **Codex** or **Claude Code** to browse local sessions and select chats to copy. The file picker also accepts session JSONL files and the ZIP or `conversations.json` from a Claude account export. Spindle copies the visible prompts and replies. It recognizes sessions it has imported before.
 
@@ -65,6 +65,8 @@ In a project chat, ask about a previous discussion or name a distinctive topic f
 ## Providers and settings
 
 Use **Settings → Model providers → Add provider** to test and save an LM Studio, OpenAI, OpenRouter, Anthropic, or custom Chat Completions connection. Enter the provider's API base URL, including its API version path, and supply a key if required. Spindle fetches the model list. Windows Credential Manager stores keys. Selecting a hosted model sends its request context to that provider. Accounts and billing are managed with the provider.
+
+Add multiple connections of the same type. Each connection has its own address, catalog and optional key. Leave the display name empty to use the suggested name, such as **Ollama-2**, or enter your own.
 
 Click the model control beside the message box or press **Ctrl+K**. Search by model or provider, star favorites, and select a result. Icons beside each model show what it accepts beyond text: an eye for images and sound waves for audio. A brain marks models that can reason. Spindle reads these from Ollama's reported capabilities and provider catalogs, and otherwise from known model families. They describe the model; Spindle does not yet send images or audio.
 
@@ -128,7 +130,7 @@ Use `/council` to get independent feedback on the latest response, or `/council 
 
 ## Images (ComfyUI)
 
-Set the ComfyUI address in **Settings › Models › Image generation**, or use `/image server http://model-host.local:8188`. Use **Test** to list checkpoints from the server.
+Spindle tries ComfyUI on this device at port 8188 when the address is blank. For another device, set the address in **Settings › Models › Image generation**, or use `/image server http://model-host.local:8188`. **Refresh models** lists checkpoints and separate diffusion models.
 
 - `/image a red fox in the snow` generates a PNG. Models can also generate pictures with the `image` tool.
 - Attach a PNG or JPEG and send `/image edit make the sky violet`, or use `/image edit "red fox.png" -- make the sky violet` with a workspace file or an image created in this chat. The edit saves a separate file.

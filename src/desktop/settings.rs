@@ -20,7 +20,7 @@ const TEMPLATES: &[(&str, &str, Protocol)] = &[
         Protocol::ChatCompletions,
     ),
     // Ollama uses its own API; adding it sets the server address.
-    ("Ollama", "", Protocol::ChatCompletions),
+    ("Ollama", "", Protocol::Ollama),
     (
         "OpenAI API",
         "https://api.openai.com/v1",
@@ -696,7 +696,7 @@ impl Desktop {
                             .changed();
                     });
                     changed |= ui
-                        .checkbox(&mut prefs.enter_sends, "Send with Enter")
+                        .checkbox(&mut prefs.enter_sends, "Send with Enter when idle")
                         .changed();
                     ui.label(
                         Text::new(if prefs.enter_sends {
@@ -707,6 +707,9 @@ impl Desktop {
                         .size(13.)
                         .color(muted()),
                     );
+                    ui.label("While the current conversation is working");
+                    changed |= ui.radio_value(&mut prefs.enter_steers, true, "Enter steers · Ctrl+Enter queues").changed();
+                    changed |= ui.radio_value(&mut prefs.enter_steers, false, "Enter queues · Ctrl+Enter steers").changed();
                 });
             ui.add_space(14.);
             ui.heading("Appearance");
@@ -1887,7 +1890,8 @@ impl Desktop {
             let prefs = &self.view.state.preferences;
             for server in &local.results {
                 let active = match server.kind {
-                    Kind::Ollama => prefs.ollama_on && crate::ollama::endpoint().trim_end_matches('/') == server.url,
+                    Kind::Ollama => (prefs.ollama_on && crate::ollama::endpoint().trim_end_matches('/') == server.url)
+                        || self.view.state.providers.iter().any(|p| p.protocol == Protocol::Ollama && p.base == server.url),
                     Kind::Compatible => self.view.state.providers.iter().any(|p| p.base.trim_end_matches('/') == server.url),
                     Kind::ComfyUi => prefs.comfyui == server.url && prefs.image_backend == crate::comfy::Backend::ComfyUi,
                     Kind::StableDiffusion => prefs.sd_webui == server.url && prefs.image_backend == crate::comfy::Backend::StableDiffusion,
@@ -1908,9 +1912,9 @@ impl Desktop {
         });
         if let Some(server) = connect {
             match server.kind {
-                Kind::Ollama => self.set_ollama(true, server.url),
-                Kind::Compatible => {
-                    let form = Connection { name: server.name.into(), base: server.url, ..Default::default() };
+                Kind::Ollama | Kind::Compatible => {
+                    let protocol = if server.kind == Kind::Ollama { Protocol::Ollama } else { Protocol::ChatCompletions };
+                    let form = Connection { name: server.name.into(), base: server.url, protocol, ..Default::default() };
                     self.send(format!("/connect {}", serde_json::json!(form)));
                 }
                 Kind::ComfyUi | Kind::StableDiffusion => {
@@ -2012,7 +2016,7 @@ impl Desktop {
                 ).inner.clicked();
                 if selected {
                     self.connection = Connection {
-                        name: name.into(),
+                        name: String::new(),
                         base: base.into(),
                         protocol,
                         key: String::new(),
@@ -2025,7 +2029,14 @@ impl Desktop {
 
     fn provider_form(&mut self, ui: &mut egui::Ui, name: &str) {
         let width = ui.available_width();
-        if name == "Ollama" {
+        ui.label("Display name (optional)");
+        let suggested = self.view.state.available_provider_name(name);
+        self.android_ime.field(
+            ui, "provider-name", &mut self.connection.name, Default::default(),
+            |field| field.desired_width(width).hint_text(suggested),
+        );
+        let action = match self.connection.protocol {
+            Protocol::Ollama => {
             ui.label("Address of the computer running Ollama");
             self.android_ime.field(
                 ui,
@@ -2047,26 +2058,8 @@ impl Desktop {
             self.android_ime.field(ui, "ollama-provider-key", &mut self.connection.key,
                 super::android_ime::Field { password: true, ..Default::default() },
                 |field| field.desired_width(width).hint_text("Leave blank for local access"));
-            if ui
-                .add_enabled(!self.view.connecting, egui::Button::new("Add Ollama"))
-                .clicked()
-            {
-                let address = self.connection.base.trim().to_owned();
-                let key = std::mem::take(&mut self.connection.key);
-                self.send(format!("/ollama-connect {}", serde_json::json!([address, key.trim()])));
-                self.provider_setup = ProviderSetup::Connections;
+                "Test & connect"
             }
-            return;
-        }
-        ui.label("Display name");
-        self.android_ime.field(
-            ui,
-            "provider-name",
-            &mut self.connection.name,
-            Default::default(),
-            |field| field.desired_width(width),
-        );
-        let action = match self.connection.protocol {
             Protocol::ChatGpt => {
                 ui.label("Use your ChatGPT plan for eligible models. Your browser opens for account selection and consent.");
                 "Continue with ChatGPT"
@@ -2142,8 +2135,8 @@ impl Desktop {
             ui.label(Text::new(&self.settings_feedback).color(accent()));
         }
         let enabled = !self.view.connecting
-            && !self.connection.name.trim().is_empty()
-            && !self.connection.base.trim().is_empty();
+            && (!self.connection.base.trim().is_empty()
+                || (self.connection.protocol == Protocol::Ollama && !cfg!(target_os = "android")));
         if ui
             .add_enabled(
                 enabled,
@@ -2156,9 +2149,12 @@ impl Desktop {
             .clicked()
         {
             self.settings_feedback.clear();
+            let mut connection = self.connection.clone();
+            if connection.name.trim().is_empty() { connection.name = name.into(); }
+            connection.key = connection.key.trim().to_owned();
             self.send(format!(
                 "/connect {}",
-                serde_json::to_string(&self.connection).unwrap()
+                serde_json::to_string(&connection).unwrap()
             ));
         }
     }
@@ -2364,7 +2360,8 @@ impl Desktop {
             return;
         };
         let (provider, name) = route(model);
-        let local_ollama = provider == "ollama";
+        let local_ollama = provider == "ollama" || self.view.state.providers.iter()
+            .any(|p| p.id == provider && p.protocol == Protocol::Ollama);
         let mut open = true;
         let (mut save, mut reset, mut cancel) = (false, false, false);
         super::detail_panel(
