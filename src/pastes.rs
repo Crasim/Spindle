@@ -188,7 +188,7 @@ impl Engine {
                 text: body,
             });
         }
-        self.enqueue(&text, self.state.thread.message_mode(), String::new())?;
+        self.enqueue(&text, crate::state::Mode::Chat, String::new())?;
         let task = self
             .state
             .queue

@@ -74,7 +74,6 @@ pub fn main(args: &[String]) -> Result<()> {
         providers: profiles,
         ..Default::default()
     };
-    state.thread.cowork = true;
     state.tuning.entry(model.clone()).or_default().thinking = thinking;
     // Running code works when Spindle's Python is here and the sandbox check passes.
     if let Some(rt) = crate::runtime::installed() {

@@ -95,6 +95,8 @@ pub struct Jobs {
     pub panel_read: Option<(u64, u64, String, Option<tokio::sync::oneshot::Sender<Result<String>>>)>,
     pub browser_retries: Vec<BrowserRetry>,
     pub web_region_ui: bool,
+    pub import_panel: Option<String>,
+    pub import_request: Option<Pending>,
     pub web_region_fallback: Option<u64>,
 }
 
@@ -352,7 +354,7 @@ impl Engine {
 
     /// Make an image the model asked for, in the background.
     pub(crate) fn start_image(&mut self, p: Pending) -> Result<()> {
-        let Call::Image { prompt, .. } = &p.call.call else {
+        let Call::Image { prompt, options, source, .. } = &p.call.call else {
             bail!("Not an image");
         };
         let settings = crate::comfy::Settings::from(&self.state.preferences);
@@ -360,14 +362,30 @@ impl Engine {
             settings.ready(),
             "Set an image server in Settings › Models › Image generation."
         );
-        let request = crate::comfy::Request::new(prompt);
+        let request = crate::comfy::Request::configured(prompt, options, &settings)?;
+        let source = source.as_deref().map(|path| -> Result<_> {
+            if path == "attached" {
+                use base64::Engine as _;
+                let (thread, history) = self.state.thread_data(p.chat).context("Conversation unavailable")?;
+                let image = history.iter().enumerate().rev()
+                    .find(|(i, m)| m.role == "user" && !thread.tool_results.contains(i))
+                    .and_then(|(_, m)| m.images.first()).context("Attach an image to this prompt or name a saved image")?;
+                ensure!(image.len() <= crate::comfy::MAX_SOURCE_BYTES.div_ceil(3) * 4, "Use an image up to 6 MB");
+                return crate::comfy::Source::new(base64::engine::general_purpose::STANDARD.decode(image)?);
+            }
+            let file = crate::state::project_path(&p.root, path)
+                .or_else(|_| crate::artifacts::existing_file(&self.state.files_root(&self.root, p.chat), p.chat, path))?;
+            let mut bytes = Vec::new();
+            std::fs::File::open(file)?.take(crate::comfy::MAX_SOURCE_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+            crate::comfy::Source::new(bytes)
+        }).transpose()?;
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
         self.jobs.running = Some(p.call.call.summary());
         let pending = Box::new(p);
         self.jobs.started = Some(tokio::spawn(async move {
             JobDone::Image {
-                result: crate::comfy::generate(&settings, &request, cancel).await,
+                result: crate::comfy::run(&settings, &request, source, cancel).await,
                 pending,
             }
         }));
@@ -494,7 +512,7 @@ impl Engine {
         command: String,
         source: Option<crate::comfy::Source>,
     ) -> Result<String> {
-        let prompt = prompt.trim();
+        let (options, prompt) = crate::comfy::Options::command(prompt.trim())?;
         ensure!(!prompt.is_empty(), "Describe the image to generate or the change to make");
         ensure!(prompt.len() <= 2000, "Describe the image in fewer words");
         ensure!(
@@ -511,7 +529,7 @@ impl Engine {
         let folder = crate::artifacts::folder(&self.state.files_root(&self.root, chat), chat)?;
         let name = crate::comfy::file_name(prompt);
         let path = unused(&folder.join(&name));
-        let request = crate::comfy::Request::new(prompt);
+        let request = crate::comfy::Request::configured(prompt, &options, &settings)?;
         self.jobs.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.jobs.cancel.clone();
         let editing = source.is_some();
@@ -591,6 +609,7 @@ impl Engine {
         let cancel = self.jobs.cancel.clone();
         self.jobs.running = Some(pending.call.call.summary());
         let block_web = self.state.preferences.block_web;
+        let image_settings = matches!(pending.call.call, Call::ImageModels {}).then(|| crate::comfy::Settings::from(&self.state.preferences));
         #[cfg(windows)]
         if !block_web && self.jobs.web_region_ui && self.state.chat_id == pending.chat
             && crate::engine::builtin_browser_request(&self.state, pending.chat)
@@ -656,6 +675,7 @@ impl Engine {
         self.jobs.started = Some(tokio::spawn(async move {
             let approved = pending.approved && pending.risk == crate::policy::Risk::Native;
             let result = match pending.call.call.clone() {
+                Call::ImageModels {} => image_settings.unwrap().describe().await,
                 Call::FindTools { source, query } => match local {
                     Some(inventory) => Ok(inventory),
                     None => crate::tool_catalog::find(&source, &query).await,
@@ -991,37 +1011,37 @@ impl Engine {
             JobDone::Image { pending, result } => {
                 let p = *pending;
                 let summary = p.call.call.summary();
-                let name = p
-                    .target
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
                 let mut images = vec![];
                 let saved = result.and_then(|image| {
-                    if let Some(dir) = p.target.parent() {
-                        std::fs::create_dir_all(dir)?;
+                    let files = save_images(&p.target, &image.images, p.confirmed_change())?;
+                    let root = self.state.files_root(&self.root, p.chat);
+                    let gallery = crate::artifacts::folder(&root, p.chat)?;
+                    let mut names = Vec::new();
+                    for (file, bytes) in files.iter().zip(&image.images) {
+                        let name = file.file_name().context("Image has no filename")?;
+                        if file.parent() == Some(gallery.as_path()) {
+                            names.push(name.to_string_lossy().into_owned());
+                        } else {
+                            let mirror = unused(&gallery.join(name));
+                            crate::tools::write_generated(&mirror, bytes, false)?;
+                            names.push(mirror.file_name().unwrap().to_string_lossy().into_owned());
+                        }
                     }
-                    crate::tools::write_generated(&p.target, &image.png, p.confirmed_change())?;
-                    Ok(image)
+                    Ok((image, names))
                 });
                 let (text, note, ok) = match saved {
-                    Ok(image) => {
-                        if self.sees(&p.model) {
+                    Ok((image, names)) => {
+                        if self.sees(&p.model)
+                            && let Some(first) = image.images.first().filter(|bytes| bytes.len() <= crate::comfy::MAX_SOURCE_BYTES)
+                        {
                             use base64::Engine as _;
-                            images
-                                .push(base64::engine::general_purpose::STANDARD.encode(&image.png));
+                            images.push(base64::engine::general_purpose::STANDARD.encode(first));
                         }
-                        if p.project.is_none() {
-                            crate::engine::produced(&mut self.state, p.chat, vec![name.clone()]);
-                        }
+                        let list = names.join(", ");
+                        crate::engine::produced(&mut self.state, p.chat, names);
                         crate::engine::refresh_changes(&mut self.state, p.chat);
                         (
-                            format!(
-                                "Saved {name} ({} KB, made with {} in {} s). It shows up for the user by itself.",
-                                image.png.len() / 1024,
-                                image.checkpoint,
-                                image.seconds
-                            ),
+                            format!("Saved {list} using {} in {} s. The files appear as previews after your reply.", image.checkpoint, image.seconds),
                             format!("Made in {} s", image.seconds),
                             true,
                         )
@@ -1034,18 +1054,16 @@ impl Engine {
                 };
                 crate::engine::record_outcome(&mut self.state, p.id, &text, ok);
                 crate::engine::set_tool_note(&mut self.state, p.chat, summary.clone(), &note);
-                crate::engine::continue_with(
+                crate::engine::continue_tool(
                     &mut self.state,
-                    p.chat,
-                    &p.model,
-                    p.steps + 1,
+                    &p,
                     format!(
                         "Tool result {} · {summary}\n{text}{}",
                         p.call.id,
                         if images.is_empty() {
                             ""
                         } else {
-                            "\nThe image is attached."
+                            "\nA preview is attached."
                         }
                     ),
                     false,
@@ -1153,28 +1171,23 @@ impl Engine {
                 path,
                 result,
             } => {
-                let saved = result.and_then(|image| {
-                    std::fs::write(&path, &image.png)?;
-                    Ok(image)
-                });
+                let saved = result.and_then(|image| Ok((save_images(&path, &image.images, false)?, image)));
                 match saved {
-                    Ok(image) => {
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
+                    Ok((files, image)) => {
+                        let names: Vec<String> = files.iter().filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).collect();
+                        let body = names.iter().map(|name| format!("Saved file: {name}")).collect::<Vec<_>>().join("\n\n");
+                        let notice = if names.len() == 1 { format!("Image saved: {}", names[0]) } else { format!("{} images saved", names.len()) };
                         crate::engine::add_exchange(
                             &mut self.state,
                             chat,
                             backend,
                             command,
                             format!(
-                                "Made with {} in {} s.\n\nSaved file: {name}",
-                                image.checkpoint, image.seconds
+                                "Made with {} in {} s.\n\n{body}", image.checkpoint, image.seconds
                             ),
-                            vec![name.clone()],
+                            names,
                         );
-                        format!("Image saved: {name}")
+                        notice
                     }
                     Err(e) => {
                         let notice = format!("Image failed: {e:#}");
@@ -1293,4 +1306,17 @@ fn unused(path: &std::path::Path) -> PathBuf {
         .map(|n| path.with_file_name(format!("{stem}-{n}.{ext}")))
         .find(|p| !p.exists())
         .unwrap()
+}
+
+fn save_images(target: &std::path::Path, images: &[Vec<u8>], replace: bool) -> Result<Vec<PathBuf>> {
+    if let Some(dir) = target.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut paths = Vec::with_capacity(images.len());
+    for (index, image) in images.iter().enumerate() {
+        let path = if index == 0 { target.to_owned() } else { unused(target) };
+        crate::tools::write_generated(&path, image, index == 0 && replace)?;
+        paths.push(path);
+    }
+    Ok(paths)
 }

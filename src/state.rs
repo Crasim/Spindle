@@ -236,9 +236,6 @@ pub struct State {
     pub chat_id: u64,
     pub model: String,
     pub history: Vec<Message>,
-    /// Last mode chosen with the Chat/Cowork control for new conversations.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub new_chat_cowork: Option<bool>,
     pub queue: VecDeque<Task>,
     pub held: bool,
     pub serial: u64,
@@ -422,6 +419,14 @@ pub struct Preferences {
     pub sd_webui: String,
     #[serde(default)]
     pub image_backend: crate::comfy::Backend,
+    #[serde(default)]
+    pub image_aspect_ratio: String,
+    #[serde(default)]
+    pub image_transparent: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comfy_profiles: Vec<crate::comfy::Workflow>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comfy_profile: String,
     /// Speech server (OpenAI-compatible audio API); empty uses the Ollama server.
     #[serde(default)]
     pub speech_url: String,
@@ -496,6 +501,10 @@ impl Default for Preferences {
             ollama_on: ollama_default(),
             projects_dir: String::new(),
             comfy_checkpoint: String::new(),
+            image_aspect_ratio: String::new(),
+            image_transparent: false,
+            comfy_profiles: vec![],
+            comfy_profile: String::new(),
             comfy_workflow: String::new(),
             comfy_edit_workflow: String::new(),
             sd_webui: String::new(),
@@ -537,9 +546,9 @@ pub struct PromptVersion {
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ThreadInfo {
-    /// Existing saved threads used the work engine before the mode selector existed.
-    #[serde(default = "legacy_cowork")]
-    pub cowork: bool,
+    /// Stable identity of a conversation copied from another local application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_from: Option<String>,
     /// Prompt position → shared identifier for independently saved versions.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub prompt_versions: BTreeMap<usize, PromptVersion>,
@@ -669,10 +678,6 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
-fn legacy_cowork() -> bool {
-    true
-}
-
 impl ThreadInfo {
     pub fn select_model(&mut self, previous: &str, selected: &str) {
         if (self.started || !self.turns.is_empty()) && !previous.is_empty() && previous != selected {
@@ -688,10 +693,6 @@ impl ThreadInfo {
         } else {
             None
         }
-    }
-
-    pub fn message_mode(&self) -> Mode {
-        if self.cowork { Mode::Chat } else { Mode::Conversation }
     }
 
     pub fn label<'a>(&'a self, history: &'a [Message]) -> &'a str {
@@ -785,9 +786,7 @@ impl State {
         let next = if let Some(id) = id {
             self.chats.remove(&id).context("Unknown conversation")?
         } else {
-            let mut draft = Conversation::default();
-            draft.thread.cowork = self.new_chat_cowork.unwrap_or(self.thread.cowork);
-            draft
+            Conversation::default()
         };
         self.thread.model.clone_from(&self.model);
         let previous = Conversation {

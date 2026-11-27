@@ -547,6 +547,48 @@ fn artifact_card(ui: &mut egui::Ui, name: &str, bytes: Option<usize>, image: Opt
     reader::file_card(ui, name, bytes)
 }
 
+fn artifact_gallery(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    images: &[(&str, &egui::TextureHandle)],
+) -> usize {
+    let mut selected = ui.data(|data| data.get_temp::<usize>(id)).unwrap_or(0).min(images.len() - 1);
+    let wide = ui.available_width() >= 285.;
+    let thumb_width = 54.;
+    let preview_width = (ui.available_width() - if wide { thumb_width + 12. } else { 0. }).min(640.);
+    let (name, image) = images[selected];
+    let size = image.size_vec2();
+    let size = size * (preview_width / size.x).min(400. / size.y);
+    let preview = |ui: &mut egui::Ui| {
+        ui.add(egui::Image::new((image.id(), size)).alt_text(name));
+    };
+    let mut strip = |ui: &mut egui::Ui| {
+        for (index, (name, image)) in images.iter().enumerate() {
+            let size = image.size_vec2();
+            let fit = size * (48. / size.x).min(40. / size.y);
+            let button = egui::Button::image(egui::Image::new((image.id(), fit)).alt_text(*name))
+                .min_size(egui::vec2(thumb_width, 46.)).selected(index == selected);
+            if ui.add(button).on_hover_text(*name).clicked() {
+                selected = index;
+                ui.ctx().request_repaint();
+            }
+        }
+    };
+    if wide {
+        ui.horizontal_top(|ui| {
+            preview(ui);
+            egui::ScrollArea::vertical().id_salt(id).max_height(size.y.max(96.)).show(ui, |ui| strip(ui));
+        });
+    } else {
+        preview(ui);
+        egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
+            ui.horizontal(|ui| strip(ui));
+        });
+    }
+    ui.data_mut(|data| data.insert_temp(id, selected));
+    selected
+}
+
 impl TranscriptRows {
     fn observe(&mut self, before: &crate::state::State, after: &crate::state::State) {
         if before.chat_id != after.chat_id {
@@ -1282,43 +1324,6 @@ impl Desktop {
             serde_json::to_string(&prefs).unwrap()
         ));
     }
-    fn sidebar_mode(&mut self, ui: &mut egui::Ui, compact: bool) {
-        let cowork = self.view.state.thread.cowork;
-        let chosen = if compact {
-            let (icon, hint) = if cowork {
-                (Icon::Tool, "Cowork mode · switch to Chat")
-            } else {
-                (Icon::Chat, "Chat mode · switch to Cowork")
-            };
-            small(ui, icon, hint).then_some(!cowork)
-        } else {
-            let mut chosen = None;
-            egui::Frame::new().fill(raised()).stroke(egui::Stroke::new(1_f32, line()))
-                .corner_radius(9).inner_margin(3).show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 2.;
-                        for (label, value, hint) in [
-                            ("Chat", false, "Talk, ask questions, or make an image"),
-                            ("Cowork", true, "Work on files and tasks together"),
-                        ] {
-                            if ui.selectable_label(cowork == value, label).on_hover_text(hint).clicked() {
-                                chosen = Some(value);
-                            }
-                        }
-                    });
-                });
-            chosen
-        };
-        if let Some(mode) = chosen {
-            if mode != cowork {
-                self.send(if mode { "/mode cowork" } else { "/mode chat" });
-            }
-            self.page = Page::Chat;
-            self.drawer = false;
-            self.focus = true;
-        }
-    }
-
     pub(super) fn sidebar(&mut self, ctx: &egui::Context) {
         let drawer = narrow(ctx);
         let compact = self.view.state.preferences.compact_sidebar && !drawer;
@@ -1388,7 +1393,6 @@ impl Desktop {
                     self.toggle_sidebar();
                 }
                 ui.add_space(4.);
-                self.sidebar_mode(ui, compact);
                 // The full sidebar has + beside Chats; the narrow one keeps an icon here.
                 if compact
                     && control(
@@ -1640,7 +1644,6 @@ impl Desktop {
                     });
                 let mut submit = enter;
                 let mut steer = false;
-                let cowork = self.view.state.thread.cowork;
                 if !has_pastes && self.image_drafts.len() == 1
                     && ui.small_button("Edit image").on_hover_text("Compose an image edit").clicked()
                 {
@@ -1649,7 +1652,7 @@ impl Desktop {
                     }
                     self.focus = true;
                 }
-                let hint = if cowork { "Give Spindle a task…   / for commands" } else { "Message Spindle…   / for commands" };
+                let hint = "Message Spindle…   / for commands";
                 let composer = egui::Frame::new()
                     .fill(raised())
                     .stroke(egui::Stroke::new(1.0_f32, line()))
@@ -2151,7 +2154,12 @@ impl Desktop {
                         sizes.get(&f.path).copied().flatten()
                     };
                     let names: Vec<String> = files().map(|f|f.path.clone()).collect();
-                    let mut shown: Vec<String> = vec![];
+                    let gallery: Vec<_> = names.iter()
+                        .filter_map(|name| Some((name.as_str(), images.get(name)?.as_ref()?))).collect();
+                    let grouped = !user && gallery.len() > 1;
+                    let mut shown: Vec<String> = if grouped {
+                        gallery.iter().map(|(name, _)| (*name).into()).collect()
+                    } else { vec![] };
                     let mut chosen: Vec<(String, reader::FileAction)> = vec![];
                     let clicked=ui.push_id((state.chat_id,index),|ui| {
                         if self.message_editors.field(ui, state.chat_id, index, &message.content, &self.tx, &mut self.android_ime) { None }
@@ -2176,6 +2184,17 @@ impl Desktop {
                             }
                         }
                     }).inner;
+                    if grouped {
+                        let id = ui.make_persistent_id(("artifact-gallery", state.chat_id, index));
+                        let selected = artifact_gallery(ui, id, &gallery);
+                        let name = gallery[selected].0;
+                        let bytes = files().find(|f| f.path == name).and_then(&mut size_of);
+                        ui.push_id(id.with("file"), |ui| {
+                            if let Some(action) = reader::file_card(ui, name, bytes) {
+                                chosen.push((name.to_owned(), action));
+                            }
+                        });
+                    }
                     if let Some(turn)=turn.filter(|_|!user) {
                         ui.push_id(("reply-notes",index),|ui| if let Some(a)=notes::reply_notes(ui,turn,&state.memories) {note=Some(a);});
                         if let Some(applied)=&turn.applied {
@@ -2835,6 +2854,11 @@ impl eframe::App for Desktop {
                 self.reader_files_at = None;
             }
             self.observe_submission(&v);
+            if let Some(source) = &v.import_panel {
+                self.threads.open_import_request(source);
+                self.page = Page::Chat;
+                self.drawer = false;
+            }
             if let Some((chat, _)) = self.view.browser_pairing
                 && v.browser_pairing.map(|pair| pair.0) != Some(chat)
             {
@@ -3591,6 +3615,35 @@ mod transcript_tests {
         let texture_id = app.transcript.file_images["generated.png"].as_ref().unwrap().id();
         assert!(visible_text(&output, "https://example.com/guide").is_some());
         assert!(output.shapes.iter().any(|shape| shape.shape.texture_id() == texture_id));
+    }
+
+    #[test]
+    fn image_gallery_keeps_one_large_preview_and_switches_from_the_strip() {
+        use egui::{Event, Modifiers, PointerButton};
+        let ctx = egui::Context::default();
+        let make = |name: &str, color| ctx.load_texture(name, egui::ColorImage::new([180, 120], color), egui::TextureOptions::LINEAR);
+        let first = make("first", egui::Color32::RED);
+        let second = make("second", egui::Color32::GREEN);
+        let frame = |events| ctx.run(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720., 600.))),
+            events, ..Default::default()
+        }, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let id = ui.make_persistent_id("gallery");
+                artifact_gallery(ui, id, &[("first.png", &first), ("second.png", &second)]);
+            });
+        });
+        let initial = frame(vec![]);
+        let thumbnail = initial.shapes.iter().find(|shape| shape.shape.texture_id() == second.id()).unwrap();
+        let pos = thumbnail.shape.visual_bounding_rect().center();
+        for pressed in [true, false] {
+            frame(vec![Event::PointerMoved(pos), Event::PointerButton {
+                pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+            }]);
+        }
+        let next = frame(vec![]);
+        assert!(next.shapes.iter().any(|shape| shape.shape.texture_id() == second.id()
+            && shape.shape.visual_bounding_rect().width() > 200.));
     }
 
     #[test]

@@ -1993,11 +1993,11 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_mode_switch_keeps_the_draft_without_an_image_button() {
+    fn sidebar_has_no_mode_switch_and_keeps_the_draft() {
         let ctx = egui::Context::default();
         let cc = eframe::CreationContext::_new_kittest(ctx.clone());
         let dir = tempfile::tempdir().unwrap();
-        let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
         let (_views, rx) = std::sync::mpsc::channel();
         let (_stream, preview) = tokio::sync::watch::channel(String::new());
         let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
@@ -2006,16 +2006,9 @@ mod tests {
         run(&mut app, &ctx, vec![]);
         let labels = run(&mut app, &ctx, vec![]);
         assert!(!labels.contains_key("Make image"));
-        assert!(labels["Collapse sidebar"].y < labels["Cowork"].y);
-        assert!(labels["Cowork"].y < labels["Work queue    0"].y);
+        assert!(!labels.contains_key("Cowork"));
+        assert!(labels["Collapse sidebar"].y < labels["Work queue    0"].y);
         assert_eq!(app.draft, "a moonlit lake");
-        click(&mut app, &ctx, labels["Cowork"]);
-        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|s| s == "/mode cowork"));
-        app.view.state.thread.cowork = true;
-        let labels = run(&mut app, &ctx, vec![]);
-        assert!(!labels.contains_key("Make image"));
-        click(&mut app, &ctx, labels["Chat"]);
-        assert!(std::iter::from_fn(|| commands.try_recv().ok()).any(|s| s == "/mode chat"));
     }
 
     #[test]

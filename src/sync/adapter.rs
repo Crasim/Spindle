@@ -991,6 +991,9 @@ fn export_with(state: &State, sync: &mut SyncState, space: &mut Space) -> Result
             "dropped": dropped,
             "turns": turns,
         });
+        if let Some(origin) = &thread.imported_from {
+            value["imported_from"] = json!(origin);
+        }
         let mut versions: BTreeMap<String, crate::state::PromptVersion> = before.as_ref()
             .and_then(|v| serde_json::from_value(v["prompt_versions"].clone()).ok())
             .unwrap_or_default();
@@ -1443,7 +1446,7 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
             "main": view.main.iter().map(|t| &t.turn.h).collect::<Vec<_>>(),
             "branches": view.branches.iter().map(|b| (b.new_from, b.turns.iter()
                 .map(|t| &t.turn.h).collect::<Vec<_>>())).collect::<Vec<_>>(),
-            "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"], &v["prompt_versions"]],
+            "meta": [&v["title"], &v["pinned"], &v["archived"], &v["section"], &v["project"], &v["prompt_versions"], &v["imported_from"]],
         }));
         if sync.seen.get(&format!("chatview:{gid}")) == Some(&fp) {
             continue;
@@ -1493,6 +1496,9 @@ fn import_with(state: &mut State, sync: &mut SyncState, space: &Space) -> Result
         }
         if let Some(t) = v["title"].as_str() {
             thread.title = t.to_owned();
+        }
+        if let Some(origin) = v["imported_from"].as_str().filter(|id| id.len() <= 150) {
+            thread.imported_from = Some(origin.to_owned());
         }
         thread.pinned = v["pinned"].as_bool().unwrap_or(thread.pinned);
         thread.archived = v["archived"].as_bool().unwrap_or(thread.archived);

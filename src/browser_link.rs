@@ -1127,7 +1127,6 @@ mod tests {
         } else {
             "local Ollama"
         };
-        let cowork = std::env::var_os("SPINDLE_BROWSER_FIXTURE_COWORK").is_some();
         let guided = std::env::var_os("SPINDLE_BROWSER_FIXTURE_GUIDED").is_some();
         let profiles = std::env::var("SPINDLE_BROWSER_FIXTURE_GUIDED").as_deref() == Ok("profiles");
         let root = root.canonicalize()?;
@@ -1142,7 +1141,6 @@ mod tests {
                 model: engine_model,
                 ..State::default()
             };
-            state.thread.cowork = cowork;
             if let Some(base) = provider_endpoint {
                 let (id, _) = crate::providers::route(&state.model);
                 ensure!(
@@ -1235,7 +1233,7 @@ mod tests {
                         request.call.call.summary()
                     );
                     ensure!(
-                        request.chat_read_only != cowork,
+                        !request.chat_read_only,
                         "The read changed the conversation mode"
                     );
                     ensure!(

@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::{sync::mpsc as channel, task::JoinHandle};
 
-pub const HELP: &str = "/mode chat|cowork   /goal <objective>   /image <description>   /speak <text>   /sync [now | status | …]   /plan [show | revise <change> | accept <revision>]\n/model [model ID]   /swarm <brief> --worker role=model [--worker role=model]\n/queue [add <text> | remove <id> | steer <id>]   /steer <correction>   /cancel   /resume\n/read [--section N] <workspace file>   /add <workspace file>   /permissions   /approve   /deny\n/skills create <name> <brief>   /skills show <name>   /skills test <name> <example>\n/skills install <draft-name or local SKILL.md path>   /skills remove <name>   /<skill> <task>\n/council [review question]   /council roster   /council set MODEL MODEL\n/subagent MODEL <assignment>   /automation list   /defer YYYY-MM-DD HH:MM\n/fallback set MODEL [MODEL ...]   /fallback clear   /quota threshold PERCENT\n/compact [now | status | aggressive | normal | low | N% | inherit]\n/threads   /usage   /preview <workspace.html> (desktop)   /new   /open THREAD_ID   /status   /help   /exit";
+pub const HELP: &str = "/goal <objective>   /image <description>   /speak <text>   /sync [now | status | …]   /plan [show | revise <change> | accept <revision>]\n/model [model ID]   /swarm <brief> --worker role=model [--worker role=model]\n/queue [add <text> | remove <id> | steer <id>]   /steer <correction>   /cancel   /resume\n/read [--section N] <workspace file>   /add <workspace file>   /permissions   /approve   /deny\n/skills create <name> <brief>   /skills show <name>   /skills test <name> <example>\n/skills install <draft-name or local SKILL.md path>   /skills remove <name>   /<skill> <task>\n/council [review question]   /council roster   /council set MODEL MODEL\n/subagent MODEL <assignment>   /automation list   /defer YYYY-MM-DD HH:MM\n/fallback set MODEL [MODEL ...]   /fallback clear   /quota threshold PERCENT\n/compact [now | status | aggressive | normal | low | N% | inherit]\n/threads   /usage   /preview <workspace.html> (desktop)   /new   /open THREAD_ID   /status   /help   /exit";
 
 #[derive(Clone, Default)]
 pub struct View {
@@ -44,6 +44,7 @@ pub struct View {
     pub browser_fallbacks: Vec<(u64, String)>,
     pub web_region_prompt: Option<(u64, crate::location::WebRegionPrompt)>,
     pub composer_receipt: Option<(u64, bool)>,
+    pub import_panel: Option<String>,
 }
 
 pub struct Engine {
@@ -166,7 +167,6 @@ impl Engine {
                 let id = self.state.serial;
                 let mut conversation = crate::state::Conversation::default();
                 conversation.thread.project = project;
-                conversation.thread.cowork = true;
                 conversation.thread.model = model;
                 conversation.thread.started = true;
                 self.state.chats.insert(id, conversation);
@@ -196,7 +196,6 @@ impl Engine {
                         c.plan = None;
                         (&mut c.goal, &mut c.thread)
                     };
-                    thread.cowork = true;
                     thread.steps.clear();
                     thread.plan_changes.clear();
                     *goal = r.text.clone();
@@ -206,9 +205,7 @@ impl Engine {
                 } else {
                     r.text.clone()
                 };
-                let mode = if r.goal { Mode::Chat } else {
-                    self.state.thread_data(chat).context("No such chat")?.0.message_mode()
-                };
+                let mode = Mode::Chat;
                 self.state.serial += 1;
                 let id = self.state.serial;
                 if let Some(c) = self.state.chats.get_mut(&chat) {
@@ -354,7 +351,6 @@ impl Engine {
             self.state.thread.steps.clear();
             self.state.thread.goal_done = false;
             self.state.thread.goal_runs = 0;
-            self.state.thread.cowork = true;
             for task in self.state.queue.iter_mut().filter(|q| q.origin.unwrap_or(chat) == chat) {
                 if task.text == format!("Work toward this goal until it is done: {old}")
                     || task.text.starts_with(NUDGE) {
@@ -408,26 +404,12 @@ impl Engine {
     pub fn command(&mut self, line: &str, busy: bool) -> Result<String> {
         let (cmd, args) = split(line);
         if !cmd.starts_with('/') {
-            if !self.state.thread.cowork && self.state.attachment.is_none()
-                && let Some(prompt) = image_command(line)
-            {
-                return self.start_user_image(prompt);
-            }
-            return self.enqueue(line, self.state.thread.message_mode(), String::new());
+            return self.enqueue(line, Mode::Chat, String::new());
         }
         // Commands are case-insensitive: /Goal and /GOAL work like /goal.
         let lowered = cmd.to_lowercase();
         let cmd = lowered.as_str();
         match cmd {
-            "/mode" => {
-                self.state.thread.cowork = match args.trim() {
-                    "chat" => false,
-                    "cowork" => true,
-                    _ => bail!("Use /mode chat or /mode cowork"),
-                };
-                self.state.new_chat_cowork = Some(self.state.thread.cowork);
-                Ok(format!("{} mode for new messages", if self.state.thread.cowork { "Cowork" } else { "Chat" }))
-            }
             "/sync-unlock" => {
                 ensure!(self.state.sync.is_none(), "Project already paired");
                 let pass: String =
@@ -631,7 +613,7 @@ impl Engine {
                 } else {
                     p.prompt
                 };
-                self.enqueue(&prompt, self.state.thread.message_mode(), String::new())?;
+                self.enqueue(&prompt, Mode::Chat, String::new())?;
                 let task = self
                     .state
                     .queue
@@ -939,7 +921,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     let model = turn.model.clone();
                     let call = crate::tools::extract(turn.call.as_deref().unwrap()).1
                         .and_then(Result::ok).context("Could not restore the browser read")?;
-                    let read_only = !self.state.thread.cowork;
+                    let read_only = false;
                     route_call(&mut self.state, chat, &model, 0, Some(&self.root), Ok(call), read_only);
                     self.dispatch_ready(busy)?;
                     Ok("Continuing your browser request".into())
@@ -1439,6 +1421,16 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 self.state.switch_chat(None)?;
                 Ok("New conversation".into())
             }
+            "/import-chat-local" => {
+                let selected: Vec<crate::conversation_import::Selection> = serde_json::from_str(args)?;
+                let status = self.import_conversations(selected, true)?;
+                self.complete_import(&status, true);
+                Ok(status)
+            }
+            "/cancel-import" => {
+                self.complete_import("The user closed the import picker.", false);
+                Ok("Import closed".into())
+            }
             "/import-chat" | "/import-chat-android" => {
                 let path = serde_json::from_str::<PathBuf>(args).unwrap_or_else(|_| PathBuf::from(args));
                 let temporary = cmd == "/import-chat-android";
@@ -1459,20 +1451,15 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 } else {
                     path
                 };
-                let chats = crate::conversation_import::load(&path);
+                let result = self.import_conversations(vec![crate::conversation_import::Selection {
+                    path: path.clone(), title: String::new(), origin: String::new(), archived: false,
+                }], false);
                 if temporary {
                     let _ = std::fs::remove_file(&path);
                 }
-                let chats = chats?;
-                let count = chats.len();
-                let first = self.state.serial + 1;
-                for mut chat in chats {
-                    chat.thread.model.clone_from(&self.state.model);
-                    self.state.serial += 1;
-                    self.state.chats.insert(self.state.serial, chat);
-                }
-                self.state.switch_chat(Some(first))?;
-                Ok(format!("Imported {count} conversation{}", if count == 1 { "" } else { "s" }))
+                let status = result?;
+                self.complete_import(&status, true);
+                Ok(status)
             }
             // From the CLI or MCP (control.rs): "/ext TAG {json}". Works on any chat without
             // switching the one open in the window; the reply comes back as the notice
@@ -1519,7 +1506,6 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     .context("Choose an existing Spindle project")?;
                 self.state.switch_chat(None)?;
                 self.state.thread.project = Some(project.path);
-                self.state.thread.cowork = true;
                 Ok(format!("New conversation in {}", project.name))
             }
             "/open" => {
@@ -1663,7 +1649,6 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     self.state.goal.clear();
                     return Ok("Goal cleared".into());
                 }
-                self.state.thread.cowork = true;
                 self.state.goal = args.strip_prefix("replace ").unwrap_or(args).into();
                 self.state.plan = None;
                 self.state.thread.steps.clear();
@@ -1728,7 +1713,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
             "/queue" => {
                 let (action, arg) = split(args);
                 if action == "add" {
-                    return self.enqueue(arg, self.state.thread.message_mode(), String::new());
+                    return self.enqueue(arg, Mode::Chat, String::new());
                 }
                 ensure!(
                     matches!(action, "remove" | "steer"),
@@ -2122,6 +2107,8 @@ const TOOL_CALL_GUIDANCE: &str = "Call one tool, then wait. Use its native funct
 const WEB_RESEARCH_GUIDANCE: &str = "Use web_search for current prices, reviews, availability, and other changing facts. Verify details and cite sources with Markdown links.";
 const WEB_SEARCH_EXAMPLE: &str =
     r#"- Search public pages: {"name":"web_search","args":{"query":"public search terms"}}"#;
+const IMAGE_TOOL_EXAMPLES: &str = r#"- List image models and workflows: {"name":"image_models","args":{}}.
+- Generate or edit images with {"name":"image","args":{"prompt":"description"}}. Optional: path, model, workflow, parameters, source (saved image path or "attached"), aspect_ratio or width and height, transparent, count (1–4). Use image tools for illustrations or assets the task needs. Confirm actual files from the tool result."#;
 
 const WEB_ADDRESS_GUIDANCE: &str = "Find website addresses yourself. Use web_search to verify the current official domain and discover the exact page when a URL is missing. Use a live result or a link returned by a live page. Never invent an address or rely on one from memory, and do not ask the user to supply it. If a domain fails to resolve or its homepage is missing, use web_search to find the current official site. An HTTP 403 or a verification page means the site responded; avoid probing alternate domains to get past it. Choose a country-specific website only for the user's requested region or shared default market. A website's language, country domain, or redirect does not establish where the user is. If the market matters and is unknown, ask for the market only.";
 
@@ -2172,7 +2159,7 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
             model = w.model.clone();
             "You are an independent, read-only reviewer. Give feedback on the submitted material. Prioritize concrete issues, cite evidence, distinguish assumptions, and suggest corrections. Do not carry out the task or claim to edit anything.".into()
         }
-        Mode::Conversation => "Have a conversation with the user. Listen when they vent. If the request needs workspace tools, code execution, connected accounts or installed skills, explain that this chat is in Chat mode and ask them to select Cowork in the sidebar. Spindle accepts image requests and /image.".into(),
+        Mode::Conversation => "Have a conversation with the user. Listen when they vent. If the request needs workspace tools, code execution, connected accounts or installed skills, explain that this queued request uses limited tools. A new message can use the workspace tools. Spindle accepts image requests and /image.".into(),
         Mode::Chat => "Answer the user directly.".into(),
         Mode::Plan(_) => {
             "Draft a short plan: 3 to 7 numbered steps, one short action each, in order. Make the last step checking that the result works. Reply with only the numbered list.".into()
@@ -2230,6 +2217,10 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
         system.push_str(TOOL_ACCESS_GUIDANCE);
         system.push_str("\n");
         system.push_str(TOOL_CALL_GUIDANCE);
+        if crate::comfy::Settings::from(&state.preferences).ready() {
+            system.push_str("\n");
+            system.push_str(IMAGE_TOOL_EXAMPLES);
+        }
         if state.preferences.block_web {
             system.push_str("\n");
             system.push_str(WEB_ACCESS_BLOCKED);
@@ -2357,29 +2348,6 @@ fn request(state: &State, task: &Task) -> Result<(String, Vec<Message>)> {
 
 /// Only explicit image imperatives shortcut the conversation. References to images in
 /// ordinary conversation go to the model.
-fn image_command(text: &str) -> Option<&str> {
-    let text = text.trim();
-    let lower = text.to_ascii_lowercase();
-    let mut start = 0;
-    for prefix in ["can you ", "could you ", "would you "] {
-        if lower.starts_with(prefix) { start = prefix.len(); break; }
-    }
-    if lower[start..].starts_with("please ") { start += 7; }
-    let request = &lower[start..];
-    for verb in ["make ", "generate ", "create ", "draw ", "paint "] {
-        if let Some(rest) = request.strip_prefix(verb) {
-            let rest = rest.strip_prefix("me ").unwrap_or(rest);
-            for noun in ["an image of ", "a picture of ", "a drawing of ", "an illustration of ", "a photo of "] {
-                if let Some(subject) = rest.strip_prefix(noun) {
-                    let subject = text[text.len() - subject.len()..].trim();
-                    return (!subject.is_empty()).then_some(subject);
-                }
-            }
-        }
-    }
-    None
-}
-
 fn android_apk_request(text: &str) -> bool {
     let text = text.to_ascii_lowercase();
     text.split(|c: char| !c.is_ascii_alphanumeric()).any(|word| word == "apk" || word == "apks")
@@ -2486,6 +2454,9 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         }
     }
     tools.push(r#"- Load a relevant skill: {"name":"read_skill","args":{"name":"SKILL"}} or omit name to list skills. Tool permissions apply."#.into());
+    if mentions(&["import chat", "import conversation"]) || mentions(&["codex", "claude"]) && mentions(&["import", "migrate", "bring", "copy"]) {
+        tools.push(r#"- Open the local chat picker: {"name":"import_conversations","args":{"source":"codex"}}. Source is codex or claude. The user chooses which chats to copy."#.into());
+    }
     if format!("{request} {first_user}").to_ascii_lowercase().contains("html") {
         let html = if crate::html_preview::is_html(Path::new(&page)) { page.as_str() } else { "index.html" };
         tools.push(format!(r#"- Present saved HTML: {{"name":"preview_html","args":{{"path":"{html}"}}}}. Link its path in the final answer."#));
@@ -2533,12 +2504,10 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
             tools.push("- Transcription needs a speech-to-text model. Choose one in Settings › Models › Audio.".into());
         }
     }
-    if wants_image {
-        tools.push(if crate::comfy::Settings::from(&state.preferences).ready() {
-            r#"- Generate an image: {"name":"image","args":{"prompt":"what the picture shows","path":"picture.png"}}"#.into()
-        } else {
-            "- Image generation needs a server. Set one in Settings › Models › Image generation.".into()
-        });
+    if crate::comfy::Settings::from(&state.preferences).ready() {
+        tools.push(IMAGE_TOOL_EXAMPLES.into());
+    } else if wants_image {
+        tools.push("- Image generation needs a server. Set one in Settings › Models › Image generation.".into());
     }
     if (android || remote_here(WorkKind::Apk)) && (android_apk_request(request) || android_apk_request(&first_user)) {
         tools.push(r#"- Compile and sign a small Android app: {"name":"build_apk","args":{"package":"com.example.counter","activity":"com.example.counter.MainActivity","label":"Counter","sources":["MainActivity.java"]}}. Create the Java files first. This build profile uses plain Java 8 and programmatic Android UI. It supports multiple .java files, Android SDK APIs and no external dependencies. Each build requires approval."#.into());
@@ -3480,6 +3449,8 @@ fn route_resolved_call(
             | crate::tools::Call::WebOpen { .. }
             | crate::tools::Call::FindTools { .. }
             | crate::tools::Call::ReadSkill { .. }
+            | crate::tools::Call::ImageModels {}
+            | crate::tools::Call::ImportConversations { .. }
     );
     let browser_tab = matches!(env.call, crate::tools::Call::BrowserTab(_));
     let connector = matches!(env.call, crate::tools::Call::ConnectorRead { .. });
@@ -4072,7 +4043,26 @@ impl Engine {
                 }
                 continue;
             }
-            if matches!(p.call.call,crate::tools::Call::FindTools{..}|crate::tools::Call::WebSearch{..}|crate::tools::Call::WebOpen{..}|crate::tools::Call::BrowserTab(_)|crate::tools::Call::ConnectorRead{..}|crate::tools::Call::LoadTool{..}|crate::tools::Call::RunTool{..}) {
+            if let crate::tools::Call::ImportConversations { source } = &p.call.call {
+                let problem = if !matches!(source.as_str(), "codex" | "claude") {
+                    Some("Choose codex or claude as the import source.")
+                } else if !self.jobs.web_region_ui {
+                    Some("Open Spindle and run /import-chat to select the local conversations.")
+                } else if self.jobs.import_request.is_some() {
+                    Some("The import picker is already open.")
+                } else { None };
+                if let Some(problem) = problem {
+                    record_outcome(&mut self.state, p.id, problem, false);
+                    set_tool_note(&mut self.state, p.chat, summary, problem);
+                    continue_tool(&mut self.state, &p, format!("Tool result {} · {problem}", p.call.id), busy);
+                } else {
+                    set_tool_note(&mut self.state, p.chat, summary, "Waiting for your selection");
+                    self.jobs.import_panel = Some(source.clone());
+                    self.jobs.import_request = Some(p);
+                }
+                continue;
+            }
+            if matches!(p.call.call,crate::tools::Call::FindTools{..}|crate::tools::Call::WebSearch{..}|crate::tools::Call::WebOpen{..}|crate::tools::Call::BrowserTab(_)|crate::tools::Call::ConnectorRead{..}|crate::tools::Call::LoadTool{..}|crate::tools::Call::RunTool{..}|crate::tools::Call::ImageModels{}) {
                 self.start_catalog(p);
                 continue;
             }
@@ -4124,6 +4114,7 @@ impl Engine {
                 continue;
             }
             if matches!(p.call.call, crate::tools::Call::Image { .. }) {
+                let read_only = p.chat_read_only;
                 let (id, chat, model, steps, call_id) =
                     (p.id, p.chat, p.model.clone(), p.steps, p.call.id.clone());
                 set_tool_note(&mut self.state, chat, summary.clone(), "Making the image");
@@ -4131,11 +4122,12 @@ impl Engine {
                     let text = format!("Error: {e:#}");
                     record_outcome(&mut self.state, id, &text, false);
                     set_tool_note(&mut self.state, chat, summary.clone(), "Couldn't make it");
-                    continue_with(
+                    continue_tool_result(
                         &mut self.state,
                         chat,
                         &model,
-                        steps + 1,
+                        steps,
+                        read_only,
                         format!("Tool result {call_id} · {summary}\n{text}"),
                         busy,
                     );
@@ -4499,7 +4491,8 @@ fn finish_turn(
         && !answer.starts_with(crate::generation::LOOPED)
         && let (clean, Some(Ok(browser_call))) = crate::tools::extract(&answer)
         && ((!task.tool_result && matches!(browser_call.call, crate::tools::Call::BrowserTab(crate::browser_link::Action::Read { .. })))
-            || matches!(browser_call.call, crate::tools::Call::WebOpen { .. } | crate::tools::Call::WebSearch { .. })
+            || matches!(browser_call.call, crate::tools::Call::WebOpen { .. } | crate::tools::Call::WebSearch { .. }
+                | crate::tools::Call::Image { .. } | crate::tools::Call::ImageModels {})
             || (builtin && matches!(browser_call.call, crate::tools::Call::PreviewHtml { .. })))
     {
         if builtin || !matches!(browser_call.call, crate::tools::Call::BrowserTab(_)) || can_request_browser(state) {
@@ -4627,7 +4620,7 @@ fn finish_turn(
         }
     }
     // A finished reply shows the files tools made in this chat's folder along the way.
-    if !matches!(task.mode, Mode::Conversation) && call.is_none() && !thread.produced.is_empty() {
+    if call.is_none() && !thread.produced.is_empty() {
         for name in std::mem::take(&mut thread.produced) {
             if name == "_spindle_run.py" {
                 continue;
@@ -5238,7 +5231,6 @@ mod tests {
         Engine {
             state: State {
                 model: "one".into(),
-                thread: crate::state::ThreadInfo { cowork: true, ..Default::default() },
                 ..State::default()
             },
             models: vec!["one".into(), "two".into()],
@@ -5355,8 +5347,7 @@ mod tests {
 
         let prompt = "What orchard rollout code did we agree on in the previous chat?";
         for mode in [Mode::Conversation, Mode::Chat] {
-            e.state.thread.cowork = matches!(mode, Mode::Chat);
-            e.command(prompt, false).unwrap();
+            e.enqueue(prompt, mode, String::new()).unwrap();
             let task = e.state.queue.pop_front().unwrap();
             let (_, messages) = request(&e.state, &task).unwrap();
             assert!(messages[0].content.contains("quoted evidence"));
@@ -5377,13 +5368,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let mut e = fixture(tmp.path());
         e.state.goal = "Finish the old project".into();
-        e.command("/mode chat", false).unwrap();
-        e.command("I just want to vent.", false).unwrap();
+        e.enqueue("I just want to vent.", Mode::Conversation, String::new()).unwrap();
         let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
         assert!(messages[0].content.contains("Listen when they vent"));
         assert!(!messages[1].content.contains(&e.state.goal));
         // A queued turn keeps its behavior if the next message will use another mode.
-        e.command("/mode cowork", false).unwrap();
         let answer = "Let me read notes.md.\n\n```spindle-tool\n{\"name\":\"create\",\"args\":{\"path\":\"notes.md\",\"content\":\"hello\"}}\n```";
         finish_turn(&mut e.state, answer.into(), Turn::default(), Some(tmp.path())).unwrap();
         assert_eq!(e.state.history.last().unwrap().content, answer);
@@ -5399,8 +5388,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut e = fixture(root.path());
         e.state.preferences.browser_mode = crate::browser_link::Mode::BlockAll;
-        e.command("/mode chat", false).unwrap();
-        e.command("Read my shopping cart", false).unwrap();
+        e.enqueue("Read my shopping cart", Mode::Conversation, String::new()).unwrap();
         let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
         assert!(messages[0].content.contains(BROWSER_LINK_BLOCKED));
         assert!(!messages[0].content.contains(BROWSER_TOOL_EXAMPLE));
@@ -5409,7 +5397,6 @@ mod tests {
         assert!(e.state.browser_reads.is_empty());
 
         e.state.preferences.block_web = true;
-        e.command("/mode cowork", false).unwrap();
         e.command("Search the web for hiking routes", false).unwrap();
         let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
         assert!(messages[0].content.contains(WEB_ACCESS_BLOCKED));
@@ -5483,8 +5470,7 @@ mod tests {
     fn chat_can_request_and_deny_access_to_an_unpaired_tab() {
         let root = tempfile::tempdir().unwrap();
         let mut e = fixture(root.path());
-        e.command("/mode chat", false).unwrap();
-        e.command("Can you make a list of items in my Amazon cart?", false).unwrap();
+        e.enqueue("Can you make a list of items in my Amazon cart?", Mode::Conversation, String::new()).unwrap();
         let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
         assert!(messages[0].content.contains("connection and access request in the chat"));
         assert!(messages[0].content.contains(BROWSER_TOOL_EXAMPLE));
@@ -5504,10 +5490,9 @@ mod tests {
     #[test]
     fn builtin_browser_uses_web_open_even_when_the_model_asks_for_browser_link() {
         let root = tempfile::tempdir().unwrap();
-        for mode in ["/mode chat", "/mode cowork"] {
+        for mode in [Mode::Conversation, Mode::Chat] {
             let mut e = fixture(root.path());
-            e.command(mode, false).unwrap();
-            e.command("Open https://example.com/ in the built-in browser.", false).unwrap();
+            e.enqueue("Open https://example.com/ in the built-in browser.", mode, String::new()).unwrap();
             let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
             assert!(messages[0].content.contains("Browser panel"));
             assert!(messages[0].content.contains(WEB_ADDRESS_GUIDANCE));
@@ -5554,10 +5539,9 @@ mod tests {
     #[test]
     fn regional_web_requests_receive_only_the_country_the_user_shared() {
         let root = tempfile::tempdir().unwrap();
-        for mode in ["/mode chat", "/mode cowork"] {
+        for mode in [Mode::Conversation, Mode::Chat] {
             let mut e = fixture(root.path());
-            e.command(mode, false).unwrap();
-            e.command("Use the built-in browser to find eBay listings for an RX 6800 XT.", false).unwrap();
+            e.enqueue("Use the built-in browser to find eBay listings for an RX 6800 XT.", mode, String::new()).unwrap();
             let prompt = |e: &Engine| request(&e.state, &e.state.queue[0]).unwrap().1[0].content.clone();
             assert!(!prompt(&e).contains("The user has shared country code"));
             let mut prefs = e.state.preferences.clone();
@@ -5631,8 +5615,7 @@ mod tests {
     fn embedded_browser_shares_only_the_requested_page_and_resumes_the_chat() {
         let root = tempfile::tempdir().unwrap();
         let mut e = fixture(root.path());
-        e.command("/mode chat", false).unwrap();
-        e.command("Open https://example.com/search?q=fixture in the built-in browser", false).unwrap();
+        e.enqueue("Open https://example.com/search?q=fixture in the built-in browser", Mode::Conversation, String::new()).unwrap();
         finish_turn(&mut e.state, BROWSER_TOOL_EXAMPLE.into(), Turn::default(), Some(root.path())).unwrap();
         let pending = e.state.requests.remove(0);
         let id = pending.id;
@@ -5657,8 +5640,7 @@ mod tests {
     fn a_restricted_public_read_offers_the_same_page_through_browser_link() {
         let root = tempfile::tempdir().unwrap();
         let mut e = fixture(root.path());
-        e.command("/mode chat", false).unwrap();
-        e.command("Open https://example.com/search?q=fixture in the built-in browser", false).unwrap();
+        e.enqueue("Open https://example.com/search?q=fixture in the built-in browser", Mode::Conversation, String::new()).unwrap();
         finish_turn(&mut e.state, BROWSER_TOOL_EXAMPLE.into(), Turn::default(), Some(root.path())).unwrap();
         let pending = e.state.requests.remove(0);
         let retry = pending.id;
@@ -5714,8 +5696,7 @@ mod tests {
     fn browser_request_uses_the_named_site_on_retry_and_rejects_stale_consent() {
         let root = tempfile::tempdir().unwrap();
         let mut e = fixture(root.path());
-        e.command("/mode chat", false).unwrap();
-        e.command("Can you convert my Amazon card into a csv with links from the cart?", false).unwrap();
+        e.enqueue("Can you convert my Amazon card into a csv with links from the cart?", Mode::Conversation, String::new()).unwrap();
         finish_turn(&mut e.state, BROWSER_TOOL_EXAMPLE.into(), Turn::default(), Some(root.path())).unwrap();
         let chat = e.state.chat_id;
         let old = e.state.browser_reads[&chat].id;
@@ -5754,19 +5735,6 @@ mod tests {
         assert!(next.tool_result && matches!(next.mode, Mode::Chat));
         assert!(next.text.contains(definition));
         assert!(e.state.actions.last().unwrap().ok);
-    }
-
-    #[test]
-    fn chat_mode_persists_and_old_threads_keep_cowork() {
-        use crate::state::ThreadInfo;
-        let fresh = ThreadInfo::default();
-        assert!(!fresh.cowork);
-        let mut saved = serde_json::to_value(fresh).unwrap();
-        assert!(!serde_json::from_value::<ThreadInfo>(saved.clone()).unwrap().cowork);
-        saved.as_object_mut().unwrap().remove("cowork");
-        assert!(serde_json::from_value::<ThreadInfo>(saved).unwrap().cowork);
-        assert_eq!(image_command("Could you please make me a picture of a café"), Some("a café"));
-        assert_eq!(image_command("I wanted to talk about a picture of a café"), None);
     }
 
     #[test]
@@ -7018,27 +6986,57 @@ mod tests {
     }
 
     #[test]
-    fn new_chats_remember_the_explicit_workflow() {
+    fn work_tools_are_available_in_new_and_legacy_chats() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut e = fixture(tmp.path());
-        e.command("/mode cowork", false).unwrap();
-        e.command("Cowork thread", false).unwrap();
-        finish(&mut e.state, "Done".into()).unwrap();
-        let cowork = e.state.chat_id;
-        e.command("/new", false).unwrap();
-        assert!(e.state.thread.cowork);
-        e.command("/mode chat", false).unwrap();
-        e.command(&format!("/open {cowork}"), false).unwrap();
-        assert!(e.state.thread.cowork);
-        e.command("/new", false).unwrap();
-        assert!(!e.state.thread.cowork);
+        let mut engine = fixture(tmp.path());
+        let mut legacy = serde_json::to_value(&engine.state.thread).unwrap();
+        legacy["cowork"] = serde_json::json!(false);
+        engine.state.thread = serde_json::from_value(legacy).unwrap();
+        engine.command("Work in this conversation", false).unwrap();
+        assert!(matches!(engine.state.queue[0].mode, Mode::Chat));
+        engine.command("/new", false).unwrap();
+        engine.command("Work in a new conversation", false).unwrap();
+        assert!(matches!(engine.state.queue[1].mode, Mode::Chat));
+    }
+
+    #[test]
+    fn import_tool_opens_a_picker_and_waits_for_the_user() {
+        let root = tempfile::tempdir().unwrap();
+        let mut engine = fixture(root.path());
+        engine.jobs.web_region_ui = true;
+        engine.command("Import my Codex chats", false).unwrap();
+        let (_, messages) = request(&engine.state, &engine.state.queue[0]).unwrap();
+        assert!(messages[0].content.contains("\"name\":\"import_conversations\""));
+        finish_turn(&mut engine.state,
+            r#"{"name":"import_conversations","args":{"source":"codex"}}"#.into(),
+            Default::default(), Some(root.path())).unwrap();
+        engine.dispatch_ready(false).unwrap();
+        assert_eq!(engine.jobs.import_panel.as_deref(), Some("codex"));
+        assert!(engine.jobs.import_request.is_some() && engine.state.chats.is_empty());
+        assert!(engine.state.queue.is_empty());
+        engine.command("/cancel-import", false).unwrap();
+        assert!(engine.jobs.import_request.is_none());
+        assert!(engine.state.queue[0].text.contains("closed the import picker"));
+    }
+
+    #[test]
+    fn image_tool_accepts_named_workflow_and_transparent_batch_options() {
+        let (_, call) = crate::tools::extract(r#"{"name":"image","args":{"prompt":"test","model":"flux3","workflow":"Example","aspect_ratio":"16:9","transparent":true,"count":2,"parameters":{"steps":12}}}"#);
+        let crate::tools::Call::Image { options, .. } = call.unwrap().unwrap().call else { panic!("Expected image tool") };
+        assert_eq!(options.model.as_deref(), Some("flux3"));
+        assert_eq!(options.workflow.as_deref(), Some("Example"));
+        assert_eq!(options.dimensions("").unwrap(), (1024, 576));
+        assert_eq!(options.transparent, Some(true));
+        assert_eq!(options.count, Some(2));
+        assert_eq!(options.parameters["steps"], 12);
+        assert!(matches!(crate::tools::extract(r#"{"name":"image_models","args":{}}"#).1.unwrap().unwrap().call,
+            crate::tools::Call::ImageModels {}));
     }
 
     #[test]
     fn cowork_executes_a_bare_tool_call_with_trailing_model_text() {
         let tmp = tempfile::tempdir().unwrap();
         let mut e = fixture(tmp.path());
-        e.command("/mode cowork", false).unwrap();
         e.command("Create main.rs", false).unwrap();
         finish_turn(
             &mut e.state,
@@ -7066,8 +7064,8 @@ mod tests {
         for cowork in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let mut e = fixture(tmp.path());
-            e.state.thread.cowork = cowork;
-            e.command("What is the price of well reviewed flocked white Christmas trees?", false).unwrap();
+            let mode = if cowork { Mode::Chat } else { Mode::Conversation };
+            e.enqueue("What is the price of well reviewed flocked white Christmas trees?", mode, String::new()).unwrap();
             let (_, messages) = request(&e.state, &e.state.queue[0]).unwrap();
             assert!(messages[0].content.contains(WEB_SEARCH_EXAMPLE));
             let luna = r#"I'll look up current options.{"query":"flocked white trees"},{"query":"pre-lit trees"}]} tool?{"name":"web_search","args":{"query":"flocked white pre-lit trees"}}_tool_call{"name":"web_search","args":{"query":"another search"}}to=web_search? Unverified price: $200."#;
@@ -8041,6 +8039,7 @@ impl Engine {
                         .map(|r| (r.id, r.address.clone())).collect(),
                     web_region_prompt,
                     composer_receipt: composer_receipt.take(),
+                    import_panel: self.jobs.import_panel.take(),
                 })
                 .is_err()
             {

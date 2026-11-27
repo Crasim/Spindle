@@ -13,7 +13,105 @@ pub(super) struct Threads {
     collapsed: BTreeSet<std::path::PathBuf>,
     projects_hidden: bool,
     pub(super) importing: bool,
+    asked_to_import: bool,
     import_path: String,
+    #[cfg(not(target_os = "android"))]
+    local_import: LocalImport,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Default)]
+struct LocalImport {
+    pending: Option<std::sync::mpsc::Receiver<Vec<crate::conversation_import::LocalSession>>>,
+    sessions: Vec<crate::conversation_import::LocalSession>,
+    source: usize,
+    scanned: bool,
+    filter: String,
+    selected: BTreeSet<String>,
+}
+
+#[cfg(not(target_os = "android"))]
+impl LocalImport {
+    fn start(&mut self) {
+        self.selected.clear();
+        self.sessions.clear();
+        self.scanned = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending = Some(rx);
+        let source = if self.source == 0 {
+            crate::conversation_import::Source::Codex
+        } else {
+            crate::conversation_import::Source::ClaudeCode
+        };
+        std::thread::spawn(move || { let _ = tx.send(source.discover()); });
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui, state: &crate::state::State) -> Option<String> {
+        let mut refresh = !self.scanned;
+        ui.horizontal_wrapped(|ui| {
+            refresh |= ui.selectable_value(&mut self.source, 0, "Codex").changed();
+            refresh |= ui.selectable_value(&mut self.source, 1, "Claude Code").changed();
+            refresh |= ui.button("Rescan").clicked();
+        });
+        if refresh {
+            self.start();
+        }
+        if let Some(pending) = &self.pending {
+            match pending.try_recv() {
+                Ok(sessions) => {
+                    self.sessions = sessions;
+                    self.pending = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ui.spinner();
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                    return None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.pending = None,
+            }
+        }
+        if self.sessions.is_empty() {
+            ui.weak("No local sessions found. For a Claude account export, use Choose file.");
+            return None;
+        }
+        let imported: BTreeSet<&str> = std::iter::once(&state.thread)
+            .chain(state.chats.values().map(|chat| &chat.thread))
+            .filter_map(|thread| thread.imported_from.as_deref()).collect();
+        ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Find a local conversation"));
+        let filter = self.filter.to_lowercase();
+        let matches = self.sessions.iter().filter(|s| s.title.to_lowercase().contains(filter.trim()));
+        ui.horizontal_wrapped(|ui| {
+            if ui.small_button("Select matches").clicked() {
+                self.selected.extend(matches.clone().filter(|s| !imported.contains(s.origin.as_str()))
+                    .map(|s| s.origin.clone()));
+            }
+            if ui.small_button("Clear selection").clicked() {
+                self.selected.clear();
+            }
+        });
+        egui::ScrollArea::vertical().id_salt("local-import-results").max_height(290.).show(ui, |ui| {
+            for session in matches {
+                ui.push_id(&session.origin, |ui| {
+                    let already = imported.contains(session.origin.as_str());
+                    let mut checked = already || self.selected.contains(&session.origin);
+                    let day: chrono::DateTime<chrono::Local> = session.modified.into();
+                    let text = format!("{} · {}{}", session.title, day.format("%b %d, %Y"),
+                        if already { " · Imported" } else if session.archived { " · Archived" } else { "" });
+                    if ui.add_enabled(!already, egui::Checkbox::new(&mut checked, text)).changed() {
+                        if checked { self.selected.insert(session.origin.clone()); }
+                        else { self.selected.remove(&session.origin); }
+                    }
+                });
+            }
+        });
+        let count = self.selected.len();
+        if ui.add_enabled(count > 0, egui::Button::new(format!("Import selected ({count})"))).clicked() {
+            let selected = self.sessions.iter().filter(|s| self.selected.contains(&s.origin))
+                .map(crate::conversation_import::Selection::from).collect::<Vec<_>>();
+            return Some(format!("/import-chat-local {}", serde_json::json!(selected)));
+        }
+        None
+    }
 }
 
 enum Entry<R> {
@@ -213,6 +311,18 @@ impl Editor {
     }
 }
 impl Threads {
+    pub(super) fn open_import_request(&mut self, source: &str) {
+        self.importing = true;
+        self.asked_to_import = true;
+        #[cfg(not(target_os = "android"))]
+        {
+            self.local_import.source = usize::from(source == "claude");
+            self.local_import.scanned = false;
+        }
+        #[cfg(target_os = "android")]
+        let _ = source;
+    }
+
     pub(super) fn has_editor(&self) -> bool {
         self.reader.is_some() || !self.editors.is_empty()
     }
@@ -221,7 +331,10 @@ impl Threads {
     pub fn observe(&mut self, v: &View) {
         if v.notice.starts_with("Imported ") && v.notice.contains("conversation") {
             self.importing = false;
+            self.asked_to_import = false;
             self.import_path.clear();
+            #[cfg(not(target_os = "android"))]
+            self.local_import.selected.clear();
         }
         self.editors.retain(|id, e| {
             if v.state.thread_data(*id).is_none() {
@@ -1030,10 +1143,17 @@ impl Desktop {
     pub(super) fn conversation_import_panel(&mut self, ui: &mut egui::Ui) {
         let mut open = self.threads.importing;
         #[cfg(not(target_os = "android"))]
+        let mut command = None;
+        #[cfg(not(target_os = "android"))]
         let mut selected: Option<std::path::PathBuf> = None;
         super::detail_panel(ui, "Import conversations", "Back", &mut open, |ui| {
-            ui.label("Choose a Codex session (.jsonl), Claude Code session (.jsonl), or Claude data export (.json or .zip).");
-            ui.weak("Imports prompts and replies as new chats. Attachments and tool activity are skipped.");
+            #[cfg(not(target_os = "android"))]
+            {
+                ui.weak("Select local chats to copy into Spindle.");
+                command = self.threads.local_import.show(ui, &self.view.state);
+                ui.separator();
+            }
+            ui.weak("Import from a session file or a Claude export (.jsonl, .json, .zip).");
             ui.add_space(8.);
             #[cfg(windows)]
             if ui.button("Choose file…").clicked() {
@@ -1061,8 +1181,14 @@ impl Desktop {
             }
         });
         self.threads.importing = open;
+        if !open && std::mem::take(&mut self.threads.asked_to_import) {
+            self.send("/cancel-import");
+        }
         #[cfg(not(target_os = "android"))]
-        if let Some(path) = selected {
+        if let Some(command) = command {
+            self.notice = "Importing selected conversations…".into();
+            self.send(command);
+        } else if let Some(path) = selected {
             self.send(format!("/import-chat {}", serde_json::json!(path)));
         }
     }

@@ -1052,9 +1052,8 @@ impl Desktop {
         ui.add_space(10.);
         match tab {
             IntegrationTab::Plugins => {
-                ui.label("External tools extend what Spindle can do from Cowork.");
+                ui.label("External tools extend what Spindle can do.");
                 if ui.button("Find an external tool").clicked() {
-                    self.send("/mode cowork");
                     self.compose("Find an external tool for ");
                 }
                 ui.add_space(10.);

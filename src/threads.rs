@@ -267,7 +267,7 @@ impl Engine {
                 let attachment = self.state.attachment.take();
                 let pending = self.state.pending.take();
                 self.state.switch_chat(Some(branch))?;
-                if let Err(error) = self.enqueue(&replacement, self.state.thread.message_mode(), String::new()) {
+                if let Err(error) = self.enqueue(&replacement, crate::state::Mode::Chat, String::new()) {
                     self.state.switch_chat(Some(id))?;
                     self.state.chats.remove(&branch);
                     self.state.attachment = attachment;
@@ -476,6 +476,7 @@ fn make_branch(c: &mut Conversation) {
     c.thread.started = true;
     c.thread.pinned = false;
     c.thread.archived = false;
+    c.thread.imported_from = None;
     c.thread.prompt_versions.clear();
     // A scratch branch may get a different artifact directory.
     for turn in c.thread.turns.values_mut() {

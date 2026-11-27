@@ -5,6 +5,7 @@
 ## Working in the desktop app
 
 - Start a conversation, select a model, and type a message. Enter sends it and Shift+Enter inserts a line break. Responses appear as Ollama generates them. Recent chats reopen from the sidebar.
+- Every chat can use Spindle's workspace and image tools. Tool permissions still apply.
 - Choose **Draft a plan** or enter `/plan <task>`. Use `/plan revise <change>` and `/plan accept <revision>` to work from a specific draft. `/goal <objective>` sets a continuing objective for the chat.
 - While a response is running, **Queue** adds a follow-up and **Steer** applies a correction to the active request. **Stop** cancels inference and holds remaining work. The Work queue lets you remove or promote a waiting message. After an interrupted session, **Resume** releases the saved queue.
 - **Ask two models** lets you choose each worker's role and model. Workers run sequentially and the coordinator synthesizes their findings. From any chat, use `/swarm Check boundary conditions --worker reviewer=qwen3.5:9b` for one worker or append a second `--worker role=model`. Use `/steer --worker reviewer <correction>` for one role.
@@ -19,9 +20,13 @@ New conversations use the last **Chat** or **Cowork** mode you selected. Click a
 
 Use the pencil beside one of your prompts to edit it. **Send** starts a new branch with the earlier context and keeps the original conversation. Use the arrows beside the prompt to switch between versions.
 
-Use **Import conversations** beside **Chats**, or `/import-chat`. Choose a Codex session JSONL from `.codex/sessions`, a Claude Code session JSONL from `.claude/projects`, or a Claude account export ZIP or its `conversations.json`. Spindle imports the message text into new chats.
+Use **Import conversations** beside **Chats**, or `/import-chat`. On desktop, select **Codex** or **Claude Code** to browse local sessions and select chats to copy. The file picker also accepts session JSONL files and the ZIP or `conversations.json` from a Claude account export. Spindle copies the visible prompts and replies. It recognizes sessions it has imported before.
 
-Generated PNG and JPEG files preview in the conversation. Paste a URL or write a Markdown link to add a clickable link to a message. Use the built-in **Spindle** skill for guidance on tools, search results, and generated files.
+Generated PNG and JPEG files preview in the conversation. For several images, select a thumbnail to change the main preview. Paste a URL or write a Markdown link to add a clickable link to a message.
+
+In **Settings → Models → Image generation**, refresh ComfyUI to discover checkpoints and separate diffusion models. The built-in workflows cover SDXL and supported FLUX models. Use **Add workflow** to register a ComfyUI API graph for other nodes. Give it a name and optionally set defaults for named inputs such as `{{steps}}`. The model can use `image_models` to list available choices, then select the model, workflow, and options when it calls `image`.
+
+For direct requests, use `/image --aspect 16:9 --count 2 your prompt`. Set `--size 1280x720` for pixel dimensions, `--transparent` for an alpha PNG, or `--workflow "Workflow name"` to use a registered graph. Built-in alpha output uses a background-removal model installed on ComfyUI. Custom workflows can produce their own alpha output.
 
 Click **…** beside any thread, or right-click it, to expand its options in the sidebar. You can rename, pin, mark unread, move to a project, branch, read, copy, archive, or delete a conversation. **Conversation settings** opens a panel for its title, next model, section, project, and compaction. **Back** or **Close** returns you to what you were viewing. **Branch** starts an independent conversation with the same history. Archived threads are available through **Archive** in the sidebar. Moving a chat changes where its new files are saved. Files already generated stay where they are.
 

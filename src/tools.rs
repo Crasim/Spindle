@@ -152,7 +152,17 @@ pub enum Call {
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default)]
+        options: crate::comfy::Options,
     },
+    /// List models and the configured workflows for the image server.
+    #[serde(rename = "image_models")]
+    ImageModels {},
+    /// Open the local conversation picker for the user to choose what to copy.
+    #[serde(rename = "import_conversations")]
+    ImportConversations { source: String },
 }
 
 impl Call {
@@ -177,6 +187,8 @@ impl Call {
             Call::Browser { .. } => "browser",
             Call::PreviewHtml { .. } => "preview_html",
             Call::Image { .. } => "image",
+            Call::ImageModels {} => "image_models",
+            Call::ImportConversations { .. } => "import_conversations",
             Call::Speak { .. } => "speak",
             Call::Transcribe { .. } => "transcribe",
         }
@@ -195,7 +207,7 @@ impl Call {
             Call::Image { path, .. } => path.as_deref().unwrap_or("image.png"),
             Call::Speak { path, .. } => path.as_deref().unwrap_or("speech.wav"),
             Call::Transcribe { path } => path,
-            Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}|Call::Apply {} | Call::Setup {} | Call::Install { .. } => ".",
+            Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}|Call::Apply {} | Call::Setup {} | Call::Install { .. } | Call::ImageModels {} | Call::ImportConversations { .. } => ".",
         }
     }
 
@@ -223,7 +235,7 @@ impl Call {
                     | Call::BuildApk { .. }
                     | Call::Install { .. }
                     | Call::Browser { .. }
-                    | Call::Image { .. }
+                    | Call::Image { .. } | Call::ImageModels {}
                     | Call::Speak { .. }
                     | Call::Transcribe { .. }
             )
@@ -273,6 +285,8 @@ impl Call {
             Call::Browser { .. } => format!("Check {p} in a browser"),
             Call::PreviewHtml { .. } => format!("Present HTML preview of {p}"),
             Call::Image { prompt, .. } => format!("Make {p}: {}", short(prompt, 60)),
+            Call::ImageModels {} => "List image models and workflows".into(),
+            Call::ImportConversations { .. } => "Import conversations".into(),
             Call::Speak { text, .. } => format!("Say into {p}: {}", short(text, 60)),
             Call::Transcribe { .. } => format!("Transcribe {p}"),
         }
@@ -573,10 +587,21 @@ pub fn definitions() -> serde_json::Value {
         ),
         f(
             "image",
-            "Make an image with the user's image generator and save it as a .png in the working folder.",
-            serde_json::json!({"prompt": s("What the image shows, in plain words"), "path": s("File name, e.g. logo.png")}),
+            "Generate or edit images using the user's image server. Use image_models for available models and workflows.",
+            serde_json::json!({
+                "prompt": s("What each image shows"), "path": s("PNG output filename"),
+                "source": s("Optional existing workspace image path for editing"),
+                "model": s("Exact model from image_models"), "workflow": s("Registered name or builtin"),
+                "parameters":{"type":"object","description":"Named workflow options from image_models"},
+                "aspect_ratio":{"type":"string","enum":crate::comfy::ASPECT_RATIOS},
+                "width":{"type":"integer"},"height":{"type":"integer"},"count":{"type":"integer","minimum":1,"maximum":4},
+                "transparent":{"type":"boolean"}
+            }),
             &["prompt"]
         ),
+        f("image_models","List available image models and registered generation and edit workflows.",serde_json::json!({}), &[]),
+        f("import_conversations","Open a local conversation picker. The user selects which conversations to copy into Spindle.",
+            serde_json::json!({"source":{"type":"string","enum":["codex","claude"]}}), &["source"]),
         f(
             "speak",
             "Read text aloud into a .wav file in the working folder.",
@@ -1026,6 +1051,8 @@ fn normalize(value: &mut serde_json::Value) {
             "image" => {
                 rename(&["file", "filename", "file_path", "name", "output"], "path");
                 rename(&["description", "text", "caption", "query"], "prompt");
+                rename(&["ratio", "aspect"], "aspect_ratio");
+                rename(&["checkpoint"], "model");
                 if !args.contains_key("path")
                     && let Some(p) = args.get("prompt").and_then(|p| p.as_str())
                 {
@@ -1038,6 +1065,15 @@ fn normalize(value: &mut serde_json::Value) {
                         args.insert("path".into(), serde_json::json!(format!("{stem}.png")));
                     }
                 }
+                let mut options = args.remove("options").unwrap_or_else(|| serde_json::json!({}));
+                if let Some(options) = options.as_object_mut() {
+                    for key in ["aspect_ratio", "width", "height", "count", "transparent", "model", "workflow", "parameters"] {
+                        if let Some(value) = args.remove(key) {
+                            options.insert(key.into(), value);
+                        }
+                    }
+                }
+                args.insert("options".into(), options);
             }
             "create" => {
                 rename(&["file", "filename", "file_path", "name"], "path");
@@ -1102,7 +1138,9 @@ fn normalize(value: &mut serde_json::Value) {
             "browser_tab" => &["action", "url", "target", "text"],
             "connector_read" => &["service", "query"],
             "read_skill" => &["name"],
-            "image" => &["prompt", "path"],
+            "image" => &["prompt", "path", "source", "options"],
+            "image_models" => &[],
+            "import_conversations" => &["source"],
             "speak" => &["text", "path"],
             "transcribe" => &["path"],
             "apply" | "setup" => &[],
@@ -1661,7 +1699,7 @@ pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<
         | Call::Install { .. }
         | Call::Browser { .. }
         | Call::PreviewHtml { .. }
-        | Call::Image { .. }
+        | Call::Image { .. } | Call::ImageModels {} | Call::ImportConversations { .. }
         | Call::Speak { .. }
         | Call::Transcribe { .. } => {
             bail!("{} isn't a file tool", call.name())
