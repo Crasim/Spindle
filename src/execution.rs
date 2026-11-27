@@ -61,6 +61,22 @@ pub enum JobDone {
     },
 }
 
+impl JobDone {
+    fn pending(&self) -> Option<&Pending> {
+        match self {
+            Self::Catalog { pending, .. }
+            | Self::Tool { pending, .. }
+            | Self::Native { pending, .. }
+            | Self::Browser { pending, .. }
+            | Self::Image { pending, .. }
+            | Self::Audio { pending, .. } => Some(pending),
+            #[cfg(target_os = "android")]
+            Self::Apk { pending, .. } => Some(pending),
+            _ => None,
+        }
+    }
+}
+
 /// What an audio tool produced.
 pub enum Heard {
     Spoken(Vec<u8>),
@@ -81,6 +97,7 @@ pub struct After {
 #[derive(Default)]
 pub struct Jobs {
     pub catalog_chat: Option<u64>,
+    pub tool_action: Option<(u64, u64)>,
     /// Started work the engine loop hasn't picked up yet.
     pub started: Option<tokio::task::JoinHandle<JobDone>>,
     /// What is running, for the window.
@@ -104,6 +121,7 @@ pub struct Jobs {
 impl Jobs {
     fn track_tool(&mut self, pending: &Pending) {
         self.catalog_chat = Some(pending.chat);
+        self.tool_action = Some((pending.chat, pending.id));
         self.running = Some(pending.call.call.summary());
     }
 }
@@ -337,6 +355,7 @@ impl Engine {
             script.clone(),
             Duration::from_millis(wait_ms.unwrap_or(1500).clamp(200, 20_000)),
         );
+        self.jobs.cancel = Arc::new(AtomicBool::new(false));
         self.jobs.track_tool(&p);
         let page = p.target.clone();
         let block = self.state.preferences.block_web;
@@ -436,6 +455,7 @@ impl Engine {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
+        self.jobs.cancel = Arc::new(AtomicBool::new(false));
         self.jobs.track_tool(&p);
         let pending = Box::new(p);
         self.jobs.started = Some(tokio::spawn(async move {
@@ -797,6 +817,28 @@ impl Engine {
     pub(crate) fn finish_job(&mut self, done: JobDone) -> String {
         self.jobs.running = None;
         self.jobs.catalog_chat = None;
+        self.jobs.tool_action = None;
+        if self.jobs.cancel.swap(false, Ordering::Relaxed) {
+            if let Some(p) = done.pending() {
+                #[cfg(windows)]
+                if self.jobs.panel_read.as_ref().is_some_and(|(id, ..)| *id == p.id) {
+                    self.jobs.panel_read = None;
+                }
+                if let Call::WebOpen { url, start: 0, .. } = &p.call.call
+                    && let Ok(address) = crate::browser::public_page(url)
+                {
+                    self.jobs.browser_panel = Some(BrowserPanel { chat: p.chat,
+                        address: address.to_string(), activity: BrowserActivity::Unavailable("Browsing stopped".into()) });
+                }
+                self.finish_stopped_tool(p.chat, p.id, p.call.call.summary());
+                crate::engine::refresh_changes(&mut self.state, p.chat);
+                return "Stopped by user".into();
+            }
+            if let Some(after) = self.jobs.after.take() {
+                self.finish_stopped_tool(after.chat, after.id, after.summary);
+                return "Stopped by user".into();
+            }
+        }
         match done {
             JobDone::Catalog{pending:p,result}=>{
                 #[cfg(windows)]
@@ -806,18 +848,6 @@ impl Engine {
                 #[cfg(windows)]
                 if panel_read {
                     self.jobs.panel_read = None;
-                }
-                if self.jobs.cancel.load(Ordering::Relaxed) {
-                    crate::bobbins::finish(&mut self.state, p.chat, crate::bobbins::Status::Cancelled, "Stopped by you during the tool action.");
-                    if let Call::WebOpen { url, start: 0, .. } = &p.call.call
-                        && let Ok(address) = crate::browser::public_page(url)
-                    {
-                        self.jobs.browser_panel = Some(BrowserPanel { chat: p.chat,
-                            address: address.to_string(), activity: BrowserActivity::Unavailable("Browsing stopped".into()) });
-                    }
-                    crate::engine::record_outcome(&mut self.state,p.id,"Stopped by user",false);
-                    crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),"Stopped by user");
-                    return "Stopped by user".into();
                 }
                 let ok = result.is_ok();
                 use crate::{browser::PageAccess, diagnostics::Reason};
@@ -1291,6 +1321,15 @@ impl Engine {
                 );
                 notice
             }
+        }
+    }
+
+    fn finish_stopped_tool(&mut self, chat: u64, action: u64, summary: String) {
+        crate::bobbins::finish(&mut self.state, chat, crate::bobbins::Status::Cancelled, "Stopped by you during the tool action.");
+        crate::engine::record_outcome(&mut self.state, action, "Stopped by user", false);
+        crate::engine::set_tool_note(&mut self.state, chat, summary, "Stopped by user");
+        if let Ok(thread) = self.state.thread_mut(chat) {
+            thread.pending_steering.clear();
         }
     }
 }

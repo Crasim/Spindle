@@ -114,7 +114,7 @@ impl State {
                 .map(|c| (&c.thread, c.history.as_slice()))
         }
     }
-    fn thread_mut(&mut self, id: u64) -> Result<&mut ThreadInfo> {
+    pub(crate) fn thread_mut(&mut self, id: u64) -> Result<&mut ThreadInfo> {
         if id == self.chat_id {
             Ok(&mut self.thread)
         } else {

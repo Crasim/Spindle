@@ -61,6 +61,8 @@ On Windows, Spindle sends a system notification when a reply finishes and its wi
 
 ### Revising work in progress
 
+Use the square **Stop** button beside **Send** to stop a reply or model tool running in this chat. Your draft stays in the composer.
+
 Switch between **Chat** and **Cowork** in the sidebar. The sync indicator sits beside Settings. Open **Panel → Plan** to edit the current conversation's checklist. Choose **Revise plan…** to describe a change while the model is working. Check **Replace the current objective** when the deliverable itself has changed. For example, `/goal replace Build and test a Windows Rust executable` replaces an HTML goal. Use `/plan revise Include an empty-input test` to keep the objective and amend the plan. Steering an active plan also carries your correction into subsequent tool turns.
 
 In a project chat, ask about a previous discussion or name a distinctive topic from it. For example, “What build flags did we agree on in the previous thread?” Chat and Cowork can draw on short excerpts from other chats in the same project and cite the source chat. This works with Project Memory off and includes project chats already synced to this device.

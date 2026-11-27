@@ -31,6 +31,7 @@ pub struct View {
     pub models: Vec<String>,
     pub busy: bool,
     pub can_steer: bool,
+    pub stop: Option<StopTarget>,
     pub notice: String,
     pub connecting: bool,
     /// Background work in progress, such as a sandboxed test run.
@@ -48,6 +49,21 @@ pub struct View {
     pub import_panel: Option<String>,
     #[cfg(windows)]
     pub completed_reply: Option<(u64, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StopTarget {
+    Reply { chat: u64, task: u64 },
+    Tool { chat: u64, action: u64 },
+}
+
+impl StopTarget {
+    pub(crate) fn command(self) -> String {
+        match self {
+            Self::Reply { chat, task } => format!("/stop-task reply {chat} {task}"),
+            Self::Tool { chat, action } => format!("/stop-task tool {chat} {action}"),
+        }
+    }
 }
 
 pub struct Engine {
@@ -1825,6 +1841,17 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 self.state.held = !self.state.queue.is_empty();
                 Ok("Cancelled current task; remaining queue held".into())
             }
+            "/stop-task" => {
+                let target = self.stop_target(busy).context("This task has already stopped")?;
+                ensure!(target.command() == format!("/stop-task {args}"), "The running task changed");
+                match target {
+                    StopTarget::Reply { .. } => self.command("/cancel", busy),
+                    StopTarget::Tool { chat, .. } => {
+                        crate::computer_use::stop(Some(chat));
+                        self.stop_run()
+                    }
+                }
+            }
             "/resume" => {
                 self.state.automation.wake = None;
                 if self.state.held {
@@ -1974,6 +2001,19 @@ The user denied this action. Continue with other work or explain the denial. Do 
 
     fn inference_in_chat(&self, chat: u64, busy: bool) -> bool {
         busy && self.state.queue.front().is_some_and(|task| task.origin.unwrap_or(self.state.chat_id) == chat)
+    }
+
+    fn stop_target(&self, busy: bool) -> Option<StopTarget> {
+        let chat = self.state.chat_id;
+        if self.inference_in_chat(chat, busy) {
+            return self.state.queue.front().map(|task| StopTarget::Reply { chat, task: task.id });
+        }
+        if self.jobs.running.is_none() || self.jobs.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let tool = self.jobs.tool_action
+            .or_else(|| self.jobs.after.as_ref().map(|after| (after.chat, after.id)));
+        tool.filter(|(owner, _)| *owner == chat).map(|(_, action)| StopTarget::Tool { chat, action })
     }
 
     fn skills(&mut self, input: &str) -> Result<String> {
@@ -7690,11 +7730,40 @@ mod tests {
                 .content
                 .contains("keep the signature")
         );
-        e.command("/cancel", true).unwrap();
+        let stop = e.stop_target(true).unwrap();
+        assert!(e.command("/stop-task reply 9999 1", true).is_err());
+        e.command(&stop.command(), true).unwrap();
+        assert!(e.command(&stop.command(), true).is_err());
         assert!(e.state.held);
         assert_eq!(e.state.queue[0].text, "release notes");
         e.command("/resume", false).unwrap();
         assert!(!e.state.held);
+    }
+
+    #[test]
+    fn stop_targets_the_current_tool_and_suppresses_its_late_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut engine = fixture(&root);
+        let chat = engine.state.chat_id;
+        engine.command("Read this project", false).unwrap();
+        finish_turn(&mut engine.state, r#"{"name":"list","args":{"path":"."}}"#.into(), Turn::default(), Some(&root)).unwrap();
+        let pending = engine.state.requests.pop().unwrap();
+        engine.jobs.running = Some("Running a tool".into());
+        engine.jobs.catalog_chat = Some(chat);
+        engine.jobs.tool_action = Some((chat, pending.id));
+        let target = engine.stop_target(false).unwrap();
+        engine.state.chat_id = 9999;
+        assert!(engine.stop_target(false).is_none());
+        assert!(engine.command(&target.command(), false).is_err());
+        engine.state.chat_id = chat;
+        assert!(engine.command(&target.command(), false).is_ok());
+        assert!(engine.stop_target(false).is_none());
+        assert_eq!(engine.finish_job(crate::execution::JobDone::Catalog {
+            pending: Box::new(pending), result: Ok("Late result".into()),
+        }), "Stopped by user");
+        assert!(engine.state.queue.is_empty());
+        assert!(engine.jobs.tool_action.is_none());
     }
 
     #[test]
@@ -8621,6 +8690,7 @@ impl Engine {
                     busy: active.is_some(),
                     can_steer: self.inference_in_chat(self.state.chat_id, active.is_some())
                         || self.awaiting_tool(self.state.chat_id),
+                    stop: self.stop_target(active.is_some()),
                     notice: notice.clone(),
                     connecting: connecting.is_some(),
                     job: self.jobs.running.clone(),
@@ -8665,6 +8735,7 @@ impl Engine {
                         Ok(done) => self.finish_job(done),
                         Err(e) => {
                             self.jobs.running = None;
+                            self.jobs.tool_action = None;
                             if let Some(chat) = self.jobs.catalog_chat.take() {
                                 crate::bobbins::finish(&mut self.state, chat, crate::bobbins::Status::Interrupted, "The tool stopped before recording a result.");
                             }

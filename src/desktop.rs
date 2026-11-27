@@ -1775,129 +1775,128 @@ impl Desktop {
                                 self.reader.preview.focus_chat();
                             }
                         }
-                        ui.horizontal(|ui| {
-                            let compact = narrow(ctx) || ui.available_width() < 520.;
-                            self.model_picker(ui, compact);
-                            if !compact {
-                                let current = self.view.state.model.clone();
-                                self.capability_icons(ui, &current, 16., false);
-                            }
-                            self.thinking_toggle(ui, compact);
-                            if !compact || (!self.view.busy && !self.view.state.held
-                                && self.voice.recording().is_none() && ui.available_width() >= 202.)
-                            {
-                                self.usage_rings(ui);
-                            } else if matches!(settings::ComposerMenu::current(ctx), Some(settings::ComposerMenu::PlanUsage | settings::ComposerMenu::Budget)) {
-                                settings::ComposerMenu::dismiss(ctx);
-                            }
-                            if !compact {
-                                ui.separator();
-                            }
-                            if small(ui, Icon::Attach, "Attach files to your next message") {
-                                #[cfg(windows)]
-                                if let Some(paths) =
-                                    rfd::FileDialog::new().set_directory(&self.root).pick_files()
-                                {
-                                    for path in paths {
-                                        if image_file(&path) {
-                                            self.attach_image_file(ui.ctx(), &path);
-                                        } else {
-                                            self.attach_file(&path);
-                                        }
-                                    }
-                                }
-                                #[cfg(not(windows))]
-                                self.compose("/add ");
-                            }
-                            if let Some(elapsed) = self.voice.recording() {
-                                let secs = elapsed.as_secs();
-                                if small(ui, Icon::Stop, "Stop and write down what you said") {
-                                    let settings = self.speech_settings();
-                                    self.voice.stop_recording(ui.ctx(), settings);
-                                }
-                                let cancel = if compact {
-                                    ui.small_button("Cancel").clicked()
+                        let compact = narrow(ctx) || ui.available_width() < 520.;
+                        // Allocate the message controls before optional toolbar items can take their space.
+                        ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), 33.),
+                            egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let label = if active || self.view.busy || self.view.state.held {
+                                "Queue"
+                            } else {
+                                "Send"
+                            };
+                            let (r, res) = ui.allocate_exact_size(
+                                egui::vec2(39., 33.),
+                                egui::Sense::click(),
+                            );
+                            let ready = !self.awaiting_submission()
+                                && (!self.draft.trim().is_empty() || has_pastes || !self.image_drafts.is_empty());
+                            ui.painter().rect_filled(
+                                r,
+                                10,
+                                if ready {
+                                    accent()
                                 } else {
-                                    ui.label(
-                                        Text::new(format!("● {}:{:02}", secs / 60, secs % 60))
-                                            .color(Color::from_rgb(220, 60, 60)),
-                                    );
-                                    ui.small_button("Cancel").clicked()
-                                };
-                                if cancel {
-                                    self.voice.cancel_recording();
-                                }
-                            } else if self.voice.transcribing() {
-                                ui.add(egui::Spinner::new().size(14.));
-                                if !compact {
-                                    ui.weak("Writing it down…");
-                                }
-                            } else if small(ui, Icon::Mic, "Dictate: record from your microphone") {
-                                if let Err(e) = self.voice.start_recording() {
-                                    self.notice = format!("{e:#}");
-                                }
-                            }
-                            if !compact && small(ui, Icon::Swarm, "Choose swarm workers") {
-                                self.show_swarm();
-                            }
-                            self.run_on_button(ui, compact || ui.available_width() < 280.);
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let label = if active || self.view.busy || self.view.state.held {
-                                        "Queue"
-                                    } else {
-                                        "Send"
-                                    };
-                                    let (r, res) = ui.allocate_exact_size(
-                                        egui::vec2(39., 33.),
-                                        egui::Sense::click(),
-                                    );
-                                    let ready = !self.awaiting_submission()
-                                        && (!self.draft.trim().is_empty() || has_pastes || !self.image_drafts.is_empty());
-                                    ui.painter().rect_filled(
-                                        r,
-                                        10,
-                                        if ready {
-                                            accent()
-                                        } else {
-                                            accent().gamma_multiply(0.45)
-                                        },
-                                    );
-                                    draw(
-                                        ui,
-                                        Icon::Arrow,
-                                        egui::Rect::from_center_size(
-                                            r.center(),
-                                            egui::vec2(19., 19.),
-                                        ),
-                                        surface(),
-                                    );
-                                    res.widget_info(|| {
-                                        egui::WidgetInfo::labeled(
-                                            egui::WidgetType::Button,
-                                            ready,
-                                            label,
-                                        )
-                                    });
-                                    if ready && res.on_hover_text(if active { queue_hint } else { label }).clicked() {
-                                        submit = true;
-                                        steer = false;
-                                    }
-                                    if active {
-                                        steer |= ui.add_enabled_ui(!self.awaiting_submission() && plain && !self.draft.trim().is_empty(),
-                                            |ui| small(ui, Icon::Steer, steer_hint)).inner;
-                                    }
-                                    if self.view.busy && self.view.state.queue.front().is_some_and(|t|t.origin.unwrap_or(self.view.state.chat_id)==self.view.state.chat_id) {
-                                        if small(ui, Icon::Stop, "Stop the running task") {
-                                            self.send("/cancel");
-                                        }
-                                    } else if self.view.state.held && ui.button("Resume").clicked()
-                                    {
-                                        self.send("/resume");
-                                    }
+                                    accent().gamma_multiply(0.45)
                                 },
                             );
+                            draw(
+                                ui,
+                                Icon::Arrow,
+                                egui::Rect::from_center_size(
+                                    r.center(),
+                                    egui::vec2(19., 19.),
+                                ),
+                                surface(),
+                            );
+                            res.widget_info(|| {
+                                egui::WidgetInfo::labeled(
+                                    egui::WidgetType::Button,
+                                    ready,
+                                    label,
+                                )
+                            });
+                            if ready && res.on_hover_text(if active { queue_hint } else { label }).clicked() {
+                                submit = true;
+                                steer = false;
+                            }
+                            if let Some(target) = self.view.stop {
+                                if small(ui, Icon::Stop, "Stop the running task") {
+                                    self.send(target.command());
+                                }
+                            } else if self.view.state.held && ui.button("Resume").clicked() {
+                                self.send("/resume");
+                            }
+                            if active {
+                                steer |= ui.add_enabled_ui(!self.awaiting_submission() && plain && !self.draft.trim().is_empty(),
+                                    |ui| small(ui, Icon::Steer, steer_hint)).inner;
+                            }
+                            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center)
+                                .with_main_wrap(compact), |ui| {
+                                self.model_picker(ui, compact);
+                                if !compact {
+                                    let current = self.view.state.model.clone();
+                                    self.capability_icons(ui, &current, 16., false);
+                                }
+                                self.thinking_toggle(ui, compact);
+                                if !compact || (!self.view.busy && !self.view.state.held
+                                    && self.voice.recording().is_none() && ui.available_width() >= 202.)
+                                {
+                                    self.usage_rings(ui);
+                                } else if matches!(settings::ComposerMenu::current(ctx), Some(settings::ComposerMenu::PlanUsage | settings::ComposerMenu::Budget)) {
+                                    settings::ComposerMenu::dismiss(ctx);
+                                }
+                                if !compact {
+                                    ui.separator();
+                                }
+                                if small(ui, Icon::Attach, "Attach files to your next message") {
+                                    #[cfg(windows)]
+                                    if let Some(paths) =
+                                        rfd::FileDialog::new().set_directory(&self.root).pick_files()
+                                    {
+                                        for path in paths {
+                                            if image_file(&path) {
+                                                self.attach_image_file(ui.ctx(), &path);
+                                            } else {
+                                                self.attach_file(&path);
+                                            }
+                                        }
+                                    }
+                                    #[cfg(not(windows))]
+                                    self.compose("/add ");
+                                }
+                                if let Some(elapsed) = self.voice.recording() {
+                                    let secs = elapsed.as_secs();
+                                    if small(ui, Icon::Stop, "Stop and write down what you said") {
+                                        let settings = self.speech_settings();
+                                        self.voice.stop_recording(ui.ctx(), settings);
+                                    }
+                                    let cancel = if compact {
+                                        ui.small_button("Cancel").clicked()
+                                    } else {
+                                        ui.label(
+                                            Text::new(format!("● {}:{:02}", secs / 60, secs % 60))
+                                                .color(Color::from_rgb(220, 60, 60)),
+                                        );
+                                        ui.small_button("Cancel").clicked()
+                                    };
+                                    if cancel {
+                                        self.voice.cancel_recording();
+                                    }
+                                } else if self.voice.transcribing() {
+                                    ui.add(egui::Spinner::new().size(14.));
+                                    if !compact {
+                                        ui.weak("Writing it down…");
+                                    }
+                                } else if small(ui, Icon::Mic, "Dictate: record from your microphone") {
+                                    if let Err(e) = self.voice.start_recording() {
+                                        self.notice = format!("{e:#}");
+                                    }
+                                }
+                                if !compact && small(ui, Icon::Swarm, "Choose swarm workers") {
+                                    self.show_swarm();
+                                }
+                                self.run_on_button(ui, compact || ui.available_width() < 280.);
+                            });
                         });
                     });
                 if !commands.is_empty() {
@@ -3851,6 +3850,51 @@ mod transcript_tests {
                 .expect("selecting a thinking level should send a change");
             assert_eq!(model, "@test/reasoning-model");
             assert_eq!(tuning.thinking, crate::state::Thinking::High);
+        }
+    }
+
+    #[test]
+    fn stop_stays_clickable_in_the_composer_for_replies_and_tools() {
+        use egui::{Event, Modifiers, PointerButton, Pos2};
+        use crate::engine::StopTarget;
+        let dir = tempfile::tempdir().unwrap();
+        for width in [300., 375., 850.] {
+            for tool in [false, true] {
+                let (ctx, mut app) = fixture(dir.path(), 0);
+                let (tx, mut commands) = tokio::sync::mpsc::unbounded_channel();
+                app.tx = tx;
+                app.draft = "Keep this draft".into();
+                app.view.busy = !tool;
+                app.view.can_steer = true;
+                let chat = app.view.state.chat_id;
+                let target = if tool { StopTarget::Tool { chat, action: 17 } } else { StopTarget::Reply { chat, task: 5 } };
+                app.view.stop = Some(target);
+                let frame = |app: &mut Desktop, events| {
+                    ctx.run(egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 480.))),
+                        events, ..Default::default()
+                    }, |ctx| app.composer(ctx))
+                };
+                frame(&mut app, vec![]);
+                let output = frame(&mut app, vec![]);
+                let stop = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Rect(square)
+                        if (square.rect.width() - 10.5).abs() < 0.1
+                            && (square.rect.height() - 10.5).abs() < 0.1
+                            && square.fill == muted()
+                            && square.rect.center().x > width - 116.
+                            && shape.clip_rect.contains_rect(square.rect) => Some(square.rect.center()),
+                    _ => None,
+                }).unwrap_or_else(|| panic!("Stop icon outside the composer at {width}px"));
+                for pressed in [true, false] {
+                    frame(&mut app, vec![Event::PointerMoved(stop), Event::PointerButton {
+                        pos: stop, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                    }]);
+                }
+                assert_eq!(commands.try_recv().unwrap(), target.command());
+                assert!(commands.try_recv().is_err());
+                assert_eq!(app.draft, "Keep this draft");
+            }
         }
     }
 
