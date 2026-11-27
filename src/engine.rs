@@ -385,6 +385,7 @@ impl Engine {
             set_tool_note(&mut self.state, chat, p.call.call.summary(), "Superseded by plan revision");
             journal(&mut self.state, crate::state::ActionRecord {
                 id: p.id, time: automation::now(), chat, model: p.model, summary: p.call.call.summary(),
+                tool: p.call.call.name().into(),
                 risk: p.risk, decision: "Superseded by plan revision".into(), outcome: "Not started".into(), ok: false,
             });
         }
@@ -764,6 +765,7 @@ impl Engine {
                         time: automation::now(),
                         chat: p.chat,
                         model: p.model.clone(),
+                        tool: p.call.call.name().into(),
                         summary: summary.clone(),
                         risk: p.risk,
                         decision: "Denied by you".into(),
@@ -1990,7 +1992,7 @@ fn can_read_paired_tab(state: &State, chat: u64) -> bool {
         })
 }
 
-fn can_request_browser(state: &State) -> bool {
+pub(crate) fn can_request_browser(state: &State) -> bool {
     crate::browser::SUPPORTED && browser_access_blocker(state).is_none()
 }
 
@@ -2775,6 +2777,7 @@ pub(crate) fn auto_apply(state: &mut State, chat: u64) {
             time: automation::now(),
             chat,
             model,
+            tool: "apply".into(),
             summary: "Apply the sandbox changes to the project".into(),
             risk: crate::policy::Risk::Write,
             decision: "Applied automatically (Settings › Sandbox)".into(),
@@ -3197,6 +3200,17 @@ fn queue_followup_at(state: &mut State, chat: u64, model: &str, steps: u32, text
 
 /// Fill in the result of a logged action.
 pub(crate) fn record_outcome(state: &mut State, id: u64, text: &str, ok: bool) {
+    record_result(state, id, text, ok);
+    if !ok && text != "Stopped by user"
+        && let Some(record) = state.actions.iter().rev().find(|r| r.id == id)
+    {
+        let (chat, model, tool) = (record.chat, record.model.clone(), record.tool.clone());
+        let operation = if tool.is_empty() { "tool_execution" } else { &tool };
+        crate::diagnostics::log(state, chat, &model, operation, crate::diagnostics::Reason::classify(text), false);
+    }
+}
+
+pub(crate) fn record_result(state: &mut State, id: u64, text: &str, ok: bool) {
     if let Some(r) = state.actions.iter_mut().rev().find(|r| r.id == id) {
         r.outcome = text
             .lines()
@@ -3324,6 +3338,7 @@ fn route_resolved_call(
     call: std::result::Result<crate::tools::Envelope, String>, chat_read_only: bool,
 ) {
     let Some((root, project_chat)) = tool_folder(state, chat, workspace) else {
+        crate::diagnostics::log(state, chat, model, "tool_call", crate::diagnostics::Reason::Unavailable, false);
         set_tool_note(
             state,
             chat,
@@ -3334,6 +3349,7 @@ fn route_resolved_call(
     };
     let project = project_chat.then(|| root.clone());
     if steps >= MAX_STEPS {
+        crate::diagnostics::log(state, chat, model, "tool_call", crate::diagnostics::Reason::ToolLimit, false);
         set_tool_note(
             state,
             chat,
@@ -3345,6 +3361,7 @@ fn route_resolved_call(
     let env = match call {
         Ok(env) => env,
         Err(problem) => {
+            crate::diagnostics::log(state, chat, model, "tool_call", crate::diagnostics::Reason::InvalidCall, false);
             // Two repair attempts: a third malformed call in a row stops the run.
             let strikes = state
                 .thread_data(chat)
@@ -3411,6 +3428,7 @@ fn route_resolved_call(
     if destination.is_none() && cfg!(target_os = "android")
         && (env.call.runs() || matches!(env.call, crate::tools::Call::Setup {} | crate::tools::Call::Install { .. }))
     {
+        crate::diagnostics::log(state, chat, model, env.call.name(), crate::diagnostics::Reason::Unavailable, false);
         let summary = env.call.summary();
         set_tool_note(state, chat, summary.clone(), "Unavailable on Android");
         continue_with(
@@ -3624,6 +3642,7 @@ fn route_resolved_call(
         Ok(r) => r,
         Err(e) => {
             let detail = format!("{e:#}");
+            crate::diagnostics::log(state, chat, model, env.call.name(), crate::diagnostics::Reason::classify(&detail), false);
             let status = if detail.contains("Settings ›") {
                 format!("Blocked · {detail}")
             } else if env.call.runs() {
@@ -3732,6 +3751,7 @@ Error: {detail}",
                     time: crate::automation::now(),
                     chat,
                     model: model.to_owned(),
+                    tool: pending.call.call.name().into(),
                     summary: summary.clone(),
                     risk,
                     decision: format!("Denied: {reason}"),
@@ -4000,6 +4020,7 @@ impl Engine {
                     time: automation::now(),
                     chat: p.chat,
                     model: p.model.clone(),
+                    tool: p.call.call.name().into(),
                     summary: summary.clone(),
                     risk: p.risk,
                     decision: p.reason.clone(),
@@ -4368,7 +4389,9 @@ fn fallback_after_disconnect(state: &mut State, model: &str, error: &anyhow::Err
         return None;
     }
     task.disconnected.push(model.into());
+    let chat = task.origin.unwrap_or(state.chat_id);
     let notice = format!("Task #{} lost contact with {model}. Checking the configured fallback order.", task.id);
+    crate::diagnostics::log(state, chat, model, "model_request", crate::diagnostics::Reason::classify(&format!("{error:#}")), false);
     state.automation.record(&notice);
     Some(notice)
 }
@@ -4378,6 +4401,8 @@ fn stop_failed_task(state: &mut State, reason: &str) -> String {
     let Some(task) = state.queue.pop_front() else {
         return notice;
     };
+    crate::diagnostics::log(state, task.origin.unwrap_or(state.chat_id), task.actual.as_deref().unwrap_or(&task.model),
+        "model_request", crate::diagnostics::Reason::classify(reason), false);
     let fallback_from = task.actual.as_deref().and_then(|actual| task.fallback_from(actual)).map(str::to_owned);
     state.held = false;
     if state.automation.wake.as_ref().is_some_and(|wake| wake.task == task.id) {
@@ -5656,6 +5681,10 @@ mod tests {
         let retry = pending.id;
         e.finish_job(crate::execution::JobDone::Catalog { pending: Box::new(pending),
             result: Err(crate::browser::PageAccess::Http(403).into()) });
+        let failure = e.state.failures.last().unwrap();
+        assert_eq!(failure.operation, "web_open");
+        assert_eq!(failure.reason, crate::diagnostics::Reason::Http(403));
+        assert!(failure.browser_link_offered);
         let chat = e.state.chat_id;
         assert!(matches!(e.jobs.browser_panel.as_ref().unwrap().activity, crate::execution::BrowserActivity::Unavailable(_)));
         assert!(e.state.browser_reads.is_empty());

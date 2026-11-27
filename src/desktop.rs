@@ -16,6 +16,7 @@ mod images;
 mod message_edit;
 mod notes;
 mod notebook;
+mod chat_search;
 mod paste;
 mod submission;
 mod android_ime;
@@ -223,6 +224,7 @@ enum Page {
     Automations,
     Skills,
     Notes,
+    ChatSearch,
     Settings,
 }
 
@@ -387,6 +389,8 @@ pub struct Desktop {
     sidebar_sent: Option<u16>,
     plan: notes::PlanPane,
     notebook: notebook::Notebook,
+    chat_search: chat_search::ChatSearch,
+    diagnostic_models: bool,
     memory: notes::MemoryPage,
     git: notes::GitPane,
     components: notes::ComponentsPane,
@@ -1094,6 +1098,8 @@ impl Desktop {
             sidebar_sent: None,
             plan: Default::default(),
             notebook: Default::default(),
+            chat_search: Default::default(),
+            diagnostic_models: false,
             memory: Default::default(),
             git: Default::default(),
             components: Default::default(),
@@ -1414,6 +1420,7 @@ impl Desktop {
                 }
                 ui.add_space(10.);
                 for (page, icon, label) in [
+                    (Page::ChatSearch, Icon::Search, "Search chats".into()),
                     (
                         Page::Queue,
                         Icon::Queue,
@@ -1437,6 +1444,9 @@ impl Desktop {
                             self.projects.refresh(self.root.clone());
                         }
                         self.page = page;
+                        if page == Page::ChatSearch {
+                            self.chat_search.activate();
+                        }
                     }
                 }
                 if !compact {
@@ -1511,6 +1521,7 @@ impl Desktop {
                         Page::Automations => "Automations",
                         Page::Skills => "Skill library",
                         Page::Notes => "Notes",
+                        Page::ChatSearch => "Search chats",
                         Page::Settings => "Settings",
                         Page::Projects => "Projects",
                         Page::Project => self.projects.home_title(),
@@ -2106,11 +2117,16 @@ impl Desktop {
                     }
                     if user && state.thread.tool_results.contains(&index) {
                         ui.add_space(6.);
-                        ui.push_id(("tool-result",index),|ui| notes::tool_result(ui,&message.content));
+                        let inset = if groups[index].is_some() { 11 } else { 0 };
+                        egui::Frame::new().inner_margin(egui::Margin::symmetric(inset,0)).show(ui,|ui| {
+                            ui.push_id(("tool-result",index),|ui| notes::tool_result(ui,&message.content));
+                        });
                         continue;
                     }
                     ui.push_id(("history-row", state.chat_id, index), |ui| {
                     ui.add_space(12.);
+                    let inset = if groups[index].is_some() { 11 } else { 0 };
+                    egui::Frame::new().inner_margin(egui::Margin::symmetric(inset,0)).show(ui,|ui| {
                     message_row(ui,user,|ui|{
                     let failed=turn.is_some_and(|turn|turn.failed);
                     let label=if failed {"Spindle"} else {turn.map(|t|route(&t.model).1).unwrap_or(if user {"You"}else{"Spindle"})};
@@ -2265,6 +2281,7 @@ impl Desktop {
                             },
                         }
                     }
+                    });
                     });
                     });
                     self.transcript.heights[index] = cache_row.then(|| ui.cursor().top() - top);
@@ -2852,6 +2869,11 @@ impl eframe::App for Desktop {
         {
             self.show_models();
         }
+        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::F)) {
+            self.page = Page::ChatSearch;
+            self.drawer = false;
+            self.chat_search.activate();
+        }
         while let Ok(v) = self.rx.try_recv() {
             self.transcript.observe(&self.view.state, &v.state);
             if v.job != self.view.job { self.build_files = None; }
@@ -3280,6 +3302,7 @@ impl eframe::App for Desktop {
                 match self.page {
                     Page::Chat => self.conversation(ui),
                     Page::Notes => self.notes_page(ui),
+                    Page::ChatSearch => self.search_chats(ui),
                     Page::Queue => {
                         egui::ScrollArea::vertical().show(ui, |ui| self.queue(ui));
                     }

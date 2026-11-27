@@ -15,11 +15,11 @@ use std::{
 pub(super) struct Notebook {
     library: Library,
     root: Option<PathBuf>,
-    listing: Option<mpsc::Receiver<anyhow::Result<Vec<PathBuf>>>>,
-    files: Vec<PathBuf>,
+    listing: Option<mpsc::Receiver<anyhow::Result<Vec<NoteCard>>>>,
+    files: Vec<NoteCard>,
     note: Option<Note>,
     filter: String,
-    new_title: Option<String>,
+    focus_editor: bool,
     vault_input: String,
     vault_status: String,
     status: String,
@@ -27,10 +27,16 @@ pub(super) struct Notebook {
 
 struct Note {
     path: PathBuf,
+    draft_title: Option<String>,
     saved: String,
     text: String,
     preview: bool,
     images: HashMap<String, Option<egui::TextureHandle>>,
+}
+
+struct NoteCard {
+    path: PathBuf,
+    excerpt: String,
 }
 
 impl Note {
@@ -38,6 +44,7 @@ impl Note {
         let text = notebook::read(root, &path)?;
         Ok(Self {
             path,
+            draft_title: None,
             saved: text.clone(),
             text,
             preview: false,
@@ -45,12 +52,31 @@ impl Note {
         })
     }
 
+    fn draft() -> Self {
+        Self {
+            path: PathBuf::from("Untitled note.md"),
+            draft_title: Some("Untitled note".into()),
+            saved: String::new(),
+            text: String::new(),
+            preview: false,
+            images: HashMap::new(),
+        }
+    }
+
     fn modified(&self) -> bool {
         self.text != self.saved
+            || self
+                .draft_title
+                .as_deref()
+                .is_some_and(|title| title != "Untitled note")
     }
 
     fn save(&mut self, root: &Path) -> anyhow::Result<()> {
-        if self.modified() {
+        if let Some(title) = &self.draft_title {
+            self.path = notebook::create(root, title, &self.text)?;
+            self.draft_title = None;
+            self.saved.clone_from(&self.text);
+        } else if self.modified() {
             notebook::save(root, &self.path, &self.saved, &self.text)?;
             self.saved.clone_from(&self.text);
         }
@@ -75,7 +101,20 @@ impl Notebook {
                 let (tx, rx) = mpsc::channel();
                 let ctx = ctx.clone();
                 std::thread::spawn(move || {
-                    let _ = tx.send(notebook::list(&root));
+                    let _ = tx.send(notebook::list(&root).map(|paths| {
+                        paths
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, path)| {
+                                let excerpt = if i < 150 {
+                                    card_excerpt(&root, &path)
+                                } else {
+                                    String::new()
+                                };
+                                NoteCard { path, excerpt }
+                            })
+                            .collect()
+                    }));
                     ctx.request_repaint();
                 });
                 self.listing = Some(rx);
@@ -110,6 +149,7 @@ impl Notebook {
                     field
                         .hint_text("Path to an Obsidian vault folder")
                         .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(12, 8))
                 },
             );
             ui.horizontal_wrapped(|ui| {
@@ -190,7 +230,7 @@ impl Notebook {
                 {
                     self.library = library;
                     self.note = None;
-                    self.new_title = None;
+                    self.focus_editor = false;
                     self.filter.clear();
                     self.status.clear();
                     self.refresh(ui.ctx());
@@ -198,7 +238,10 @@ impl Notebook {
             }
             if ui.button("Refresh").clicked() {
                 self.status.clear();
-                if !dirty && let (Some(note), Some(root)) = (&self.note, &self.root) {
+                if !dirty
+                    && let (Some(note), Some(root)) = (&self.note, &self.root)
+                    && note.draft_title.is_none()
+                {
                     match Note::open(root, note.path.clone()) {
                         Ok(fresh) => self.note = Some(fresh),
                         Err(e) => self.status = format!("{e:#}"),
@@ -220,25 +263,43 @@ impl Notebook {
             return None;
         };
         let mut attachment = None;
+        let mut refresh = false;
+        if self.note.is_none() && ui.button("New note").clicked() {
+            self.note = Some(Note::draft());
+            self.focus_editor = true;
+            self.status.clear();
+        }
         if let Some(note) = &mut self.note {
             let close = egui::ScrollArea::vertical()
                 .id_salt("note-editor-scroll")
                 .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width().min(680.));
                     let mut close = false;
                     ui.horizontal_wrapped(|ui| {
                         close = ui
                             .add_enabled(!dirty, egui::Button::new("All notes"))
                             .clicked();
-                        ui.label(
-                            RichText::new(
-                                note.path.file_stem().unwrap_or_default().to_string_lossy(),
-                            )
-                            .strong()
-                            .size(20.),
-                        );
+                        if note.draft_title.is_none() {
+                            ui.label(
+                                RichText::new(
+                                    note.path.file_stem().unwrap_or_default().to_string_lossy(),
+                                )
+                                .strong()
+                                .size(20.),
+                            );
+                        }
                     });
                     if close {
                         return true;
+                    }
+                    if let Some(title) = &mut note.draft_title {
+                        ime.field(ui, "draft-note-title", title, Default::default(), |field| {
+                            field
+                                .hint_text("Note title")
+                                .desired_width(f32::INFINITY)
+                                .margin(egui::Margin::symmetric(12, 8))
+                        });
+                        ui.add_space(4.);
                     }
                     ui.horizontal_wrapped(|ui| {
                         if ui.selectable_label(!note.preview, "Edit").clicked() {
@@ -247,17 +308,29 @@ impl Notebook {
                         if ui.selectable_label(note.preview, "Preview").clicked() {
                             note.preview = true;
                         }
-                        if ui.add_enabled(dirty, egui::Button::new("Save")).clicked()
+                        if ui
+                            .add_enabled(
+                                note.modified() || note.draft_title.is_some(),
+                                egui::Button::new("Save"),
+                            )
+                            .clicked()
                             || ui.input_mut(|input| {
                                 input.consume_key(egui::Modifiers::COMMAND, egui::Key::S)
                             })
                         {
-                            self.status = note
-                                .save(&root)
-                                .map_or_else(|e| format!("{e:#}"), |()| "Note saved".into());
+                            match note.save(&root) {
+                                Ok(()) => {
+                                    self.status = "Note saved".into();
+                                    refresh = true;
+                                }
+                                Err(error) => self.status = format!("{error:#}"),
+                            }
                         }
                         if ui
-                            .add_enabled(!note.modified(), egui::Button::new("Attach to chat"))
+                            .add_enabled(
+                                note.draft_title.is_none() && !note.modified(),
+                                egui::Button::new("Attach to chat"),
+                            )
                             .on_hover_text(
                                 "Attach this saved note to the current chat’s next message",
                             )
@@ -273,22 +346,32 @@ impl Notebook {
                         }
                         #[cfg(any(windows, target_os = "linux"))]
                         if self.library == Library::Obsidian
+                            && note.draft_title.is_none()
                             && ui.button("Open in Obsidian").clicked()
                         {
                             self.status = open_obsidian(&root, &note.path)
                                 .err()
                                 .map_or_else(String::new, |e| format!("{e:#}"));
                         }
-                        if note.modified() && ui.small_button("Discard edits").clicked() {
-                            match Note::open(&root, note.path.clone()) {
-                                Ok(fresh) => {
-                                    *note = fresh;
-                                    self.status.clear();
+                        if (note.modified() || note.draft_title.is_some())
+                            && ui.small_button("Discard edits").clicked()
+                        {
+                            if note.draft_title.is_some() {
+                                close = true;
+                            } else {
+                                match Note::open(&root, note.path.clone()) {
+                                    Ok(fresh) => {
+                                        *note = fresh;
+                                        self.status.clear();
+                                    }
+                                    Err(e) => self.status = format!("{e:#}"),
                                 }
-                                Err(e) => self.status = format!("{e:#}"),
                             }
                         }
                     });
+                    if close {
+                        return true;
+                    }
                     if note.modified() {
                         ui.weak("Unsaved edits");
                     }
@@ -329,11 +412,14 @@ impl Notebook {
                         let response = ime.multiline(ui, key, &mut note.text, |field| {
                             field
                                 .font(egui::TextStyle::Monospace)
-                                .desired_rows(17)
+                                .desired_rows(11)
                                 .desired_width(f32::INFINITY)
                                 .margin(egui::Margin::symmetric(9, 8))
                                 .hint_text("Write your note in Markdown…")
                         });
+                        if std::mem::take(&mut self.focus_editor) {
+                            response.request_focus();
+                        }
                         if response.changed() {
                             self.status.clear();
                         }
@@ -346,33 +432,6 @@ impl Notebook {
                 self.status.clear();
             }
         } else {
-            if ui.button("New note").clicked() {
-                self.new_title = Some(String::new());
-            }
-            if let Some(title) = &mut self.new_title {
-                let mut create = false;
-                let mut cancel = false;
-                ime.field(ui, "note-title", title, Default::default(), |field| {
-                    field.hint_text("Note name").desired_width(f32::INFINITY)
-                });
-                ui.horizontal(|ui| {
-                    create = ui.button("Create note").clicked();
-                    cancel = ui.button("Cancel").clicked();
-                });
-                if create {
-                    match notebook::create(&root, title).and_then(|path| Note::open(&root, path)) {
-                        Ok(note) => {
-                            self.note = Some(note);
-                            self.new_title = None;
-                            self.status.clear();
-                            self.refresh(ui.ctx());
-                        }
-                        Err(e) => self.status = format!("{e:#}"),
-                    }
-                } else if cancel {
-                    self.new_title = None;
-                }
-            }
             if !self.status.is_empty() {
                 ui.label(&self.status);
             }
@@ -385,32 +444,57 @@ impl Notebook {
                     field
                         .hint_text("Find a note by name")
                         .desired_width(f32::INFINITY)
+                        .margin(egui::Margin::symmetric(12, 8))
                 },
             );
             let filter = self.filter.to_lowercase();
             let mut open = None;
-            egui::ScrollArea::vertical()
-                .id_salt("note-list")
-                .show(ui, |ui| {
-                    if self.listing.is_some() {
-                        ui.spinner();
-                    }
-                    if self.files.is_empty() && self.listing.is_none() {
-                        ui.weak("No notes in this folder.");
-                    }
-                    for file in self.files.iter().filter(|file| {
-                        filter.is_empty() || file.to_string_lossy().to_lowercase().contains(&filter)
-                    }) {
-                        ui.push_id(file, |ui| {
-                            if ui
-                                .add(egui::Button::new(file.to_string_lossy()).wrap())
-                                .clicked()
-                            {
-                                open = Some(file.clone());
-                            }
-                        });
-                    }
-                });
+            ui.scope(|ui| {
+                if self.listing.is_some() {
+                    ui.spinner();
+                }
+                if self.files.is_empty() && self.listing.is_none() {
+                    ui.weak("No notes in this folder.");
+                }
+                let columns = ((ui.available_width() + 10.) / 180.).floor().clamp(1., 5.) as usize;
+                let width = ((ui.available_width() - (columns - 1) as f32 * 10.) / columns as f32)
+                    .min(232.);
+                let cards: Vec<_> = self
+                    .files
+                    .iter()
+                    .filter(|card| {
+                        filter.is_empty()
+                            || card.path.to_string_lossy().to_lowercase().contains(&filter)
+                    })
+                    .collect();
+                if !self.files.is_empty() && cards.is_empty() {
+                    ui.weak("No matching notes.");
+                }
+                if !cards.is_empty() {
+                    let height = (width * 0.84).max(116.);
+                    egui::ScrollArea::vertical()
+                        .id_salt("sticky-cards")
+                        .show_rows(
+                            ui,
+                            height + 6.,
+                            cards.len().div_ceil(columns),
+                            |ui, rows| {
+                                for row in rows {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 10.;
+                                        for &card in cards.iter().skip(row * columns).take(columns)
+                                        {
+                                            if sticky_card(ui, card, egui::vec2(width, height)) {
+                                                open = Some(card.path.clone());
+                                            }
+                                        }
+                                    });
+                                    ui.add_space(6.);
+                                }
+                            },
+                        );
+                }
+            });
             if let Some(path) = open {
                 match Note::open(&root, path) {
                     Ok(note) => {
@@ -421,8 +505,106 @@ impl Notebook {
                 }
             }
         }
+        if refresh {
+            self.refresh(ui.ctx());
+        }
         attachment
     }
+}
+
+fn card_excerpt(root: &Path, path: &Path) -> String {
+    use std::io::Read;
+    let Ok(path) = notebook::resolve(root, path) else {
+        return String::new();
+    };
+    let Ok(file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = vec![];
+    if file.take(800).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().peekable();
+    if lines.peek().is_some_and(|line| line.trim() == "---") {
+        lines.next();
+        for line in lines.by_ref() {
+            if line.trim() == "---" {
+                break;
+            }
+        }
+    }
+    lines
+        .filter(|line| !line.starts_with("# "))
+        .flat_map(str::split_whitespace)
+        .take(27)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(180)
+        .collect()
+}
+
+fn sticky_card(ui: &mut egui::Ui, card: &NoteCard, size: egui::Vec2) -> bool {
+    let size = egui::vec2(size.x.max(1.), size.y);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let dark = ui.visuals().dark_mode;
+    let paper = if dark {
+        egui::Color32::from_rgb(60, 51, 34)
+    } else {
+        egui::Color32::from_rgb(255, 243, 189)
+    };
+    let edge = if dark {
+        egui::Color32::from_rgb(102, 82, 48)
+    } else {
+        egui::Color32::from_rgb(198, 166, 87)
+    };
+    let color = if dark {
+        egui::Color32::from_rgb(252, 229, 170)
+    } else {
+        egui::Color32::from_rgb(67, 50, 21)
+    };
+    ui.painter().rect(
+        rect,
+        6.,
+        if response.hovered() {
+            paper.lerp_to_gamma(edge, 0.21)
+        } else {
+            paper
+        },
+        egui::Stroke::new(1_f32, edge),
+        egui::StrokeKind::Inside,
+    );
+    let fold = rect.right_bottom() - egui::vec2(2., 2.);
+    ui.painter().add(egui::Shape::convex_polygon(
+        vec![fold - egui::vec2(15., 0.), fold - egui::vec2(0., 15.), fold],
+        edge,
+        egui::Stroke::NONE,
+    ));
+    let mut content = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink(12.))
+            .layout(egui::Layout::top_down(egui::Align::LEFT)),
+    );
+    content.set_clip_rect(content.clip_rect().intersect(rect.shrink(10.)));
+    let title = card.path.file_stem().unwrap_or_default().to_string_lossy();
+    content.add(
+        egui::Label::new(RichText::new(title.as_ref()).strong().color(color))
+            .truncate()
+            .selectable(false),
+    );
+    content.add_space(6.);
+    content.add(
+        egui::Label::new(RichText::new(&card.excerpt).color(color.gamma_multiply(0.86)))
+            .wrap()
+            .selectable(false),
+    );
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, title.as_ref()));
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(card.path.display().to_string())
+        .clicked()
 }
 
 impl super::Desktop {
@@ -666,6 +848,68 @@ fn format_text(text: &mut String, selection: Range<usize>, action: Format) -> Ra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_note_opens_the_toolbar_before_it_needs_a_title() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let mut notebook = Notebook {
+            root: Some(root.path().canonicalize().unwrap()),
+            ..Default::default()
+        };
+        let mut ime = ComposerIme::default();
+        let mut draw = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(390., 760.),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        notebook.show(ui, &mut ime);
+                    });
+                },
+            )
+        };
+        fn find(shape: &egui::Shape, label: &str) -> Option<egui::Pos2> {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, label)),
+                _ => None,
+            }
+        }
+        let first = draw(vec![]);
+        let pos = first
+            .shapes
+            .iter()
+            .find_map(|shape| find(&shape.shape, "New note"))
+            .unwrap();
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        draw(vec![egui::Event::PointerMoved(pos), click(true)]);
+        let editor = draw(vec![click(false)]);
+        for label in ["H1", "B", "I", "Link", "Table", "Image", "Tag", "Save"] {
+            assert!(
+                editor
+                    .shapes
+                    .iter()
+                    .any(|shape| find(&shape.shape, label).is_some()),
+                "missing {label}"
+            );
+        }
+        assert!(notebook.note.unwrap().draft_title.is_some());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
 
     #[test]
     fn markdown_actions_work_on_selected_unicode() {

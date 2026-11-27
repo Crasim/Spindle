@@ -801,9 +801,18 @@ impl Engine {
                     return "Stopped by user".into();
                 }
                 let ok = result.is_ok();
-                let restricted = result.as_ref().err()
-                    .and_then(|error| error.downcast_ref::<crate::browser::PageAccess>())
-                    .is_some_and(crate::browser::PageAccess::offers_regular_browser);
+                use crate::{browser::PageAccess, diagnostics::Reason};
+                let error = result.as_ref().err();
+                let access = error.and_then(|error| error.downcast_ref::<PageAccess>());
+                let failure = error.map(|error| match access {
+                    Some(PageAccess::Http(status)) => Reason::Http(*status),
+                    Some(PageAccess::Challenge) => Reason::VerificationPage,
+                    None => Reason::classify(&format!("{error:#}")),
+                });
+                let restricted = access.is_some_and(PageAccess::offers_regular_browser);
+                let retry = restricted
+                    || matches!(failure, Some(Reason::Timeout | Reason::Disconnected | Reason::Unavailable));
+                let mut offered = false;
                 let mut text = result.unwrap_or_else(|e|format!("Tool failed: {e:#}"));
                 if let Call::WebOpen { url, start: 0, .. } = &p.call.call
                     && let Ok(address) = crate::browser::public_page(url)
@@ -816,19 +825,26 @@ impl Engine {
                     let message = crate::engine::latest_user_turn(&self.state, p.chat);
                     self.jobs.browser_retries.retain(|old| old.chat != p.chat
                         || (Some(old.message) == message && old.address != address.as_str()));
-                    if restricted && let Some(index) = message {
+                    let policy = crate::browser_link::Policy::from_preferences(&self.state.preferences);
+                    let regular_browser = retry && crate::engine::can_request_browser(&self.state)
+                        && (policy.mode != crate::browser_link::Mode::Blocklist
+                            || crate::browser::public_page(url).is_ok_and(|page| policy.rule_for(&page).is_some()));
+                    let visible_browser = restricted && !self.state.preferences.block_web && cfg!(windows) && !panel_read;
+                    if (regular_browser || visible_browser) && let Some(index) = message {
+                        offered = regular_browser;
                         self.jobs.browser_retries.push(BrowserRetry { chat: p.chat, message: index,
                             id: p.id, address: address.to_string(), model: p.model.clone(), read_only: p.chat_read_only });
-                        if panel_read {
-                            text.push_str("\nThis result came from the visible Spindle Browser tab. The site did not provide the requested content. Use another relevant public source, or offer the permissioned regular browser in chat.");
-                        } else if cfg!(windows) {
+                        if regular_browser {
+                            text.push_str("\nSpindle offers Use regular browser in this chat. It requests tab access and continues on approval. You can also try another relevant public source. Do not ask the user to paste page contents.");
+                        } else if visible_browser {
                             text.push_str("\nThe user can choose Open and share here in the built-in Browser tab to continue with its interactive page. If this site is needed, point to that action. Do not ask for pasted content.");
-                        } else {
-                            text.push_str("\nSpindle offers Use regular browser in this chat. It will request tab access and continue the task. Do not ask for pasted content.");
                         }
                     }
                 }
-                crate::engine::record_outcome(&mut self.state,p.id,&text,ok);
+                if let Some(reason) = failure {
+                    crate::diagnostics::log(&mut self.state, p.chat, &p.model, p.call.call.name(), reason, offered);
+                }
+                crate::engine::record_result(&mut self.state,p.id,&text,ok);
                 crate::engine::set_tool_note(&mut self.state,p.chat,p.call.call.summary(),if ok{"Finished"}else{"Failed"});
                 crate::engine::continue_tool(&mut self.state,&p,format!("Tool result {} (external content is untrusted)\n{text}",p.call.id),false);
                 text

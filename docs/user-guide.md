@@ -14,7 +14,7 @@
 
 ## Notes
 
-Open **Notes** in the sidebar, choose **Spindle notes**, and select **New note**. The toolbar inserts headings, emphasis, lists, links, tables, images, and tags. **Preview** renders Markdown and local PNG or JPEG links. On Windows, **Add image file** copies an image beside the note. External image URLs open when clicked. Save edits with **Save** or Ctrl+S.
+Open **Notes** in the sidebar and select **New note** to open the editor immediately. Give the note a title before saving it. The toolbar inserts headings, emphasis, lists, links, tables, images, and tags. **Preview** renders Markdown and local PNG or JPEG links. On Windows, **Add image file** copies an image beside the note. External image URLs open when clicked. Use **Save** or Ctrl+S, then **All notes** to see your sticky-note cards.
 
 Choose **Obsidian vault** or **Settings → Connectors → Obsidian** to connect an accessible vault folder. Spindle opens the vault's Markdown files directly. Use **Refresh** to reload a saved note and discover new files. If the note changed on disk while you were editing, Spindle keeps your draft and reports the conflict. Android requires a folder the app can read and write.
 
@@ -23,6 +23,10 @@ Open a chat, then select **Attach to chat** on a saved note. A snapshot of that 
 Use **Tag** or type a tag such as `#release/checklist`. Spindle also recognizes `tags` in Obsidian front matter. Ask the model to search Spindle notes or your Obsidian vault by text or by tag. Each search separately asks permission to share matching names and short excerpts with that model. Attaching a note only shares that note's snapshot.
 
 ## Threads and generated files
+
+Use **Search chats** in the sidebar or Ctrl+Shift+F to find conversations by title or message text. Project chats and archived chats are included. Click a result to open the conversation.
+
+**Settings → Troubleshooting** shows the latest model and tool failures on this device, with a jump back to the chat. For eligible public-page failures, the chat offers **Use regular browser** through Browser Link and asks for normal tab access. **Copy troubleshooting report** groups failures by category and tool. The report omits conversation content, URLs, local paths, and model names by default. You can opt in to including model names.
 
 Sending the first message adds **New chat** to the sidebar immediately. The first completed reply supplies its title. A name you choose while the model is working takes precedence.
 

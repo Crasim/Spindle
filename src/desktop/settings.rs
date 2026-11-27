@@ -60,6 +60,7 @@ pub(super) enum IntegrationTab {
     Plugins,
     ComputerUse,
     Connectors,
+    Troubleshooting,
 }
 
 #[derive(Default)]
@@ -629,6 +630,7 @@ impl Desktop {
                 (IntegrationTab::Plugins, Icon::Plug, "Plugins", 108.),
                 (IntegrationTab::ComputerUse, Icon::Shield, "Computer use", 155.),
                 (IntegrationTab::Connectors, Icon::Plug, "Connectors", 128.),
+                (IntegrationTab::Troubleshooting, Icon::Tool, "Troubleshooting", 165.),
             ] {
                 if control(ui, icon, label, egui::vec2(width, 35.), self.integration_tab == Some(tab)).clicked() {
                     self.preferences_tab = false;
@@ -1048,6 +1050,7 @@ impl Desktop {
             IntegrationTab::Plugins => "Plugins",
             IntegrationTab::ComputerUse => "Computer use",
             IntegrationTab::Connectors => "Connectors",
+            IntegrationTab::Troubleshooting => "Troubleshooting",
         });
         ui.add_space(10.);
         match tab {
@@ -1067,6 +1070,10 @@ impl Desktop {
             }
             IntegrationTab::Connectors => {
                 self.connector_settings(ui);
+                return;
+            }
+            IntegrationTab::Troubleshooting => {
+                self.troubleshooting(ui);
                 return;
             }
             IntegrationTab::ComputerUse => {}
@@ -1097,6 +1104,48 @@ impl Desktop {
                 self.sync_tab = true;
             }
         });
+    }
+
+    fn troubleshooting(&mut self, ui: &mut egui::Ui) {
+        let failures = &self.view.state.failures;
+        ui.label(format!("{} recorded failures in this workspace", failures.len()));
+        ui.weak("The report contains failure categories and counts. It stays here until you share it.");
+        ui.checkbox(&mut self.diagnostic_models, "Include model names in the report");
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Copy troubleshooting report").clicked() {
+                ui.ctx().copy_text(crate::diagnostics::report(failures, self.diagnostic_models));
+                self.notice = "Troubleshooting report copied".into();
+            }
+            #[cfg(windows)]
+            if ui.button("Save report…").clicked()
+                && let Some(path) = rfd::FileDialog::new().set_file_name("spindle-troubleshooting.txt").save_file()
+            {
+                let report = crate::diagnostics::report(failures, self.diagnostic_models);
+                self.notice = crate::tools::write_generated(&path, report.as_bytes(), true)
+                    .map_or_else(|error| error.to_string(), |()| "Troubleshooting report saved".into());
+            }
+        });
+        ui.add_space(12.);
+        let mut open = None;
+        for entry in failures.iter().rev() {
+            egui::Frame::new().fill(raised()).corner_radius(7).inner_margin(10).show(ui, |ui| {
+                ui.label(Text::new(format!("{} · {}", entry.operation, entry.reason.label())).strong());
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(time) = chrono::DateTime::from_timestamp(entry.time, 0) {
+                        ui.weak(time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string());
+                    }
+                    ui.weak(crate::providers::route(&entry.model).1);
+                    if entry.browser_link_offered { ui.weak("Browser Link offered"); }
+                    if self.view.state.thread_data(entry.chat).is_some() && ui.small_button("Open chat").clicked() {
+                        open = Some(entry.chat);
+                    }
+                });
+            });
+        }
+        if let Some(chat) = open {
+            self.send(format!("/open {chat}"));
+            self.page = Page::Chat;
+        }
     }
 
     fn browser_settings_card(&mut self, ui: &mut egui::Ui, browser: crate::browser::LinkBrowser) {

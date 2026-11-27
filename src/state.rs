@@ -124,6 +124,8 @@ pub struct ActionRecord {
     pub time: i64,
     pub chat: u64,
     pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub tool: String,
     pub summary: String,
     pub risk: crate::policy::Risk,
     pub decision: String,
@@ -215,6 +217,9 @@ pub struct State {
     /// Every tool action: what was asked, what was decided and what happened. Newest last.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<ActionRecord>,
+    /// Local troubleshooting entries. Sync transports send conversation records separately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<crate::diagnostics::Failure>,
     /// Projects whose memory is turned off.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub memory_off: std::collections::BTreeSet<PathBuf>,

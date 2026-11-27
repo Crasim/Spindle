@@ -26,6 +26,7 @@ mod compaction;
 mod control;
 mod desktop;
 mod diff;
+mod diagnostics;
 mod documents;
 mod editing;
 mod engine;

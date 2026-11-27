@@ -146,8 +146,9 @@ pub fn read(root: &Path, relative: &Path) -> Result<String> {
     bounded_read(&path)
 }
 
-pub fn create(root: &Path, title: &str) -> Result<PathBuf> {
+pub fn create(root: &Path, title: &str, text: &str) -> Result<PathBuf> {
     let title = title.trim();
+    ensure!(text.len() <= MAX_NOTE, "This editor supports Markdown notes up to 1 MiB");
     ensure!(
         !title.is_empty()
             && title.len() <= 160
@@ -163,7 +164,7 @@ pub fn create(root: &Path, title: &str) -> Result<PathBuf> {
         format!("{title}.md")
     });
     let path = resolve(root, &relative)?;
-    crate::tools::write_generated(&path, b"", false).context("Create the note")?;
+    crate::tools::write_generated(&path, text.as_bytes(), false).context("Create the note")?;
     Ok(relative)
 }
 
@@ -318,8 +319,8 @@ mod tests {
     fn notes_search_tags_and_refuse_stale_saves() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let root = dir.path().canonicalize()?;
-        let path = create(&root, "Meeting notes")?;
-        assert!(create(&root, "Meeting notes").is_err());
+        let path = create(&root, "Meeting notes", "")?;
+        assert!(create(&root, "Meeting notes", "replacement").is_err());
         let text = "---\ntags:\n  - work/planning\n---\n# Decisions\nShip Friday. #launch\n";
         save(&root, &path, "", text)?;
         assert!(
