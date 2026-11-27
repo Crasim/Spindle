@@ -247,14 +247,12 @@ pub fn inventory(state: &crate::state::State) -> String {
     if !crate::comfy::Settings::from(&state.preferences).ready() {
         lines.push("Image generation needs a server in Settings › Models › Image generation.".into());
     }
-    if let Some(s) = &state.space {
-        if s.paused {
-            lines.push("Remote work is paused. Resume sync in Settings › Sync on the sending and receiving devices.".into());
-        } else {
-            for (peer, os) in &s.remote.platforms {
-                lines.push(format!("Paired {os}: {peer}"));
-            }
-        }
+    let shells = crate::host_shell::available();
+    if !shells.is_empty() {
+        lines.push(format!("Approved local shells (host_shell): {shells}. Each command requires one-time approval."));
+    }
+    if crate::computer_use::SUPPORTED {
+        lines.push("Native Windows apps (desktop_control): list windows, inspect, click, type and release. Each access action requires approval. Press Escape to end access.".into());
     }
     lines.join("\n")
 }

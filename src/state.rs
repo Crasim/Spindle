@@ -797,6 +797,7 @@ impl State {
         } else {
             Conversation::default()
         };
+        crate::computer_use::stop(Some(self.chat_id));
         self.thread.model.clone_from(&self.model);
         let previous = Conversation {
             thread: std::mem::replace(&mut self.thread, next.thread),

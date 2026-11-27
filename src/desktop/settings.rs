@@ -1078,6 +1078,24 @@ impl Desktop {
             }
             IntegrationTab::ComputerUse => {}
         }
+        egui::Frame::new().fill(raised()).corner_radius(8).inner_margin(12).show(ui, |ui| {
+            ui.strong("Local computer");
+            let shells = crate::host_shell::available();
+            if !shells.is_empty() {
+                ui.label(format!("Available shells: {shells}. Spindle asks before each command."));
+            }
+            if crate::computer_use::SUPPORTED {
+                ui.label("Windows app control asks before listing windows, inspecting a window or sending input. Press Escape to revoke access.");
+                if let Some(window) = crate::computer_use::current() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(format!("Controlling {window}"));
+                        if ui.button("Stop control").clicked() { crate::computer_use::stop(None); }
+                    });
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                }
+            }
+        });
+        ui.add_space(12.);
         if !crate::browser::SUPPORTED {
             ui.label("Spindle Browser Link is available on Windows and Linux.");
             return;

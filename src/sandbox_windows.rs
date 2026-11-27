@@ -352,7 +352,7 @@ pub fn run(spec: &Spec, cancel: &Arc<AtomicBool>, private: bool) -> Result<Outco
         profile.readonly.push(&spec.work);
         acl(&spec.work, &profile.sid, GRANT_ACCESS, FILE_ALL_ACCESS)?;
         label_work(&spec.work)?;
-        return run_in(spec, cancel, &profile.sid, true);
+        return run_in(spec, cancel, Some((&profile.sid, true)), None);
     }
     let sid = container(&wide(PROFILE), false)?;
     for dir in &spec.readonly {
@@ -360,10 +360,14 @@ pub fn run(spec: &Spec, cancel: &Arc<AtomicBool>, private: bool) -> Result<Outco
     }
     grant_once(&spec.work, &sid, FILE_ALL_ACCESS)?;
     label_work(&spec.work)?;
-    run_in(spec, cancel, &sid, false)
+    run_in(spec, cancel, Some((&sid, false)), None)
 }
 
-fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, sid: &Sid, private: bool) -> Result<Outcome> {
+pub(super) fn run_host(spec: &Spec, cancel: &Arc<AtomicBool>, raw_suffix: Option<&str>) -> Result<Outcome> {
+    run_in(spec, cancel, None, raw_suffix)
+}
+
+fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, container: Option<(&Sid, bool)>, raw_suffix: Option<&str>) -> Result<Outcome> {
     // SAFETY: no name, default security.
     let job = Owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
     if job.0.is_null() {
@@ -401,7 +405,7 @@ fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, sid: &Sid, private: bool) -> Re
     drop(in_write);
 
     let mut capabilities = SECURITY_CAPABILITIES {
-        AppContainerSid: sid.0 as _,
+        AppContainerSid: container.map_or(std::ptr::null_mut(), |(sid, _)| sid.0 as _),
         Capabilities: std::ptr::null_mut(),
         CapabilityCount: 0,
         Reserved: 0,
@@ -409,18 +413,19 @@ fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, sid: &Sid, private: bool) -> Re
     let inherit: [HANDLE; 3] = [in_read.0, out_write.0, err_write.0];
     let mut size = 0usize;
     // SAFETY: the first call only reports the size needed.
-    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size) };
-    let mut list = vec![0u8; size];
+    let attribute_count = 1 + u32::from(container.is_some());
+    unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), attribute_count, 0, &mut size) };
+    let mut list = vec![0usize; size.div_ceil(std::mem::size_of::<usize>())];
     let attrs = list.as_mut_ptr() as *mut c_void;
     // SAFETY: the buffer has the reported size and lives until after CreateProcessW.
-    if unsafe { InitializeProcThreadAttributeList(attrs as _, 2, 0, &mut size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(attrs as _, attribute_count, 0, &mut size) } == 0 {
         bail!("Couldn't prepare the process attributes ({})", unsafe {
             GetLastError()
         });
     }
     // SAFETY: values outlive the attribute list's use.
     let ok = unsafe {
-        UpdateProcThreadAttribute(
+        (container.is_none() || UpdateProcThreadAttribute(
             attrs as _,
             0,
             PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
@@ -428,7 +433,7 @@ fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, sid: &Sid, private: bool) -> Re
             std::mem::size_of::<SECURITY_CAPABILITIES>(),
             std::ptr::null_mut(),
             std::ptr::null(),
-        ) != 0
+        ) != 0)
             && UpdateProcThreadAttribute(
                 attrs as _,
                 0,
@@ -460,9 +465,17 @@ fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, sid: &Sid, private: bool) -> Re
         line.push(' ');
         line.push_str(&quote(a));
     }
+    if let Some(suffix) = raw_suffix {
+        line.push(' ');
+        line.push_str(suffix);
+    }
     let mut line = wide(line);
     let mut env: Vec<u16> = vec![];
-    for (k, v) in launch_environment(spec, private) {
+    let environment = match container {
+        Some((_, private)) => launch_environment(spec, private),
+        None => crate::host_shell::environment(),
+    };
+    for (k, v) in environment {
         env.extend(OsStr::new(&format!("{k}={v}")).encode_wide());
         env.push(0);
     }
@@ -494,7 +507,7 @@ fn run_in(spec: &Spec, cancel: &Arc<AtomicBool>, sid: &Sid, private: bool) -> Re
     drop(list);
     drop(in_read);
     if created == 0 {
-        bail!("Couldn't start the sandboxed program ({})", unsafe {
+        bail!("Couldn't start the program ({})", unsafe {
             GetLastError()
         });
     }

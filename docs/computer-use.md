@@ -2,6 +2,12 @@
 
 [Spindle](../README.md)
 
+## Local computer
+
+Ask Spindle to use a shell on **This device**. It shows the executable, working folder, and exact command and waits for **Allow once**. The command runs with the current account’s permissions outside the workspace sandbox. Windows supports PowerShell, Command Prompt, and Git Bash if detected. Linux supports Bash and `sh`. Android uses `/system/bin/sh` with Spindle’s app permissions. Output goes to the selected model. You can check detected shells in **Settings › Computer use**.
+
+On Windows, ask Spindle to inspect or interact with a visible app window. It can list window titles, read accessible controls, click, and type literal text. Each action shows its scope and asks for one-time approval. The same Spindle cursor used by Browser Link marks a click, and a border and status badge mark the window while control is active. Press **Esc** to revoke access and invalidate pending desktop approvals. A later action needs fresh approval. Use Browser Link for your regular browser.
+
 ## Side panel
 
 The Panel button opens **Viewer** for documents and previews, **Files** for chat attachments and outputs, **Library** for workspace files, and **Browser** for web pages beside the chat.
@@ -54,7 +60,7 @@ Open **Run on** under the chat box to choose an execution device for Cowork. Set
 
 On the destination, open **Settings › Sync › Devices › Manage** for the source device and enable **Allow sandboxed jobs from this device**. Select the kinds of jobs that device can run. **Check capabilities** in Run on asks the host what it can execute. The response appears in **Work queue › Remote jobs**, alongside other job statuses and **Save output** for completed builds.
 
-Spindle shows the destination and files in an approval card before sending a model-requested job. File edits and model selection stay with the conversation. Pool members can read submitted files and results. Changes to Run on apply to new tool requests. Requests already approved retain their destination. If a selected host is unavailable, Spindle reports the problem so you can change the route.
+Spindle shows the destination and files in an approval card before sending a model-requested job. The model can check capabilities only on devices selected in **Run on**. **This device** keeps a request local unless a specific operation has a remote override. Changing the route invalidates an outstanding model-requested inventory for the previous device. File edits and model selection stay with the conversation. Pool members can read submitted files and results. If a selected host is unavailable, Spindle reports the problem so you can change the route.
 
 For an explicit one-off job, `/remote inventory DEVICE` checks available tools, `/remote tool DEVICE TOOL_ID COMMAND [INPUT_FILES] -- [ARGS]` runs an installed CLI, and `/remote build DEVICE main.rs` compiles and tests selected source files. `/remote status` lists jobs and `/remote save JOB_ID` exports a returned executable. Use an explicit Python entry script for remote tests. Unittest discovery and retesting a locally built executable use the local device.
 

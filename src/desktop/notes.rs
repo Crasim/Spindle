@@ -454,13 +454,20 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
             });
             let scope = if req.risk == crate::policy::Risk::Browser {
                 format!("Paired tab for chat #{}", req.chat)
+            } else if matches!(req.call.call, crate::tools::Call::DesktopControl(_)) {
+                "Local Windows desktop".into()
             } else {
                 crate::projects::display_path(&req.target)
+            };
+            let permission = match &req.call.call {
+                crate::tools::Call::HostShell { .. } => "Run a local shell command",
+                crate::tools::Call::DesktopControl(_) => "Windows app access",
+                _ => req.risk.label(),
             };
             ui.label(
                 Text::new(format!(
                     "{} · {} · {} model ({})",
-                    req.risk.label(), scope, req.trust.label(), route(&req.model).1
+                    permission, scope, req.trust.label(), route(&req.model).1
                 ))
                 .size(12.)
                 .color(muted()),
@@ -514,7 +521,11 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
                     choice = Some(format!("/deny {}", req.id));
                 }
             });
-            if req.risk == crate::policy::Risk::Native {
+            if matches!(req.call.call, crate::tools::Call::HostShell { .. }) {
+                ui.weak("Approval applies only to the command shown above.");
+            } else if matches!(req.call.call, crate::tools::Call::DesktopControl(_)) {
+                ui.weak("Approve only this action. Press Esc to revoke desktop access and invalidate pending approvals.");
+            } else if req.risk == crate::policy::Risk::Native {
                 ui.weak("Each build or test needs its own approval.");
             } else if req.risk == crate::policy::Risk::Browser {
                 ui.weak("Standing approvals apply to this URL, model, and action type. Manage them in Computer use.");

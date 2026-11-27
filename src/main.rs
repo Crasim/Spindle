@@ -62,6 +62,8 @@ mod sync;
 mod threads;
 mod tool_catalog;
 mod tools;
+mod host_shell;
+mod computer_use;
 mod tray;
 mod usage;
 mod vault;

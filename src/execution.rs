@@ -675,6 +675,14 @@ impl Engine {
         self.jobs.started = Some(tokio::spawn(async move {
             let approved = pending.approved && pending.risk == crate::policy::Risk::Native;
             let result = match pending.call.call.clone() {
+                Call::HostShell { shell, command } if approved => {
+                    let root = pending.root.clone();
+                    tokio::task::spawn_blocking(move || crate::host_shell::run(shell, &command, &root, &cancel)).await.map_err(anyhow::Error::from).and_then(|result| result)
+                }
+                Call::DesktopControl(action) if approved => {
+                    let (target, chat) = (pending.target.clone(), pending.chat);
+                    tokio::task::spawn_blocking(move || crate::computer_use::run(&action, &target, chat, &cancel)).await.map_err(anyhow::Error::from).and_then(|result| result)
+                }
                 Call::ImageModels {} => image_settings.unwrap().describe().await,
                 Call::FindTools { source, query } => match local {
                     Some(inventory) => Ok(inventory),

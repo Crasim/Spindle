@@ -19,6 +19,11 @@ use std::time::{Duration, Instant};
 #[path = "sandbox_windows.rs"]
 mod win;
 
+#[cfg(windows)]
+pub(crate) fn run_host(spec: &Spec, cancel: &Arc<AtomicBool>, raw_suffix: Option<&str>) -> Result<Outcome> {
+    win::run_host(spec, cancel, raw_suffix)
+}
+
 pub struct Spec {
     pub program: PathBuf,
     pub args: Vec<String>,

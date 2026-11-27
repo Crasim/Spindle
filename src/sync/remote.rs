@@ -580,10 +580,35 @@ fn snapshot(
     Ok(r)
 }
 
+pub fn model_targets(state: &State, chat: u64) -> impl Iterator<Item = &str> {
+    use super::placement::{Kind, Scope, Target};
+    let scope = Scope::Chat(chat);
+    Kind::OPERATIONS.into_iter().filter_map(move |kind| {
+        let Some(Target::Device(id)) = state.placement.effective(state, &scope, kind) else { return None };
+        let sync = state.space.as_ref().filter(|sync| !sync.paused)?;
+        let os = sync.remote.platforms.get(id)?;
+        (kind.supports(os) && id != &sync.identity.device.id && !sync.source_paused(id)).then_some(id.as_str())
+    })
+}
+
+pub fn validate_model_target(state: &State, chat: u64, call: &Call) -> Result<()> {
+    use super::placement::{Kind, Scope, Target};
+    if let Call::RemoteJob { device, .. } = call {
+        let scope = Scope::Chat(chat);
+        let routed = model_targets(state, chat).any(|id| id == device);
+        let matches_operation = Kind::for_call(call).is_none_or(|kind| {
+            matches!(state.placement.effective(state, &scope, kind), Some(Target::Device(id)) if id == device)
+        });
+        ensure!(routed && matches_operation,
+            "Use Run on to select a paired device for this operation. Local capabilities are available through find_tools with source local.");
+    }
+    Ok(())
+}
+
 pub fn selected_target(state: &State, chat: u64, call: &Call) -> Option<String> {
     use super::placement::{Kind, Scope, Target};
     if let Call::RemoteJob { device, .. } = call {
-        return Some(device.clone());
+        return Some(device.clone()); // model calls are checked before snapshot and dispatch
     }
     match state.placement.effective(state, &Scope::Chat(chat), Kind::for_call(call)?)? {
         Target::Device(id) => Some(id.clone()),
@@ -658,6 +683,7 @@ pub fn snapshot_call(state: &State, root: &Path, chat: u64, device: &str, call: 
 }
 
 pub fn submit_call(state: &mut State, p: &crate::state::Pending, req: Request) -> Result<String> {
+    validate_model_target(state, p.chat, &p.call.call)?;
     let sync = state
         .space
         .as_mut()
