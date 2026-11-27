@@ -38,7 +38,7 @@ A lightweight, local-first agent for coding and authorized computer work. Infere
 
 ## Decision and next step
 
-No decision blocks this design. Recommend **M1: Windows containment and one bounded repair**, after a separately authorized implementation phase. Before execution on James's hardware, record Windows build/edition, runtime location and a disposable fixture path. If containment fails, choose a separately reviewed VM profile or leave execution disabled; never add an unrestricted fallback.
+No decision blocks this design. Recommend **M1: Windows containment and one bounded repair**, after a separately authorized implementation phase. Record the test machine's Windows build and edition, runtime location, and disposable fixture path before execution. If containment fails, choose a separately reviewed VM profile or leave execution disabled. Keep execution disabled unless isolation is available.
 
 All platform behavior below is documentation-backed where cited. No Windows, Android, GPU or sandbox implementation has been tested in this phase.
 

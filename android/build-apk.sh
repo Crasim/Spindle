@@ -36,7 +36,9 @@ echo "Spindle $VERSION, Android build $BUILD"
 cargo build --locked --release --target aarch64-linux-android
 
 OUT=target/apk
-rm -rf "$OUT" && mkdir -p "$OUT/compiled" "$OUT/classes" "$OUT/generated" "$OUT/lib/arm64-v8a" "$OUT/assets/apk-builder"
+rm -rf "$OUT" && mkdir -p "$OUT/compiled" "$OUT/classes" "$OUT/generated" "$OUT/lib/arm64-v8a" "$OUT/assets/apk-builder" "$OUT/assets/docs"
+cp ../THIRD-PARTY-NOTICES.md "$OUT/assets/"
+cp ../docs/credits.md "$OUT/assets/docs/"
 "$BT/aapt2" compile --dir res -o "$OUT/compiled"
 "$BUILDER_BT/aapt2" link -o "$OUT/template.apk" -I "$PLATFORM" --manifest builder/ProjectManifest.xml
 unzip -p "$OUT/template.apk" AndroidManifest.xml > "$OUT/assets/apk-builder/manifest.bin"

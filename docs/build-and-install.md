@@ -18,6 +18,8 @@ While Spindle is running, rebuild into a separate folder with `cargo build --rel
 
 On Windows and Linux, open **Settings › Preferences › Updates** and choose **Check for updates**, then **Download update**. When the download is ready, choose **Restart to update**. Spindle saves the workspace, verifies the download’s SHA-256 digest again, and opens the updated app in the same workspace. The desktop release workflow publishes assets for a Git tag that matches the version in `Cargo.toml`. Builds from a GitHub checkout use that checkout's origin for downloads. Builds from source archives can set `SPINDLE_RELEASE_REPO` to the GitHub owner and repository.
 
+On Windows, Linux, and Android, **Release notes** in Updates opens the published version history. **What's new** shows the notes for an available download. **Credits and licenses** is in Preferences below Updates. Refresh the [third-party notices](../THIRD-PARTY-NOTICES.md) after dependency changes with `python tools/generate-third-party-notices.py` using the Cargo source caches for both builds.
+
 The current working directory identifies the workspace, and each workspace keeps its own chats. Start Spindle from the same folder each time (for example with **Start Spindle.vbs**). Starting the executable from its build folder opens a different, empty workspace. Projects open inside the one window from the sidebar. Desktop and interactive CLI share one session lock per workspace. Chats, pending work, attachment snapshots, and installed skills are saved in a Windows-user-encrypted session under `%LOCALAPPDATA%\Spindle\state`. Existing installs reopen their encrypted storage in place. One-shot queries use no session file.
 
 ## Android

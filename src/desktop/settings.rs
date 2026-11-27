@@ -162,13 +162,17 @@ pub(super) struct UpdatePanel {
     update: Option<crate::updates::Update>,
     job: Option<std::sync::mpsc::Receiver<anyhow::Result<UpdateResult>>>,
     status: String,
+    notes: std::collections::BTreeMap<semver::Version, crate::updates::ReleaseNote>,
+    notes_open: bool,
+    selected_note: Option<semver::Version>,
+    next_notes_page: Option<u32>,
     #[cfg(any(windows, target_os = "linux"))]
     confirm_restart: bool,
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 enum UpdateWork {
-    Check,
+    Check(u32),
     Download(crate::updates::Update),
     #[cfg(target_os = "android")]
     OpenApk,
@@ -176,7 +180,7 @@ enum UpdateWork {
 
 #[cfg(any(windows, target_os = "linux", target_os = "android"))]
 enum UpdateResult {
-    Checked(Option<crate::updates::Update>),
+    Checked(u32, crate::updates::ReleasePage),
     Downloaded,
     #[cfg(target_os = "android")]
     OpenedApk,
@@ -186,7 +190,8 @@ enum UpdateResult {
 impl UpdatePanel {
     fn run(&mut self, work: UpdateWork) {
         self.status = match &work {
-            UpdateWork::Check => "Checking GitHub Releases…",
+            UpdateWork::Check(1) => "Checking GitHub Releases…",
+            UpdateWork::Check(_) => "Loading older release notes…",
             UpdateWork::Download(_) => "Downloading and verifying…",
             #[cfg(target_os = "android")]
             UpdateWork::OpenApk => "Verifying the APK…",
@@ -198,8 +203,8 @@ impl UpdatePanel {
             let result = tokio::runtime::Runtime::new().map_err(anyhow::Error::from)
                 .and_then(|runtime| runtime.block_on(async {
                     match work {
-                        UpdateWork::Check => {
-                            Ok(UpdateResult::Checked(crate::updates::check().await?))
+                        UpdateWork::Check(page) => {
+                            Ok(UpdateResult::Checked(page, crate::updates::check(page).await?))
                         }
                         UpdateWork::Download(update) => {
                             crate::updates::download(&update).await?;
@@ -216,6 +221,74 @@ impl UpdatePanel {
         });
     }
 
+    fn show_notes_for(&mut self, version: Option<semver::Version>) {
+        self.notes_open = true;
+        if let Some(version) = version {
+            self.selected_note = Some(version);
+        }
+        if self.notes.is_empty() && self.job.is_none() {
+            self.run(UpdateWork::Check(1));
+        }
+    }
+
+    fn release_notes(&mut self, ui: &mut egui::Ui, staged: Option<&str>) {
+        let installed = crate::updates::current();
+        let available = self.update.as_ref().map(|update| update.version.clone())
+            .or_else(|| staged.and_then(|version| semver::Version::parse(version).ok()));
+        ui.separator();
+        ui.heading("Release notes");
+        let Some(version) = self.selected_note.as_ref().filter(|version| self.notes.contains_key(*version)).cloned()
+            .or_else(|| self.notes.range(..=installed.clone()).next_back().map(|(version, _)| version.clone()))
+            .or_else(|| self.notes.keys().next_back().cloned())
+        else {
+            if self.job.is_none() {
+                ui.weak("No release notes are loaded. Check for updates to load the history.");
+            }
+            return;
+        };
+        let label = |version: &semver::Version| {
+            if *version == installed {
+                format!("{version} · Installed")
+            } else if Some(version) == available.as_ref() {
+                format!("{version} · Update available")
+            } else {
+                version.to_string()
+            }
+        };
+        let mut selected = version;
+        crate::widgets::InlineChoice::from_id_salt("release-notes-version")
+            .selected_text(label(&selected))
+            .width(300.)
+            .show_ui(ui, |ui| {
+                for version in self.notes.keys().rev() {
+                    ui.selectable_value(&mut selected, version.clone(), label(version));
+                }
+            });
+        let note = &self.notes[&selected];
+        ui.horizontal_wrapped(|ui| {
+            if let Some(time) = note.published {
+                ui.weak(time.with_timezone(&chrono::Local).format("%b %-d, %Y").to_string());
+            }
+            if note.prerelease {
+                ui.weak("Beta");
+            }
+            ui.hyperlink_to("View on GitHub", &note.url);
+        });
+        ui.push_id(("release-note", &selected), |ui| {
+            if note.markdown.trim().is_empty() {
+                ui.weak("This release has no published notes.");
+            } else {
+                reader::markdown(ui, &note.markdown, false);
+            }
+        });
+        self.selected_note = Some(selected);
+        if let Some(page) = self.next_notes_page
+            && ui.add_enabled(self.job.is_none(), egui::Button::new("Load older releases")).clicked()
+        {
+            self.run(UpdateWork::Check(page));
+        }
+    }
+
     fn show(&mut self, ui: &mut egui::Ui, has_drafts: bool, submitting: bool) -> bool {
         #[cfg(any(windows, target_os = "linux"))]
         let mut restart = false;
@@ -229,9 +302,17 @@ impl UpdatePanel {
                 Ok(result) => {
                     self.job = None;
                     match result {
-                        Ok(UpdateResult::Checked(update)) => {
-                            self.status = if update.is_some() { String::new() } else { "No newer compatible release on GitHub.".into() };
-                            self.update = update;
+                        Ok(UpdateResult::Checked(page, releases)) => {
+                            self.status.clear();
+                            if page == 1 {
+                                self.notes.clear();
+                                self.update = releases.update;
+                                if self.update.is_none() {
+                                    self.status = "No newer compatible release on GitHub.".into();
+                                }
+                            }
+                            self.notes.extend(releases.notes);
+                            self.next_notes_page = releases.next_page;
                         }
                         Ok(UpdateResult::Downloaded) => {
                             self.status.clear();
@@ -299,9 +380,16 @@ impl UpdatePanel {
         }
         ui.horizontal_wrapped(|ui| {
             if ui.add_enabled(self.job.is_none(), egui::Button::new("Check for updates")).clicked() {
-                self.run(UpdateWork::Check);
+                self.run(UpdateWork::Check(1));
             }
             if crate::updates::releases_configured() {
+                if ui.selectable_label(self.notes_open, "Release notes").clicked() {
+                    if self.notes_open {
+                        self.notes_open = false;
+                    } else {
+                        self.show_notes_for(None);
+                    }
+                }
                 ui.hyperlink_to("GitHub Releases", crate::updates::releases_url());
             }
         });
@@ -314,15 +402,27 @@ impl UpdatePanel {
                     if ui.add_enabled(self.job.is_none(), egui::Button::new(label)).clicked() {
                         self.run(UpdateWork::Download(update.clone()));
                     }
-                    ui.hyperlink_to("Release notes", update.notes_url);
+                    if ui.button("What's new").clicked() {
+                        self.show_notes_for(Some(update.version));
+                    }
                 });
             }
+        }
+        if self.update.is_none()
+            && let Some(version) = staged.as_deref().and_then(|version| semver::Version::parse(version).ok())
+            && crate::updates::releases_configured()
+            && ui.button("What's new in the downloaded update").clicked()
+        {
+            self.show_notes_for(Some(version));
         }
         if self.job.is_some() {
             ui.spinner();
         }
         if !self.status.is_empty() {
             ui.label(&self.status);
+        }
+        if self.notes_open {
+            self.release_notes(ui, staged.as_deref());
         }
         restart
     }
@@ -1005,6 +1105,14 @@ impl Desktop {
                     .color(muted())
                     .size(13.),
             );
+            ui.add_space(14.);
+            egui::CollapsingHeader::new("Credits and licenses").show(ui, |ui| {
+                reader::markdown(ui, include_str!("../../docs/credits.md"), false);
+                ui.hyperlink_to(
+                    "Third-party notices and dependency licenses",
+                    "https://github.com/Crasim/Spindle/blob/main/THIRD-PARTY-NOTICES.md",
+                );
+            });
             return;
         }
         ui.horizontal_wrapped(|ui| {

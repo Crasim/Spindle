@@ -25,3 +25,4 @@ Spindle is a local-first workspace for AI chats and projects. Run models through
 | Building, updating, and installing on Android | [Build and install](docs/build-and-install.md) |
 | Terminal commands and agent integrations | [CLI and MCP](docs/cli-and-mcp.md) |
 | Architecture and roadmap | [Project design](Spindle-Design.md) |
+| Upstream projects, bundled assets, and licenses | [Credits and licenses](docs/credits.md) · [Third-party notices](THIRD-PARTY-NOTICES.md) |

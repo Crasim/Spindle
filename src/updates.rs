@@ -26,7 +26,19 @@ struct Release {
     draft: bool,
     prerelease: bool,
     tag_name: String,
+    body: Option<String>,
+    published_at: Option<String>,
     assets: Vec<Asset>,
+}
+
+impl Release {
+    fn version(&self) -> Option<Version> {
+        if self.draft {
+            return None;
+        }
+        let version = Version::parse(self.tag_name.strip_prefix('v')?).ok()?;
+        version.build.is_empty().then_some(version)
+    }
 }
 
 #[derive(Deserialize)]
@@ -40,9 +52,21 @@ struct Asset {
 #[derive(Clone)]
 pub struct Update {
     pub version: Version,
-    pub notes_url: String,
     url: String,
     record: Install,
+}
+
+pub struct ReleaseNote {
+    pub markdown: String,
+    pub url: String,
+    pub published: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub prerelease: bool,
+}
+
+pub struct ReleasePage {
+    pub notes: std::collections::BTreeMap<Version, ReleaseNote>,
+    pub update: Option<Update>,
+    pub next_page: Option<u32>,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -52,7 +76,7 @@ struct Install {
     size: u64,
 }
 
-fn current() -> Version {
+pub fn current() -> Version {
     Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo package version")
 }
 
@@ -79,21 +103,21 @@ fn valid_digest(digest: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
 }
 
-fn select(releases: Vec<Release>, installed: &Version, filename: &str) -> Option<Update> {
+fn select(releases: &[Release], installed: &Version, filename: &str) -> Option<Update> {
     let releases_url = releases_url();
     releases
-        .into_iter()
+        .iter()
         .filter_map(|release| {
-            if release.draft || (release.prerelease && installed.pre.is_empty()) {
+            if release.prerelease && installed.pre.is_empty() {
                 return None;
             }
-            let version = Version::parse(release.tag_name.strip_prefix('v')?).ok()?;
+            let version = release.version()?;
             if !newer(&version, installed) || (!version.pre.is_empty() && installed.pre.is_empty())
             {
                 return None;
             }
             let url = format!("{releases_url}/download/{}/{filename}", release.tag_name);
-            let asset = release.assets.into_iter().find(|asset| {
+            let asset = release.assets.iter().find(|asset| {
                 asset.name == filename
                     && asset.browser_download_url == url
                     && (1..=MAX_BINARY).contains(&asset.size)
@@ -109,11 +133,26 @@ fn select(releases: Vec<Release>, installed: &Version, filename: &str) -> Option
                     size: asset.size,
                 },
                 version,
-                notes_url: format!("{releases_url}/tag/{}", release.tag_name),
                 url,
             })
         })
         .max_by(|a, b| a.version.cmp_precedence(&b.version))
+}
+
+fn release_page(releases: Vec<Release>, page: u32, has_next: bool, installed: &Version, filename: &str) -> ReleasePage {
+    let update = if page == 1 { select(&releases, installed, filename) } else { None };
+    let notes = releases.into_iter().filter_map(|release| {
+        let version = release.version()?;
+        Some((version, ReleaseNote {
+            markdown: release.body.unwrap_or_default(),
+            url: format!("{}/tag/{}", releases_url(), release.tag_name),
+            published: release.published_at
+                .as_deref().and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok()),
+            prerelease: release.prerelease,
+        }))
+    }).collect();
+    let next_page = if has_next { page.checked_add(1) } else { None };
+    ReleasePage { notes, update, next_page }
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client> {
@@ -141,14 +180,18 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-pub async fn check() -> Result<Option<Update>> {
+pub async fn check(page: u32) -> Result<ReleasePage> {
     ensure!(!REPOSITORY.is_empty(), "This build has no GitHub release repository configured");
     let mut response = client(Duration::from_secs(15))?
-        .get(format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=50"))
+        .get(format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=50&page={page}"))
         .header("Accept", "application/vnd.github+json")
         .send()
         .await?
         .error_for_status()?;
+    // Reuse the known release endpoint for older pages.
+    let has_next = response.headers().get_all(reqwest::header::LINK).iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| value.contains(r#"rel="next""#));
     let mut data = Vec::new();
     while let Some(chunk) = response.chunk().await? {
         ensure!(
@@ -157,8 +200,10 @@ pub async fn check() -> Result<Option<Update>> {
         );
         data.extend_from_slice(&chunk);
     }
-    Ok(select(
+    Ok(release_page(
         serde_json::from_slice(&data)?,
+        page,
+        has_next,
         &current(),
         &asset_name(),
     ))
@@ -335,6 +380,8 @@ mod tests {
             draft: false,
             prerelease,
             tag_name: tag.into(),
+            body: None,
+            published_at: None,
             assets: vec![Asset {
                 name: filename.into(),
                 size: 2048,
@@ -349,7 +396,7 @@ mod tests {
             ("v0.9.0", false, true),
         ];
         for (installed, expected) in [("0.9.1", "1.0.0"), ("1.1.0-beta.1", "1.2.0-beta.1")] {
-            let candidates = releases
+            let candidates: Vec<_> = releases
                 .iter()
                 .map(|(tag, pre, hash)| {
                     fixture(
@@ -359,7 +406,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let update = select(candidates, &Version::parse(installed).unwrap(), filename).unwrap();
+            let update = select(&candidates, &Version::parse(installed).unwrap(), filename).unwrap();
             assert_eq!(update.version.to_string(), expected);
         }
     }
@@ -385,6 +432,8 @@ mod tests {
             draft: false,
             prerelease: true,
             tag_name: tag.into(),
+            body: None,
+            published_at: None,
             assets: vec![Asset {
                 name: filename.into(),
                 size: 2048,
@@ -398,7 +447,45 @@ mod tests {
             fixture("v0.3.0-beta.17", "spindle-windows-x86_64.exe", &origin),
             fixture("v0.3.0-beta.18", "Spindle.apk", "https://example.com"),
         ];
-        let update = select(releases, &installed, "Spindle.apk").unwrap();
+        let update = select(&releases, &installed, "Spindle.apk").unwrap();
         assert_eq!(update.version.to_string(), "0.3.0-beta.16");
+    }
+
+    #[test]
+    fn notes_show_published_history_and_keep_update_compatibility() {
+        let version = |v| Version::parse(v).unwrap();
+        let release = |tag: &str, draft, prerelease, body: Option<&str>, assets| Release {
+            tag_name: tag.into(),
+            draft, prerelease, body: body.map(str::to_owned), assets,
+            published_at: Some("2026-11-27T15:09:26Z".into()),
+        };
+        let filename = "Spindle.apk";
+        let asset = |tag| Asset {
+            name: filename.into(),
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+            size: 1200,
+            browser_download_url: format!("{}/download/{tag}/{filename}", releases_url()),
+        };
+        let releases = vec![
+            release("v1.0.0", false, false, Some("- An earlier fix"), vec![]),
+            release("v1.0.1", false, false, Some("## What's new"), vec![asset("v1.0.1")]),
+            release("v1.1.0-beta.1", false, true, Some("Unstable changes"), vec![asset("v1.1.0-beta.1")]),
+            release("v1.2.0", true, false, Some("Unpublished"), vec![asset("v1.2.0")]),
+            release("v2.0.0", false, false, None, vec![]),
+            release("v/untrusted-tag", false, false, Some("Ignore"), vec![]),
+        ];
+        let page = release_page(releases, 1, true, &version("1.0.0"), filename);
+        assert_eq!(page.next_page, Some(2));
+        assert_eq!(page.update.unwrap().version, version("1.0.1"));
+        assert_eq!(page.notes.keys().map(ToString::to_string).collect::<Vec<_>>(), [
+            "1.0.0", "1.0.1", "1.1.0-beta.1", "2.0.0",
+        ]);
+        assert_eq!(page.notes[&version("1.0.0")].markdown, "- An earlier fix");
+        assert!(page.notes[&version("1.0.0")].published.is_some());
+        assert!(page.notes[&version("1.1.0-beta.1")].prerelease);
+        assert!(page.notes[&version("2.0.0")].markdown.is_empty());
+        let older = release_page(vec![release("v0.9.0", false, false, None, vec![])], 2, false, &version("1.0.0"), filename);
+        assert_eq!(older.next_page, None);
+        assert!(older.update.is_none() && older.notes.contains_key(&version("0.9.0")));
     }
 }
