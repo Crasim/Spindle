@@ -15,6 +15,7 @@ mod html_preview;
 mod images;
 mod message_edit;
 mod notes;
+mod notebook;
 mod paste;
 mod submission;
 mod android_ime;
@@ -221,6 +222,7 @@ enum Page {
     Queue,
     Automations,
     Skills,
+    Notes,
     Settings,
 }
 
@@ -384,6 +386,7 @@ pub struct Desktop {
     /// The sidebar width last sent to be saved, so a drag is saved once.
     sidebar_sent: Option<u16>,
     plan: notes::PlanPane,
+    notebook: notebook::Notebook,
     memory: notes::MemoryPage,
     git: notes::GitPane,
     components: notes::ComponentsPane,
@@ -1090,6 +1093,7 @@ impl Desktop {
             discarding: false,
             sidebar_sent: None,
             plan: Default::default(),
+            notebook: Default::default(),
             memory: Default::default(),
             git: Default::default(),
             components: Default::default(),
@@ -1416,6 +1420,7 @@ impl Desktop {
                         format!("Work queue    {}", self.view.state.queue.len()),
                     ),
                     (Page::Skills, Icon::Skill, "Skill library".into()),
+                    (Page::Notes, Icon::Memory, "Notes".into()),
                     (Page::Automations, Icon::Clock, "Automations".into()),
                 ] {
                     if control(
@@ -1505,6 +1510,7 @@ impl Desktop {
                         Page::Queue => "Work queue",
                         Page::Automations => "Automations",
                         Page::Skills => "Skill library",
+                        Page::Notes => "Notes",
                         Page::Settings => "Settings",
                         Page::Projects => "Projects",
                         Page::Project => self.projects.home_title(),
@@ -3273,6 +3279,7 @@ impl eframe::App for Desktop {
                 }
                 match self.page {
                     Page::Chat => self.conversation(ui),
+                    Page::Notes => self.notes_page(ui),
                     Page::Queue => {
                         egui::ScrollArea::vertical().show(ui, |ui| self.queue(ui));
                     }

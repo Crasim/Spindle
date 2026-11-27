@@ -86,6 +86,12 @@ pub enum Call {
     BrowserTab(crate::browser_link::Action),
     #[serde(rename = "connector_read")]
     ConnectorRead { service: crate::connectors::Service, #[serde(default)] query: String },
+    #[serde(rename = "search_notes")]
+    SearchNotes {
+        #[serde(default)] library: crate::notebook::Library,
+        #[serde(default)] query: String,
+        #[serde(default)] tag: String,
+    },
     #[serde(rename = "read_skill")]
     ReadSkill {
         #[serde(default)]
@@ -189,6 +195,7 @@ impl Call {
             Call::Image { .. } => "image",
             Call::ImageModels {} => "image_models",
             Call::ImportConversations { .. } => "import_conversations",
+            Call::SearchNotes { .. } => "search_notes",
             Call::Speak { .. } => "speak",
             Call::Transcribe { .. } => "transcribe",
         }
@@ -207,7 +214,7 @@ impl Call {
             Call::Image { path, .. } => path.as_deref().unwrap_or("image.png"),
             Call::Speak { path, .. } => path.as_deref().unwrap_or("speech.wav"),
             Call::Transcribe { path } => path,
-            Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}|Call::Apply {} | Call::Setup {} | Call::Install { .. } | Call::ImageModels {} | Call::ImportConversations { .. } => ".",
+            Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::SearchNotes{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}|Call::Apply {} | Call::Setup {} | Call::Install { .. } | Call::ImageModels {} | Call::ImportConversations { .. } => ".",
         }
     }
 
@@ -231,7 +238,7 @@ impl Call {
         self.runs()
             || matches!(
                 self,
-                Call::Setup {} | Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}
+                Call::Setup {} | Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::SearchNotes{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}
                     | Call::BuildApk { .. }
                     | Call::Install { .. }
                     | Call::Browser { .. }
@@ -262,6 +269,7 @@ impl Call {
             Call::WebOpen{url,..}=>format!("Open public page {}", short(url,90)),
             Call::BrowserTab(operation) => operation.summary(),
             Call::ConnectorRead{service,..} => format!("Read {} account", service.label()),
+            Call::SearchNotes{library,..} => format!("Search {}", library.label()),
             Call::ReadSkill { name } if name.trim().is_empty() => "List installed skills".into(),
             Call::ReadSkill { name } => format!("Read skill {}", short(name, 60)),
             Call::FindTools{source,query}=>format!("Find tools in {source} · {}",short(query,90)),
@@ -626,6 +634,12 @@ pub fn definitions() -> serde_json::Value {
         "Read a bounded catalog from a connected service. Gmail accepts a search or message:ID for metadata and a snippet. Other services filter the first page by name. Each read requires approval.",
         serde_json::json!({"service":{"type":"string","enum":["onedrive","github","gmail","google_drive","dropbox"]},"query":s("Optional search or message:ID")}),
         &["service"],
+    ));
+    definitions.as_array_mut().unwrap().push(f(
+        "search_notes",
+        "Find saved Markdown notes using search text, a tag, or both. Results include matched names and short excerpts. Each search requires separate user approval, even when this conversation has a note attachment.",
+        serde_json::json!({"library":{"type":"string","enum":["spindle","obsidian"]},"query":s("Text in the note title or body"),"tag":s("One exact tag, e.g. work/planning")}),
+        &[],
     ));
     if crate::browser::SUPPORTED {
         definitions.as_array_mut().unwrap().push(f(
@@ -1137,6 +1151,7 @@ fn normalize(value: &mut serde_json::Value) {
             "web_open" => &["url", "start", "diagnostics"],
             "browser_tab" => &["action", "url", "target", "text"],
             "connector_read" => &["service", "query"],
+            "search_notes" => &["library", "query", "tag"],
             "read_skill" => &["name"],
             "image" => &["prompt", "path", "source", "options"],
             "image_models" => &[],
@@ -1689,7 +1704,7 @@ pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<
         }
         Call::Test { .. }
         | Call::Python { .. }
-        | Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::ReadSkill{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}
+        | Call::WebSearch{..}|Call::WebOpen{..}|Call::BrowserTab(_)|Call::ConnectorRead{..}|Call::SearchNotes{..}|Call::ReadSkill{..}|Call::FindTools{..}|Call::LoadTool{..}|Call::RunTool{..}
         | Call::RemoteJob { .. }
         | Call::BuildBinary { .. }
         | Call::TestBinary { .. }

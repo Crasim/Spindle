@@ -1350,7 +1350,15 @@ pub(super) struct Markdown {
 
 impl Markdown {
     pub(super) fn parse(ui: &egui::Ui, text: &str, files: &[String]) -> Self {
-        let blocks = markdown_blocks(ui, text, files);
+        Self::parse_content(ui, text, files, false)
+    }
+
+    pub(super) fn note(ui: &egui::Ui, text: &str) -> Self {
+        Self::parse_content(ui, text, &[], true)
+    }
+
+    fn parse_content(ui: &egui::Ui, text: &str, files: &[String], images: bool) -> Self {
+        let blocks = markdown_blocks(ui, text, files, images);
         let font = egui::TextStyle::Body.resolve(ui.style()).size;
         let columns = (ui.available_width() / (font * 0.55)).max(8.) as usize;
         let spacing = ui.spacing().item_spacing.y;
@@ -1531,7 +1539,7 @@ impl MarkdownBlock {
     }
 }
 
-fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String]) -> Vec<MarkdownBlock> {
+fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String], images: bool) -> Vec<MarkdownBlock> {
     let text = isolate_file_markers(text, files);
     let mut output = Vec::new();
     use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
@@ -1560,6 +1568,16 @@ fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String]) -> Vec<MarkdownB
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS | Options::ENABLE_TABLES,
     );
     while let Some(event) = parser.next() {
+        if images && let Event::Start(Tag::Image { dest_url, .. }) = event {
+            block.flush(&mut output);
+            output.push(MarkdownBlock::File(dest_url.into_string()));
+            for inner in parser.by_ref() {
+                if matches!(inner, Event::End(TagEnd::Image)) {
+                    break;
+                }
+            }
+            continue;
+        }
         if let Event::Start(Tag::Table(_)) = event {
             block.flush(&mut output);
             let mut rows: Vec<(bool, Vec<String>)> = vec![];

@@ -12,6 +12,16 @@
 - **Attach file** previews a workspace file for approval. The harness sends the approved snapshot with the next submitted task. The native picker supports UTF-8 text files up to 6,000 bytes. You can ask for analysis or a proposed patch.
 - In **Skills**, create a named draft from a brief, inspect its Markdown, try an example, and install it. Invoke it as `/<name> <task>`. The first-pass package format is one UTF-8 `SKILL.md` with simple front matter containing `name` and `description`, followed by its instructions. Installing from the workspace copies that definition into the local registry. Reinstall to update.
 
+## Notes
+
+Open **Notes** in the sidebar, choose **Spindle notes**, and select **New note**. The toolbar inserts headings, emphasis, lists, links, tables, images, and tags. **Preview** renders Markdown and local PNG or JPEG links. On Windows, **Add image file** copies an image beside the note. External image URLs open when clicked. Save edits with **Save** or Ctrl+S.
+
+Choose **Obsidian vault** or **Settings → Connectors → Obsidian** to connect an accessible vault folder. Spindle opens the vault's Markdown files directly. Use **Refresh** to reload a saved note and discover new files. If the note changed on disk while you were editing, Spindle keeps your draft and reports the conflict. Android requires a folder the app can read and write.
+
+Open a chat, then select **Attach to chat** on a saved note. A snapshot of that note goes with your next message. Repeat from another chat to attach the same note there. The Notes library and vault connection live on the current device.
+
+Use **Tag** or type a tag such as `#release/checklist`. Spindle also recognizes `tags` in Obsidian front matter. Ask the model to search Spindle notes or your Obsidian vault by text or by tag. Each search separately asks permission to share matching names and short excerpts with that model. Attaching a note only shares that note's snapshot.
+
 ## Threads and generated files
 
 Sending the first message adds **New chat** to the sidebar immediately. The first completed reply supplies its title. A name you choose while the model is working takes precedence.

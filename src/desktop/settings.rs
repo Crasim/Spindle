@@ -1623,6 +1623,10 @@ impl Desktop {
             }
         });
         if !form.status.is_empty() { ui.label(&form.status); }
+        ui.separator();
+        ui.strong("Obsidian");
+        ui.label("Connect a local vault to open and edit its Markdown notes in Notes.");
+        self.notebook.connector(ui, &mut self.android_ime);
     }
 
     fn local_server_settings(&mut self, ui: &mut egui::Ui) {

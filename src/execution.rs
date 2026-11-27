@@ -700,6 +700,14 @@ impl Engine {
                 Call::ConnectorRead { service, query } if pending.approved && pending.risk == crate::policy::Risk::Connector => {
                     service.read(&query).await
                 }
+                Call::SearchNotes { library, query, tag } if pending.approved && pending.risk == crate::policy::Risk::Connector => {
+                    let approved = pending.target.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let root = library.root()?;
+                        anyhow::ensure!(root == approved, "The note library changed. Ask to search again.");
+                        crate::notebook::search(&root, library, &query, &tag)
+                    }).await.map_err(anyhow::Error::from).and_then(|result| result)
+                }
                 Call::LoadTool { source, package, version, sha256, reason } if approved => {
                     crate::tool_catalog::load(&source, &package, &version, &sha256, &reason, &cancel).await
                 }

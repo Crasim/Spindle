@@ -222,6 +222,10 @@ impl Desktop {
                 return;
             }
         };
+        self.attach_text(name, body);
+    }
+
+    pub(super) fn attach_text(&mut self, name: String, body: String) {
         let files = self
             .paste_drafts
             .files

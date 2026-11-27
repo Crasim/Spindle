@@ -36,6 +36,7 @@ mod html_preview;
 mod git;
 mod mcp;
 mod memory;
+mod notebook;
 mod meter;
 #[cfg(any(windows, target_os = "android"))]
 mod oauth;

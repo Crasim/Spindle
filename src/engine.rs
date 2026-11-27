@@ -2453,6 +2453,9 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
             tools.push(format!("- Account access to {} requires a connection in Settings › Connectors.", service.label()));
         }
     }
+    if mentions(&["note", "obsidian", "vault", " tag"]) {
+        tools.push(r#"- Search notes: {"name":"search_notes","args":{"library":"spindle","query":"words","tag":"optional-tag"}}. Use spindle or obsidian. Supply text, a tag, or both. Each lookup needs its own approval. An attached note grants access only to the attached snapshot."#.into());
+    }
     tools.push(r#"- Load a relevant skill: {"name":"read_skill","args":{"name":"SKILL"}} or omit name to list skills. Tool permissions apply."#.into());
     if mentions(&["import chat", "import conversation"]) || mentions(&["codex", "claude"]) && mentions(&["import", "migrate", "bring", "copy"]) {
         tools.push(r#"- Open the local chat picker: {"name":"import_conversations","args":{"source":"codex"}}. Source is codex or claude. The user chooses which chats to copy."#.into());
@@ -3453,7 +3456,7 @@ fn route_resolved_call(
             | crate::tools::Call::ImportConversations { .. }
     );
     let browser_tab = matches!(env.call, crate::tools::Call::BrowserTab(_));
-    let connector = matches!(env.call, crate::tools::Call::ConnectorRead { .. });
+    let connector = matches!(env.call, crate::tools::Call::ConnectorRead { .. } | crate::tools::Call::SearchNotes { .. });
     let tools_root = if sandboxed && project_chat && !catalog_lookup && !browser_tab && !connector && !matches!(&env.call, crate::tools::Call::TestBinary { .. } | crate::tools::Call::LoadTool { .. }) {
         match crate::workcopy::ensure(&crate::runtime::data_dir(), chat, &root) {
             Ok(copy) => copy,
@@ -3516,6 +3519,13 @@ fn route_resolved_call(
         } else {
             Err(anyhow::anyhow!("Use a connector query up to 300 characters with no control characters."))
         }
+    } else if let crate::tools::Call::SearchNotes { library, query, tag } = &env.call {
+        crate::notebook::validate(query, tag).and_then(|()| {
+            let target = library.root()?;
+            preview = format!("Search {}\nText: {}\nTag: {}\n\nThe selected model receives matching note names and short excerpts.",
+                library.label(), if query.is_empty() { "Any" } else { query }, if tag.is_empty() { "Any" } else { tag });
+            Ok((crate::policy::Risk::Connector, target))
+        })
     } else if catalog_lookup {
         Ok((crate::policy::Risk::Read,tools_root.clone()))
     } else if let crate::tools::Call::BuildApk { package, sources, .. } = &env.call {
@@ -4062,7 +4072,7 @@ impl Engine {
                 }
                 continue;
             }
-            if matches!(p.call.call,crate::tools::Call::FindTools{..}|crate::tools::Call::WebSearch{..}|crate::tools::Call::WebOpen{..}|crate::tools::Call::BrowserTab(_)|crate::tools::Call::ConnectorRead{..}|crate::tools::Call::LoadTool{..}|crate::tools::Call::RunTool{..}|crate::tools::Call::ImageModels{}) {
+            if matches!(p.call.call,crate::tools::Call::FindTools{..}|crate::tools::Call::WebSearch{..}|crate::tools::Call::WebOpen{..}|crate::tools::Call::BrowserTab(_)|crate::tools::Call::ConnectorRead{..}|crate::tools::Call::SearchNotes{..}|crate::tools::Call::LoadTool{..}|crate::tools::Call::RunTool{..}|crate::tools::Call::ImageModels{}) {
                 self.start_catalog(p);
                 continue;
             }
@@ -7245,6 +7255,32 @@ mod tests {
         assert!(e.state.history.is_empty());
         e.command("/open 0", false).unwrap();
         assert_eq!(e.state.history.len(), 4);
+    }
+
+    #[test]
+    fn an_attached_note_never_approves_library_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut engine = fixture(&root);
+        std::fs::write(root.join("memo.md"), "A shared note #launch").unwrap();
+        engine.command("/add memo.md", false).unwrap();
+        engine.command("/approve", false).unwrap();
+        engine.command("Search my other notes tagged launch", false).unwrap();
+        assert!(engine.state.queue[0].context.contains("A shared note"));
+        let (_, messages) = request(&engine.state, &engine.state.queue[0]).unwrap();
+        assert!(messages[0].content.contains("search_notes"));
+        finish_turn(&mut engine.state, concat!("```spindle-tool\n",
+            r#"{"v":1,"id":"search","tool":"search_notes","args":{"library":"spindle","tag":"launch"}}"#,
+            "\n```").into(), Turn::default(), Some(&root)).unwrap();
+        let approval = &engine.state.requests[0];
+        let id = approval.id;
+        assert_eq!(approval.risk, crate::policy::Risk::Connector);
+        assert!(!approval.approved);
+        assert!(approval.preview.contains("Tag: launch"));
+        assert!(engine.command(&format!("/approve {id} conversation"), false).is_err());
+        engine.command(&format!("/deny {id}"), false).unwrap();
+        assert!(engine.state.queue[0].text.contains("The user denied"));
+        assert!(engine.state.grants.is_empty());
     }
 
     #[test]
