@@ -1,9 +1,9 @@
-use eframe::egui::{self, Galley, Id, Label, Pos2, Rect, Response, Sense, Ui, WidgetText};
+use eframe::egui::{self, Galley, Label, Pos2, Rect, Response, Sense, Ui, WidgetText};
 use std::sync::Arc;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Endpoint {
-    label: Id,
+    label: (usize, usize, usize),
     character: usize,
 }
 
@@ -15,7 +15,7 @@ pub(super) struct Selection {
 }
 
 struct Span {
-    key: Id,
+    key: (usize, usize, usize),
     response: Response,
     pos: Pos2,
     galley: Arc<Galley>,
@@ -39,19 +39,27 @@ impl Span {
 #[derive(Default)]
 pub(super) struct ChatText {
     spans: Option<Vec<Span>>,
-    message: Option<(Id, usize)>,
+    message: usize,
+    block: usize,
+    first_span: usize,
 }
 
 impl ChatText {
     pub(super) fn collecting() -> Self {
         Self {
             spans: Some(Vec::new()),
-            message: None,
+            ..Self::default()
         }
     }
 
-    pub(super) fn message(&mut self, key: impl std::hash::Hash) {
-        self.message = Some((Id::new(key), self.spans.as_ref().map_or(0, Vec::len)));
+    pub(super) fn message(&mut self, index: usize) {
+        self.message = index;
+        self.block(0);
+    }
+
+    pub(super) fn block(&mut self, index: usize) {
+        self.block = index;
+        self.first_span = self.spans.as_ref().map_or(0, Vec::len);
     }
 
     pub(super) fn label(
@@ -101,9 +109,8 @@ impl ChatText {
         } else {
             egui::CursorIcon::Text
         });
-        let (message, first) = self.message.unwrap_or((Id::new("chat-body"), 0));
         spans.push(Span {
-            key: message.with(spans.len() - first),
+            key: (self.message, self.block, spans.len() - self.first_span),
             response: response.clone(),
             pos,
             galley,
@@ -132,9 +139,11 @@ impl Selection {
         self.dragging
     }
 
-    pub(super) fn needs_all_rows(&self, ui: &Ui) -> bool {
-        self.dragging || self.range.is_some_and(|(start, end)| start != end || ui.input(|i|
-            i.modifiers.command && i.key_pressed(egui::Key::A)))
+    pub(super) fn copy_rows(&self, ui: &Ui, copy_button: Option<&Response>) -> Option<std::ops::RangeInclusive<usize>> {
+        let (a, b) = self.range?;
+        let copy = copy_button.is_some_and(|r| r.clicked())
+            || (!ui.ctx().wants_keyboard_input() && ui.input(|i| i.events.contains(&egui::Event::Copy)));
+        copy.then(|| a.label.0.min(b.label.0)..=a.label.0.max(b.label.0))
     }
 
     pub(super) fn touch_copy_visible(&self) -> bool {
@@ -158,9 +167,9 @@ impl Selection {
         }
         if let Some(pos) = pos {
             if let Some(span) = spans.iter().find(|s| s.response.contains_pointer()) {
-                let at = span.endpoint(pos);
                 let word = span.response.double_clicked() || span.response.long_touched();
                 if word || (pressed && !touch) {
+                    let at = span.endpoint(pos);
                     let (start, end) = if word {
                         let chars: Vec<_> = span.galley.text().chars().collect();
                         let mut start = at.character.min(chars.len().saturating_sub(1));
@@ -233,30 +242,15 @@ impl Selection {
         let Some((mut a, mut b)) = self.range else {
             return;
         };
-        if !spans.is_empty()
-            && !ui.ctx().wants_keyboard_input()
+        if !ui.ctx().wants_keyboard_input()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A))
         {
-            a = Endpoint {
-                label: spans[0].key,
-                character: 0,
-            };
-            let last = spans.last().unwrap();
-            b = Endpoint {
-                label: last.key,
-                character: last.galley.end().ccursor.index,
-            };
+            a = Endpoint { label: (0, 0, 0), character: 0 };
+            // Offscreen messages need no layout until the user actually copies them.
+            b = Endpoint { label: (usize::MAX, 0, 0), character: 0 };
             self.range = Some((a, b));
         }
-        let (Some(mut first), Some(mut last)) = (
-            spans.iter().position(|s| s.key == a.label),
-            spans.iter().position(|s| s.key == b.label),
-        ) else {
-            *self = Self::default();
-            return;
-        };
-        if (first, a.character) > (last, b.character) {
-            std::mem::swap(&mut first, &mut last);
+        if a > b {
             std::mem::swap(&mut a, &mut b);
         }
         let copy = copy_button.is_some_and(|r| r.clicked())
@@ -264,10 +258,9 @@ impl Selection {
                 && ui.input(|i| i.events.contains(&egui::Event::Copy)));
         let mut text = String::new();
         let mut previous: Option<Rect> = None;
-        for (offset, span) in spans[first..=last].iter().enumerate() {
-            let index = first + offset;
-            let start = if index == first { a.character } else { 0 };
-            let end = if index == last {
+        for span in spans.iter().filter(|span| a.label <= span.key && span.key <= b.label) {
+            let start = if span.key == a.label { a.character } else { 0 };
+            let end = if span.key == b.label {
                 b.character
             } else {
                 span.galley.end().ccursor.index

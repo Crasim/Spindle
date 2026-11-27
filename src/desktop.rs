@@ -500,11 +500,14 @@ impl Desktop {
 #[derive(Default)]
 struct TranscriptRows {
     chat: Option<u64>,
-    geometry: Option<(f32, f32, f32, bool)>,
+    geometry: Option<(f32, f32, f32, bool, bool, Color)>,
     heights: Vec<Option<f32>>,
     estimates: Vec<f32>,
     repeated: Vec<bool>,
     groups: Vec<Option<usize>>,
+    markdown: std::collections::BTreeMap<usize, reader::Markdown>,
+    file_sizes: std::collections::HashMap<String, Option<usize>>,
+    file_metadata: Option<Receiver<Vec<(String, Option<usize>)>>>,
 }
 
 impl TranscriptRows {
@@ -514,6 +517,10 @@ impl TranscriptRows {
             return;
         }
         if self.heights.is_empty() { return; }
+        if before.thread.project != after.thread.project {
+            self.file_sizes.clear();
+            self.file_metadata = None;
+        }
         let common = before.history.iter().zip(&after.history).take_while(|(a, b)| a == b).count();
         if common != before.history.len() || common != after.history.len() {
             self.repeated.clear();
@@ -526,6 +533,7 @@ impl TranscriptRows {
         }
         self.heights.truncate(common);
         self.estimates.truncate(common);
+        self.markdown.retain(|index, _| *index < common);
         for (index, height) in self.heights.iter_mut().enumerate() {
             if before.thread.turns.get(&index) != after.thread.turns.get(&index)
                 || before.thread.edited_messages.contains(&index) != after.thread.edited_messages.contains(&index)
@@ -534,6 +542,10 @@ impl TranscriptRows {
                         != after.thread.turns.get(&(index + 1)).map(|turn| &turn.pastes))
             {
                 *height = None;
+                self.markdown.remove(&index);
+                if let Some(turn) = after.thread.turns.get(&index) {
+                    for file in &turn.files { self.file_sizes.remove(file); }
+                }
             }
         }
     }
@@ -543,13 +555,25 @@ impl TranscriptRows {
             *self = Self { chat: Some(state.chat_id), ..Self::default() };
         }
         let geometry = (ui.available_width(), ui.ctx().pixels_per_point(),
-            egui::TextStyle::Body.resolve(ui.style()).size, state.preferences.nerd_stats);
+            egui::TextStyle::Body.resolve(ui.style()).size, state.preferences.nerd_stats,
+            ui.visuals().dark_mode, accent());
         if self.geometry != Some(geometry) {
             self.geometry = Some(geometry);
             self.heights.clear();
             self.estimates.clear();
+            self.markdown.clear();
         }
         self.heights.resize(state.history.len(), None);
+        if let Some(pending) = &self.file_metadata {
+            match pending.try_recv() {
+                Ok(files) => {
+                    self.file_sizes.extend(files);
+                    self.file_metadata = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.file_metadata = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if self.repeated.len() != state.history.len() {
             let mut seen = std::collections::HashSet::new();
             self.repeated = state.history.iter().map(|message| {
@@ -561,7 +585,7 @@ impl TranscriptRows {
             self.groups = step_groups(state);
         }
         // Give offscreen messages enough space to scroll to before their Markdown is laid out.
-        let (width, _, font, _) = geometry;
+        let (width, _, font, ..) = geometry;
         for (index, message) in state.history.iter().enumerate().skip(self.estimates.len()) {
             let width = if message.role == "user" { width * 0.85 } else { width };
             let columns = ((width - 28.) / (font * 0.54)).max(8.) as usize;
@@ -570,6 +594,27 @@ impl TranscriptRows {
             };
             self.estimates.push(48. + lines as f32 * (font + 4.));
         }
+    }
+
+    fn read_file_sizes(&mut self, ui: &egui::Ui, workspace: &Path, state: &crate::state::State,
+        names: std::collections::BTreeSet<String>) {
+        if names.is_empty() || self.file_metadata.is_some() { return; }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let workspace = workspace.to_owned();
+        let project = state.thread.project.clone();
+        let chat = state.chat_id;
+        let ctx = ui.ctx().clone();
+        std::thread::spawn(move || {
+            let root = crate::threads::files_root(&workspace, project.as_deref());
+            let files = names.into_iter().map(|name| {
+                let bytes = crate::artifacts::existing_file(&root, chat, &name).ok()
+                    .and_then(|path| std::fs::metadata(path).ok())
+                    .and_then(|m| m.len().try_into().ok());
+                (name, bytes)
+            }).collect();
+            if tx.send(files).is_ok() { ctx.request_repaint(); }
+        });
+        self.file_metadata = Some(rx);
     }
 
     fn skip(ui: &mut egui::Ui, height: f32) -> bool {
@@ -1900,7 +1945,6 @@ impl Desktop {
                     });
                 }
                 let mut action=None;
-                let files_root=self.view.state.files_root(&self.root,self.view.state.chat_id);
                 let mut open_file=None;
                 let mut open_document=None;
                 let state=&self.view.state;
@@ -1911,7 +1955,9 @@ impl Desktop {
                     }
                 }
                 self.transcript.begin(ui, state);
-                let full_transcript = self.chat_selection.needs_all_rows(ui);
+                let copy_rows = self.chat_selection.copy_rows(ui, copy_selection.as_ref());
+                let mut missing_sizes = std::collections::BTreeSet::new();
+                let mut visible_row = None;
                 let editing_row = self.message_editors.editing_row(state.chat_id);
                 let mut note=None;
                 let mut undo_at=None;
@@ -1922,7 +1968,8 @@ impl Desktop {
                 // The box drawn behind the current group of steps: its shape slot, top and start.
                 let mut group_box: Option<(egui::layers::ShapeIdx,f32,usize)>=None;
                 for (index,message) in state.history.iter().enumerate() {
-                    chat_text.message((state.chat_id,index));
+                    let copy_row = copy_rows.as_ref().is_some_and(|rows| rows.contains(&index));
+                    chat_text.message(index);
                     if let Some((slot,top,s))=group_box && groups[index]!=Some(s) {
                         close_group_box(ui,slot,top);
                         group_box=None;
@@ -1931,7 +1978,7 @@ impl Desktop {
                     if let Some(start)=groups[index] {
                         let open=self.open_steps.contains(&(state.chat_id,start));
                         if start==index {
-                            if !open && !full_transcript && index + 1 < state.history.len()
+                            if !open && !copy_row && index + 1 < state.history.len()
                                 && TranscriptRows::skip(ui, self.transcript.heights[index].unwrap_or(46.)) { continue; }
                             let top=ui.cursor().top();
                             let live=self.view.busy || self.view.job.is_some() || state.queue.front().is_some_and(|t|t.origin.unwrap_or(state.chat_id)==state.chat_id);
@@ -1953,10 +2000,12 @@ impl Desktop {
                     }
                     let cache_row = groups[index].is_none() && !state.thread.compactions.contains_key(&index)
                         && !state.thread.plan_notes.contains_key(&index) && !state.thread.tool_results.contains(&index)
-                        && editing_row != Some(index) && index + 1 < state.history.len();
-                    if cache_row && !full_transcript && TranscriptRows::skip(ui,
+                        && editing_row != Some(index) && !(index + 1 == state.history.len()
+                            && state.can_continue_stopped_goal());
+                    if cache_row && !copy_row && TranscriptRows::skip(ui,
                         self.transcript.heights[index].unwrap_or(self.transcript.estimates[index])) { continue; }
                     let top = ui.cursor().top();
+                    if !copy_row && ui.clip_rect().y_range().contains(top) { visible_row = Some(index); }
                     let user=message.role=="user";
                     let turn=state.thread.turns.get(&index);
                     if user && let Some(update)=state.thread.plan_notes.get(&index) {
@@ -2006,9 +2055,12 @@ impl Desktop {
                         turn.map(|t|t.files.iter().enumerate().filter(|(i,n)|!snapshots.iter().chain(previews).any(|f|&f.path==*n) && !t.files[..*i].contains(n)).map(|(_,n)|n).map(|n|crate::state::Attachment{path:n.clone(),text:String::new()}).collect()).unwrap_or_default()
                     };
                     let files = || snapshots.iter().chain(previews).chain(extra.iter());
-                    let size_of=|f:&crate::state::Attachment| if f.text.is_empty() {
-                        crate::artifacts::existing_file(&files_root,state.chat_id,&f.path).ok().and_then(|p|std::fs::metadata(p).ok()).map(|m|m.len() as usize).unwrap_or(0)
-                    } else {f.text.len()};
+                    let sizes = &self.transcript.file_sizes;
+                    let mut size_of=|f:&crate::state::Attachment| {
+                        if !f.text.is_empty() { return Some(f.text.len()); }
+                        if !sizes.contains_key(&f.path) && !copy_row { missing_sizes.insert(f.path.clone()); }
+                        sizes.get(&f.path).copied().flatten()
+                    };
                     let names: Vec<String> = files().map(|f|f.path.clone()).collect();
                     let mut shown: Vec<String> = vec![];
                     let mut chosen: Vec<(String, reader::FileAction)> = vec![];
@@ -2020,12 +2072,19 @@ impl Desktop {
                             None
                         }
                         else {
-                            reader::markdown_with_files(ui,&message.content,!user,&names,&mut chat_text,&mut |ui,name|{
+                            let mut card = |ui: &mut egui::Ui, name: &str| {
                                 if shown.iter().any(|s|s==name) {return;}
-                                let bytes=files().find(|f|f.path==name).map(&size_of).unwrap_or(0);
+                                let bytes=files().find(|f|f.path==name).and_then(&mut size_of);
                                 if let Some(a)=reader::file_card(ui,name,bytes) {chosen.push((name.to_owned(),a));}
                                 shown.push(name.to_owned());
-                            })
+                            };
+                            if copy_row {
+                                reader::markdown_with_files(ui, &message.content, !user, &names, &mut chat_text, &mut card)
+                            } else {
+                                self.transcript.markdown.entry(index)
+                                    .or_insert_with(|| reader::Markdown::parse(ui, &message.content, &names))
+                                    .show(ui, !user, &mut chat_text, &mut card, true)
+                            }
                         }
                     }).inner;
                     if let Some(turn)=turn.filter(|_|!user) {
@@ -2054,6 +2113,7 @@ impl Desktop {
                     }
                     for (name,choice) in chosen {
                         let Some(file)=files().find(|f|f.path==name) else {continue};
+                        let files_root=state.files_root(&self.root,state.chat_id);
                         let local=if user {true} else {turn.is_some_and(|t|t.files.contains(&file.path))};
                         let disk=if previews.iter().any(|a| a.path == file.path) {
                             preview_disk(state, &self.root, &file.path)
@@ -2095,6 +2155,10 @@ impl Desktop {
                     self.transcript.heights[index] = cache_row.then(|| ui.cursor().top() - top);
                 }
                 if let Some((slot,top,_))=group_box { close_group_box(ui,slot,top); }
+                if let Some(index) = visible_row && self.transcript.markdown.len() > 96 {
+                    self.transcript.markdown.retain(|row, _| row.abs_diff(index) <= 48);
+                }
+                self.transcript.read_file_sizes(ui, &self.root, state, missing_sizes);
                 if let Some(update)=state.thread.plan_notes.get(&state.history.len()) {
                     if let Some(a)=notes::user_plan_note(ui,update) {note=Some(a);}
                 }
@@ -2152,11 +2216,11 @@ impl Desktop {
                     } else {
                         message_row(ui,true,|ui|{
                             ui.label(Text::new(format!("You · #{}",t.id)).strong().color(muted()));
-                            chat_text.message((self.view.state.chat_id,self.view.state.history.len()));
+                            chat_text.message(self.view.state.history.len());
                             chat_text.label(ui, t.text.as_str(), false);
                         });
                     }
-                    chat_text.message((self.view.state.chat_id,self.view.state.history.len()+1));
+                    chat_text.message(self.view.state.history.len()+1);
                     message_row(ui,false,|ui|{
                     if self.view.busy {
                         // Release the watch lock before parsing and laying out the Markdown.
@@ -3380,7 +3444,13 @@ mod transcript_tests {
         draw(&ctx, &mut app, 28, vec![Event::Key {
             key: Key::A, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::COMMAND,
         }]);
-        let copied = draw(&ctx, &mut app, 29, vec![Event::Copy]);
+        // Scrolling with the whole chat selected must keep offscreen rows virtualized.
+        draw(&ctx, &mut app, 29, vec![Event::PointerMoved(Pos2::new(400., 400.)),
+            Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0., -100_000.), modifiers: Modifiers::NONE },
+        ]);
+        for frame in 30..49 { draw(&ctx, &mut app, frame, vec![]); }
+        assert!(app.transcript.heights[40].is_none());
+        let copied = draw(&ctx, &mut app, 49, vec![Event::Copy]);
         assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
             egui::OutputCommand::CopyText(text) if text.contains("Message 0") && text.contains("Message 79"))));
     }
@@ -3425,6 +3495,43 @@ mod transcript_tests {
         }
         times.sort_by(f64::total_cmp);
         println!("500-message transcript: p50 {:.2} ms, p95 {:.2} ms", times[20], times[37]);
+    }
+
+    #[test]
+    #[ignore = "measures active scrolling through a long Markdown reply at phone width"]
+    fn scrolling_transcript_frame_times() {
+        use egui::{Event, Modifiers, MouseWheelUnit};
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 500);
+        let mut report = String::new();
+        for i in 0..600 {
+            report.push_str(&format!("### Finding {i}\n\n**Status.** A paragraph with `inline code` and [a link](https://example.com/{i}). The next line explains the result.\n\n- First detail\n- Second detail\n\n"));
+        }
+        app.view.state.history.push(crate::ollama::Message::new("assistant", report));
+        for frame in 0..4 { draw_at_width(&ctx, &mut app, frame, vec![], 420.); }
+        let bottom = draw_at_width(&ctx, &mut app, 4, vec![], 420.);
+        let finding = |output: &egui::FullOutput| (0..600).rev()
+            .find(|index| visible_text(output, &format!("Finding {index}")).is_some())
+            .expect("at least one paragraph from the long reply is visible");
+        let newest = finding(&bottom);
+        assert!(newest > 590);
+        let mut times = Vec::new();
+        for frame in 5..85 {
+            let direction = if frame < 45 { 1. } else { -1. };
+            let events = vec![Event::PointerMoved(egui::pos2(200., 400.)), Event::MouseWheel {
+                unit: MouseWheelUnit::Point, delta: egui::vec2(0., direction * 175.), modifiers: Modifiers::NONE,
+            }];
+            let start = std::time::Instant::now();
+            let output = draw_at_width(&ctx, &mut app, frame, events, 420.);
+            let layout = start.elapsed();
+            let earlier = if frame == 44 { Some(finding(&output)) } else { None };
+            let paint = std::time::Instant::now();
+            std::hint::black_box(ctx.tessellate(output.shapes, output.pixels_per_point));
+            times.push((layout + paint.elapsed()).as_secs_f64() * 1000.);
+            if let Some(earlier) = earlier { assert!(earlier < newest - 10); }
+        }
+        times.sort_by(f64::total_cmp);
+        println!("Scrolling first pass p50 {:.2} ms, p95 {:.2} ms, worst {:.2} ms", times[40], times[75], times[79]);
     }
 }
 

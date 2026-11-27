@@ -73,10 +73,7 @@ impl State {
     /// Folder whose artifacts directory receives this thread's generated files and pastes.
     /// A project that is no longer available falls back to the workspace.
     pub fn files_root(&self, root: &Path, id: u64) -> PathBuf {
-        self.thread_data(id)
-            .and_then(|(t, _)| t.project.clone())
-            .filter(|p| crate::projects::existing(p).ok().flatten().is_some())
-            .unwrap_or_else(|| root.to_path_buf())
+        files_root(root, self.thread_data(id).and_then(|(t, _)| t.project.as_deref()))
     }
 
     pub fn thread_data(&self, id: u64) -> Option<(&ThreadInfo, &[Message])> {
@@ -162,6 +159,11 @@ impl State {
         self.placement.forget_chat(id);
         Ok(())
     }
+}
+
+pub(crate) fn files_root(workspace: &Path, project: Option<&Path>) -> PathBuf {
+    project.filter(|p| crate::projects::existing(p).ok().flatten().is_some())
+        .unwrap_or(workspace).to_owned()
 }
 
 fn checked_label(input: &str, max: usize, empty: bool) -> Result<String> {

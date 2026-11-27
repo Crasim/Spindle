@@ -1084,7 +1084,7 @@ pub(super) enum FileAction {
 
 /// One compact card per generated file: icon, name, type and size, a primary action and a
 /// menu for the rest.
-pub(super) fn file_card(ui: &mut egui::Ui, name: &str, bytes: usize) -> Option<FileAction> {
+pub(super) fn file_card(ui: &mut egui::Ui, name: &str, bytes: Option<usize>) -> Option<FileAction> {
     let ext = name
         .rsplit_once('.')
         .map(|(_, e)| e.to_ascii_lowercase())
@@ -1128,11 +1128,8 @@ pub(super) fn file_card(ui: &mut egui::Ui, name: &str, bytes: usize) -> Option<F
                 if response.clicked() {
                     chosen = Some(FileAction::Open);
                 }
-                ui.weak(format!(
-                    "{} · {:.1} KB",
-                    ext.to_ascii_uppercase(),
-                    bytes as f64 / 1024.
-                ));
+                let kind = ext.to_ascii_uppercase();
+                ui.weak(bytes.map_or_else(|| kind.clone(), |n| format!("{kind} · {:.1} KB", n as f64 / 1024.)));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("More").clicked() {
                         options = !options;
@@ -1202,41 +1199,26 @@ impl Block {
             self.pieces.push(Piece::Job(std::mem::take(&mut self.job)));
         }
     }
+
+    fn flush(&mut self, output: &mut Vec<MarkdownBlock>) {
+        self.split();
+        if !self.pieces.is_empty() {
+            output.push(MarkdownBlock::Inline(std::mem::take(&mut self.pieces)));
+        }
+    }
+
     fn discard(&mut self) {
         self.job = Default::default();
         self.pieces.clear();
     }
-    fn flush(&mut self, ui: &mut egui::Ui, action: &mut Option<CodeAction>, selection: &mut ChatText) {
-        if self.pieces.is_empty() {
-            if !self.job.text.is_empty() {
-                selection.label(ui, std::mem::take(&mut self.job), false);
-            }
-            return;
-        }
-        self.split();
-        let pieces = std::mem::take(&mut self.pieces);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.;
-            for piece in pieces {
-                match piece {
-                    Piece::Job(job) => {
-                        selection.label(ui, job, false);
-                    }
-                    Piece::File(name) => {
-                        if selection.label(ui, Text::new(&name).monospace().color(accent()), true)
-                            .on_hover_text("Open in the side panel")
-                            .clicked()
-                        {
-                            *action = Some(CodeAction::OpenFile(name));
-                        }
-                    }
-                    Piece::Url(label, url) => {
-                        selection.url(ui, Text::new(label).color(accent()).into(), url);
-                    }
-                }
-            }
-        });
-    }
+}
+
+enum MarkdownBlock {
+    Inline(Vec<Piece>),
+    Table(Vec<(bool, Vec<String>)>),
+    Code { info: String, body: String, lines: usize },
+    File(String),
+    Rule,
 }
 
 /// A spreadsheet cell with the formatting the file gave it. Numbers line up on the right, as in
@@ -1330,9 +1312,202 @@ pub(super) fn markdown_with_files(
     selection: &mut ChatText,
     card: &mut dyn FnMut(&mut egui::Ui, &str),
 ) -> Option<CodeAction> {
+    Markdown::parse(ui, text, files).show(ui, actions, selection, card, false)
+}
+
+/// Parsed once for saved messages. Each block keeps its last measured height so very
+/// long replies only lay out the paragraphs, code, and tables near the viewport.
+pub(super) struct Markdown {
+    blocks: Vec<MarkdownBlock>,
+    heights: Vec<f32>,
+}
+
+impl Markdown {
+    pub(super) fn parse(ui: &egui::Ui, text: &str, files: &[String]) -> Self {
+        let blocks = markdown_blocks(ui, text, files);
+        let font = egui::TextStyle::Body.resolve(ui.style()).size;
+        let columns = (ui.available_width() / (font * 0.55)).max(8.) as usize;
+        let spacing = ui.spacing().item_spacing.y;
+        let heights = blocks.iter().map(|block| block.estimated_height(columns, font) + spacing).collect();
+        Self { blocks, heights }
+    }
+
+    pub(super) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        actions: bool,
+        selection: &mut ChatText,
+        card: &mut dyn FnMut(&mut egui::Ui, &str),
+        virtualize: bool,
+    ) -> Option<CodeAction> {
+        let mut action = None;
+        let clip = ui.clip_rect().expand(96.);
+        let mut skipped = 0.;
+        for (index, (block, height)) in self.blocks.iter().zip(&mut self.heights).enumerate() {
+            // File markers also tell the caller not to repeat a card below the message.
+            let top = ui.cursor().top() + skipped;
+            if virtualize && !matches!(block, MarkdownBlock::File(_))
+                && (top + *height <= clip.top() || top >= clip.bottom())
+            {
+                skipped += *height;
+                ui.skip_ahead_auto_ids(1);
+                continue;
+            }
+            if skipped > 0. {
+                ui.add_space(skipped);
+                skipped = 0.;
+            }
+            selection.block(index + 1);
+            let top = ui.cursor().top();
+            // Separate IDs keep buttons and collapsible code stable even if preceding
+            // paragraphs are offscreen.
+            ui.push_id(("markdown-block", index), |ui| block.show(ui, actions, selection, card, &mut action));
+            *height = ui.cursor().top() - top;
+        }
+        if skipped > 0. { ui.add_space(skipped); }
+        action
+    }
+}
+
+impl MarkdownBlock {
+    fn estimated_height(&self, columns: usize, font: f32) -> f32 {
+        match self {
+            Self::Inline(pieces) => {
+                let mut size = font;
+                let mut columns_used = 0;
+                let mut hard_breaks = 0;
+                for piece in pieces {
+                    match piece {
+                        Piece::Job(job) => {
+                            columns_used += job.text.len();
+                            hard_breaks += job.text.bytes().filter(|&ch| ch == b'\n').count();
+                            size = job.sections.iter().map(|s| s.format.font_id.size).fold(size, f32::max);
+                        }
+                        Piece::File(name) | Piece::Url(name, _) => columns_used += name.len(),
+                    }
+                }
+                let lines = (columns_used.div_ceil(columns)).max(hard_breaks + 1);
+                lines as f32 * (size * 1.18)
+            }
+            Self::Table(rows) => rows.len() as f32 * (font + 8.) + 12.,
+            Self::Code { lines, .. } if *lines <= 5 => 40. + *lines as f32 * font,
+            Self::Code { .. } => 30.,
+            Self::File(_) => 44.,
+            Self::Rule => 6.,
+        }
+    }
+
+    fn show(
+        &self,
+        ui: &mut egui::Ui,
+        actions: bool,
+        selection: &mut ChatText,
+        card: &mut dyn FnMut(&mut egui::Ui, &str),
+        action: &mut Option<CodeAction>,
+    ) {
+        match self {
+            Self::Inline(pieces) => {
+                if let [Piece::Job(job)] = pieces.as_slice() {
+                    selection.label(ui, job.clone(), false);
+                    return;
+                }
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.;
+                    for piece in pieces {
+                        match piece {
+                            Piece::Job(job) => { selection.label(ui, job.clone(), false); }
+                            Piece::File(name) => {
+                                if selection.label(ui, Text::new(name).monospace().color(accent()), true)
+                                    .on_hover_text("Open in the side panel").clicked()
+                                {
+                                    *action = Some(CodeAction::OpenFile(name.clone()));
+                                }
+                            }
+                            Piece::Url(label, url) => {
+                                selection.url(ui, Text::new(label).color(accent()).into(), url.clone());
+                            }
+                        }
+                    }
+                });
+            }
+            Self::Table(rows) => {
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1_f32, line()))
+                        .corner_radius(6)
+                        .inner_margin(6)
+                        .show(ui, |ui| {
+                            egui::Grid::new("cells")
+                                .striped(true)
+                                .spacing([14., 6.])
+                                .max_col_width(280.)
+                                .show(ui, |ui| {
+                                    for (header, cells) in rows {
+                                        for cell in cells {
+                                            let t = Text::new(cell);
+                                            selection.label(ui, if *header { t.strong().color(strong()) } else { t }, false);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                });
+            }
+            Self::Code { info, body, lines } => {
+                let language = info.split_whitespace().next().unwrap_or("Code");
+                egui::Frame::new()
+                    .fill(raised())
+                    .stroke(egui::Stroke::new(1_f32, line()))
+                    .corner_radius(8)
+                    .inner_margin(egui::Margin::symmetric(10, 4))
+                    .show(ui, |ui| {
+                        let id = ui.make_persistent_id("code");
+                        let collapse =
+                            egui::collapsing_header::CollapsingState::load_with_default_open(
+                                ui.ctx(),
+                                id,
+                                *lines <= 5,
+                            );
+                        collapse
+                            .show_header(ui, |ui| {
+                                ui.strong(language);
+                                ui.weak(format!("{lines} lines"));
+                                if ui.small_button("Copy").clicked() {
+                                    ui.ctx().copy_text(body.clone());
+                                }
+                                if actions {
+                                    if crate::artifacts::html(info)
+                                        && ui.small_button("Preview HTML").clicked()
+                                    {
+                                        *action =
+                                            Some(CodeAction::Preview(info.clone(), body.clone()));
+                                    }
+                                    if crate::artifacts::name(info, "").is_some()
+                                        && ui.small_button("Save file").clicked()
+                                    {
+                                        *action = Some(CodeAction::Save(info.clone(), body.clone()));
+                                    }
+                                }
+                            })
+                            .body(|ui| {
+                                egui::Frame::new()
+                                    .fill(panel())
+                                    .inner_margin(8)
+                                    .show(ui, |ui| {
+                                        selection.label(ui, Text::new(body.trim_end_matches('\n')).monospace(), false);
+                                    });
+                            });
+                    });
+            }
+            Self::File(name) => card(ui, name),
+            Self::Rule => { ui.separator(); }
+        }
+    }
+}
+
+fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String]) -> Vec<MarkdownBlock> {
     let text = isolate_file_markers(text, files);
-    let mut action = None;
-    let mut ordinal = 0;
+    let mut output = Vec::new();
     use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
     let mut style = egui::TextFormat {
         font_id: egui::TextStyle::Body.resolve(ui.style()),
@@ -1360,7 +1535,7 @@ pub(super) fn markdown_with_files(
     );
     while let Some(event) = parser.next() {
         if let Event::Start(Tag::Table(_)) = event {
-            block.flush(ui, &mut action, selection);
+            block.flush(&mut output);
             let mut rows: Vec<(bool, Vec<String>)> = vec![];
             let mut head = false;
             for inner in parser.by_ref() {
@@ -1390,39 +1565,15 @@ pub(super) fn markdown_with_files(
                     _ => {}
                 }
             }
-            ui.push_id(("md-table", ordinal), |ui| {
-                egui::ScrollArea::horizontal().show(ui, |ui| {
-                    egui::Frame::new()
-                        .stroke(egui::Stroke::new(1_f32, line()))
-                        .corner_radius(6)
-                        .inner_margin(6)
-                        .show(ui, |ui| {
-                            egui::Grid::new("cells")
-                                .striped(true)
-                                .spacing([14., 6.])
-                                .max_col_width(280.)
-                                .show(ui, |ui| {
-                                    for (header, cells) in &rows {
-                                        for cell in cells {
-                                            let t = Text::new(cell);
-                                            selection.label(ui, if *header { t.strong().color(strong()) } else { t }, false);
-                                        }
-                                        ui.end_row();
-                                    }
-                                });
-                        });
-                });
-            });
-            ordinal += 1;
+            output.push(MarkdownBlock::Table(rows));
             continue;
         }
         if let Event::Start(Tag::CodeBlock(kind)) = event {
-            block.flush(ui, &mut action, selection);
+            block.flush(&mut output);
             let info = match kind {
                 pulldown_cmark::CodeBlockKind::Indented => String::new(),
                 pulldown_cmark::CodeBlockKind::Fenced(i) => i.to_string(),
             };
-            let language = info.split_whitespace().next().unwrap_or("Code");
             let mut body = String::new();
             for inner in parser.by_ref() {
                 match inner {
@@ -1432,52 +1583,7 @@ pub(super) fn markdown_with_files(
                 }
             }
             let lines = body.lines().count();
-            ui.push_id(ordinal, |ui| {
-                egui::Frame::new()
-                    .fill(raised())
-                    .stroke(egui::Stroke::new(1_f32, line()))
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(10, 4))
-                    .show(ui, |ui| {
-                        let id = ui.make_persistent_id("code");
-                        let collapse =
-                            egui::collapsing_header::CollapsingState::load_with_default_open(
-                                ui.ctx(),
-                                id,
-                                lines <= 5,
-                            );
-                        collapse
-                            .show_header(ui, |ui| {
-                                ui.strong(language);
-                                ui.weak(format!("{lines} lines"));
-                                if ui.small_button("Copy").clicked() {
-                                    ui.ctx().copy_text(body.clone());
-                                }
-                                if actions {
-                                    if crate::artifacts::html(&info)
-                                        && ui.small_button("Preview HTML").clicked()
-                                    {
-                                        action =
-                                            Some(CodeAction::Preview(info.clone(), body.clone()));
-                                    }
-                                    if crate::artifacts::name(&info, "").is_some()
-                                        && ui.small_button("Save file").clicked()
-                                    {
-                                        action = Some(CodeAction::Save(info.clone(), body.clone()));
-                                    }
-                                }
-                            })
-                            .body(|ui| {
-                                egui::Frame::new()
-                                    .fill(panel())
-                                    .inner_margin(8)
-                                    .show(ui, |ui| {
-                                        selection.label(ui, Text::new(body.trim_end_matches('\n')).monospace(), false);
-                                    });
-                            });
-                    });
-            });
-            ordinal += 1;
+            output.push(MarkdownBlock::Code { info, body, lines });
             continue;
         }
         match event {
@@ -1495,7 +1601,7 @@ pub(super) fn markdown_with_files(
                         style.color = strong();
                     }
                     Tag::BlockQuote(_) => {
-                        block.flush(ui, &mut action, selection);
+                        block.flush(&mut output);
                         quote += 1;
                         style.color = muted();
                         style.italics = true;
@@ -1521,7 +1627,7 @@ pub(super) fn markdown_with_files(
                         }
                     }
                     Tag::List(start) => {
-                        block.flush(ui, &mut action, selection);
+                        block.flush(&mut output);
                         lists.push(start);
                     }
                     Tag::Item => {
@@ -1560,17 +1666,17 @@ pub(super) fn markdown_with_files(
                         file_marker(&paragraph).filter(|n| files.iter().any(|f| f == n))
                     {
                         block.discard();
-                        card(ui, name);
+                        output.push(MarkdownBlock::File(name.to_owned()));
                     }
                 }
                 if matches!(
                     tag,
                     TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::CodeBlock | TagEnd::Item
                 ) {
-                    block.flush(ui, &mut action, selection);
+                    block.flush(&mut output);
                 }
                 if matches!(tag, TagEnd::BlockQuote(_)) {
-                    block.flush(ui, &mut action, selection);
+                    block.flush(&mut output);
                     quote = quote.saturating_sub(1);
                 }
                 if tag == TagEnd::List(true) || tag == TagEnd::List(false) {
@@ -1607,14 +1713,14 @@ pub(super) fn markdown_with_files(
                     .append(if done { "[x] " } else { "[ ] " }, 0., code_style.clone())
             }
             Event::Rule => {
-                block.flush(ui, &mut action, selection);
-                ui.separator();
+                block.flush(&mut output);
+                output.push(MarkdownBlock::Rule);
             }
             _ => {}
         }
     }
-    block.flush(ui, &mut action, selection);
-    action
+    block.flush(&mut output);
+    output
 }
 
 #[cfg(test)]
