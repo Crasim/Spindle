@@ -41,7 +41,11 @@ New conversations use the last **Chat** or **Cowork** mode you selected. Click a
 
 Use the pencil beside one of your prompts to edit it. **Send** creates another version with the earlier context. Both versions share one sidebar entry. Use the arrows beside the prompt to switch between them.
 
-Use **Import conversations** beside **Chats**, or `/import-chat`. On desktop, select **Codex** or **Claude Code** to browse local sessions and select chats to copy. The file picker also accepts session JSONL files and the ZIP or `conversations.json` from a Claude account export. Spindle copies the visible prompts and replies. It recognizes sessions it has imported before.
+Open **Settings → Imports**, or type `/import-chat`. On desktop, choose **Codex** or **Claude Code**, then **Conversations** to copy individual chats or **Projects** to import the chats from a workspace together. A project import uses the original workspace folder and adds Spindle project metadata there, so the project can work with its existing files. Your source chat transcripts stay in their original tool.
+
+**Import a file** accepts session JSONL files and the ZIP or `conversations.json` from a Claude account export. Spindle copies the visible prompts and replies, recognizes sessions it has already imported, and leaves Imports open for your next selection. Use **Improve existing imported titles** to update older generic titles from their prompts.
+
+In long chats, **Scroll to latest** returns to the newest message. When an expanded tool run’s heading scrolls out of view, use **Collapse steps** to close the run from where you are.
 
 Choose **Export conversation…** in the chat's **…** menu or Conversation settings to save a plaintext JSON archive. It includes the selected chat and its saved branches, recorded tool calls and results, approvals, successful and failed steps, model changes, compaction notes, and available timestamps. Request, reply, and action times are UTC Unix seconds. Sync record times are Unix milliseconds. Older records without a saved time leave that field out. Review the export before sharing because it contains the saved conversation and tool data.
 

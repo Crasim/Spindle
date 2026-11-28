@@ -388,6 +388,7 @@ pub struct Desktop {
     work_started: Option<(u64, std::time::Instant)>,
     /// Tool-step groups the user opened, by (chat, first message).
     open_steps: std::collections::HashSet<(u64, usize)>,
+    transcript_scroll_to: Option<(u64, f32)>,
     /// The notice shown as a toast, and when it appeared.
     toast: Option<(String, std::time::Instant)>,
     /// When the zoom last changed, to save it once the user stops scrolling.
@@ -846,6 +847,19 @@ fn close_group_box(ui: &mut egui::Ui, slot: egui::layers::ShapeIdx, top: f32) {
     );
 }
 
+fn find_scrolled_steps(ui: &egui::Ui, group: &mut Option<(usize, f32)>, top: f32, start: usize) {
+    let edge = ui.clip_rect().top();
+    if top + 32. < edge && ui.cursor().top() > edge + 32. {
+        *group = Some((start, top));
+    }
+}
+
+fn transcript_button(ui: &mut egui::Ui, id: &'static str, top_right: egui::Pos2, label: &str, width: f32) -> bool {
+    let rect = egui::Rect::from_min_size(top_right - egui::vec2(width, 0.), egui::vec2(width, 32.));
+    let mut button = ui.new_child(egui::UiBuilder::new().id_salt(id).max_rect(rect));
+    button.add_sized(rect.size(), egui::Button::new(label).fill(raised())).clicked()
+}
+
 /// The folded line for a run of tool steps. Returns true when clicked.
 fn steps_header(
     ui: &mut egui::Ui,
@@ -1165,6 +1179,7 @@ impl Desktop {
             pending_copy: None,
             work_started: None,
             open_steps: Default::default(),
+            transcript_scroll_to: None,
             toast: None,
             chat_selection: Default::default(),
             zoom_changed: None,
@@ -1261,10 +1276,7 @@ impl Desktop {
             return Dispatch::Handled;
         }
         if text.trim() == "/import-chat" {
-            self.threads.importing = true;
-            self.notice.clear();
-            self.page = Page::Chat;
-            self.drawer = false;
+            self.open_import_settings();
             return Dispatch::Handled;
         }
         if text.trim() == "/new"
@@ -2049,10 +2061,13 @@ impl Desktop {
         self.build_outputs(ui);
         let copy_selection = self.chat_selection.touch_copy_visible().then(|| ui.small_button("Copy selection"));
         let mut chat_text = chat_selection::ChatText::collecting();
-        egui::ScrollArea::vertical()
-            .id_salt(("conversation-history", self.view.state.chat_id))
-            .stick_to_bottom(!self.chat_selection.dragging())
-            .show(ui, |ui| {
+        let chat = self.view.state.chat_id;
+        let scroll_to = self.transcript_scroll_to.take().filter(|(id, _)| *id == chat);
+        let mut scroll = egui::ScrollArea::vertical().id_salt(("conversation-history", chat))
+            .stick_to_bottom(scroll_to.is_none() && !self.chat_selection.dragging());
+        if let Some((_, offset)) = scroll_to { scroll = scroll.vertical_scroll_offset(offset); }
+        let mut scrolled_steps = None;
+        let history = scroll.show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 if self.view.state.history.is_empty() && self.view.state.queue.is_empty() {
                     if self.browser_access_card(ui) {
@@ -2169,6 +2184,7 @@ impl Desktop {
                     let copy_row = copy_rows.as_ref().is_some_and(|rows| rows.contains(&index));
                     chat_text.message(index);
                     if let Some((slot,top,s))=group_box && groups[index]!=Some(s) {
+                        find_scrolled_steps(ui, &mut scrolled_steps, top, s);
                         close_group_box(ui,slot,top);
                         group_box=None;
                     }
@@ -2403,7 +2419,10 @@ impl Desktop {
                     }
                     self.transcript.heights[index] = height;
                 }
-                if let Some((slot,top,_))=group_box { close_group_box(ui,slot,top); }
+                if let Some((slot,top,start))=group_box {
+                    find_scrolled_steps(ui, &mut scrolled_steps, top, start);
+                    close_group_box(ui,slot,top);
+                }
                 if let Some(index) = visible_row && self.transcript.markdown.len() > 96 {
                     self.transcript.markdown.retain(|row, _| row.abs_diff(index) <= 48);
                 }
@@ -2557,6 +2576,24 @@ impl Desktop {
                 }
                 self.chat_selection.update(ui, chat_text, copy_selection);
             });
+        if self.chat_selection.dragging() { return; }
+        if let Some((start, group_top)) = scrolled_steps {
+            let corner = history.inner_rect.right_top() + egui::vec2(-12., 8.);
+            if transcript_button(ui, "collapse-history-steps", corner, "Collapse steps", 114.) {
+                self.open_steps.remove(&(chat, start));
+                let target = history.state.offset.y + group_top - history.inner_rect.top() - 8.;
+                self.transcript_scroll_to = Some((chat, target.max(0.)));
+                ui.ctx().request_repaint();
+            }
+        }
+        let remaining = history.content_size.y - history.inner_rect.height() - history.state.offset.y;
+        if remaining > 32. {
+            let corner = history.inner_rect.right_bottom() + egui::vec2(-12., -42.);
+            if transcript_button(ui, "jump-to-latest", corner, "Scroll to latest", 120.) {
+                self.transcript_scroll_to = Some((chat, history.content_size.y));
+                ui.ctx().request_repaint();
+            }
+        }
     }
 
     fn build_outputs(&mut self, ui: &mut egui::Ui) {
@@ -2863,7 +2900,6 @@ impl Desktop {
             || self.execution_panel.is_some()
             || self.tuning_editor.is_some()
             || self.threads.has_editor()
-            || self.threads.importing
             || self.projects.has_dialog()
             || self.sync_form.browse.is_some()
             || self.needs_projects_folder()
@@ -2930,9 +2966,7 @@ impl Desktop {
             self.scanner_panel(ui);
             return;
         }
-        if self.threads.importing {
-            self.conversation_import_panel(ui);
-        } else if self.sync_form.browse.is_some() {
+        if self.sync_form.browse.is_some() {
             self.folder_browser_panel(ui);
         } else if self.projects.has_dialog() {
             self.project_dialogs(ui);
@@ -3028,8 +3062,7 @@ impl eframe::App for Desktop {
             self.observe_submission(&v);
             if let Some(source) = &v.import_panel {
                 self.threads.open_import_request(source);
-                self.page = Page::Chat;
-                self.drawer = false;
+                self.open_import_settings();
             }
             if let Some((chat, _)) = self.view.browser_pairing
                 && v.browser_pairing.map(|pair| pair.0) != Some(chat)
@@ -3152,8 +3185,9 @@ impl eframe::App for Desktop {
                 .retain(|id, _| v.state.thread_data(*id).is_some());
             self.message_editors.observe(&v);
             self.threads.observe(&v);
-            if v.notice.starts_with("Imported ") && v.notice.contains("conversation") {
-                self.page = Page::Chat;
+            if v.notice.starts_with("Imported ") && v.notice.contains(" conversation")
+                && v.notice.contains(" into ") && v.notice != self.view.notice {
+                self.projects.refresh(self.root.clone());
             }
             self.drafts_by_thread
                 .retain(|id, _| v.state.thread_data(*id).is_some());
@@ -3268,7 +3302,7 @@ impl eframe::App for Desktop {
             if let Some(chosen) = crate::android::take_conversation_file() {
                 match chosen {
                     Ok(path) => self.send(format!("/import-chat-android {}", serde_json::json!(path))),
-                    Err(error) => self.notice = error,
+                    Err(error) => self.show_import_picker_error(error),
                 }
             }
             // Opened by scanning the pairing QR code: join straight away.
@@ -3497,6 +3531,9 @@ impl eframe::App for Desktop {
         });
         if panel_dismissed && self.page == Page::Settings {
             self.leave_settings();
+        }
+        if self.page != Page::Settings || self.integration_tab != Some(settings::IntegrationTab::Imports) {
+            self.close_import_request();
         }
         let viewing = self.page == Page::Chat
             && self.view.state.thread.started
@@ -3771,6 +3808,41 @@ mod transcript_tests {
             }
         }
         output.shapes.iter().find_map(|shape| find(&shape.shape, shape.clip_rect, label))
+    }
+
+    #[test]
+    fn long_tool_run_can_collapse_in_place_and_jump_to_the_latest_message() {
+        use egui::{Event, Modifiers, PointerButton};
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 70);
+        let chat = app.view.state.chat_id;
+        for row in 1..=32 {
+            app.view.state.history[row].role = "assistant".into();
+            app.view.state.thread.turns.entry(row).or_default().tool = Some(crate::state::ToolNote {
+                summary: format!("Tool step {row}"), status: "Done".into(),
+            });
+        }
+        app.open_steps.insert((chat, 1));
+        draw(&ctx, &mut app, 0, vec![]);
+        app.transcript_scroll_to = Some((chat, 1200.));
+        let out = draw(&ctx, &mut app, 1, vec![]);
+        let collapse = visible_text(&out, "Collapse steps").expect("The open run should be collapsible from the middle");
+        let click = |app: &mut Desktop, frame, pos| {
+            for (offset, pressed) in [true, false].into_iter().enumerate() {
+                draw(&ctx, app, frame + offset, vec![Event::PointerMoved(pos), Event::PointerButton {
+                    pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                }]);
+            }
+        };
+        click(&mut app, 2, collapse);
+        assert!(!app.open_steps.contains(&(chat, 1)));
+        let out = draw(&ctx, &mut app, 4, vec![]);
+        let latest = visible_text(&out, "Scroll to latest").expect("The conversation is scrolled up");
+        click(&mut app, 5, latest);
+        draw(&ctx, &mut app, 7, vec![]);
+        let bottom = draw(&ctx, &mut app, 8, vec![]);
+        assert!(visible_text(&bottom, "Message 69").is_some());
+        assert!(visible_text(&bottom, "Scroll to latest").is_none());
     }
 
     #[test]

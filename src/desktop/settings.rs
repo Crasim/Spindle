@@ -152,6 +152,7 @@ pub(super) enum IntegrationTab {
     ComputerUse,
     Connectors,
     Troubleshooting,
+    Imports,
 }
 
 #[derive(Default)]
@@ -704,6 +705,12 @@ impl Desktop {
         self.app_control_manage = false;
     }
 
+    pub(super) fn open_import_settings(&mut self) {
+        self.open_settings();
+        self.dismiss_settings_forms();
+        self.integration_tab = Some(IntegrationTab::Imports);
+    }
+
     pub(super) fn settings(&mut self, ui: &mut egui::Ui) {
         let visible_width = (ui.clip_rect().right() - ui.cursor().left()).max(0.);
         let width = ui.available_width().min(visible_width).min(780.);
@@ -814,6 +821,7 @@ impl Desktop {
                 (IntegrationTab::ComputerUse, Icon::Shield, "Computer use", 155.),
                 (IntegrationTab::Connectors, Icon::Plug, "Connectors", 128.),
                 (IntegrationTab::Troubleshooting, Icon::Tool, "Troubleshooting", 165.),
+                (IntegrationTab::Imports, Icon::Import, "Imports", 108.),
             ] {
                 if control(ui, icon, label, egui::vec2(width, 35.), self.integration_tab == Some(tab)).clicked() {
                     self.preferences_tab = false;
@@ -1270,6 +1278,7 @@ impl Desktop {
             IntegrationTab::ComputerUse => "Computer use",
             IntegrationTab::Connectors => "Connectors",
             IntegrationTab::Troubleshooting => "Troubleshooting",
+            IntegrationTab::Imports => "Imports",
         });
         ui.add_space(10.);
         match tab {
@@ -1293,6 +1302,10 @@ impl Desktop {
             }
             IntegrationTab::Troubleshooting => {
                 self.troubleshooting(ui);
+                return;
+            }
+            IntegrationTab::Imports => {
+                self.conversation_import_panel(ui);
                 return;
             }
             IntegrationTab::ComputerUse => {}

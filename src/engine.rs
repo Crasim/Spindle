@@ -47,6 +47,7 @@ pub struct View {
     pub web_region_prompt: Option<(u64, crate::location::WebRegionPrompt)>,
     pub composer_receipt: Option<(u64, bool)>,
     pub import_panel: Option<String>,
+    pub import_request_pending: bool,
     #[cfg(windows)]
     pub completed_reply: Option<(u64, usize)>,
 }
@@ -1482,10 +1483,17 @@ The user denied this action. Continue with other work or explain the denial. Do 
             }
             "/import-chat-local" => {
                 let selected: Vec<crate::conversation_import::Selection> = serde_json::from_str(args)?;
-                let status = self.import_conversations(selected, true)?;
+                let status = self.import_conversations(selected, true, None)?;
                 self.complete_import(&status, true);
                 Ok(status)
             }
+            "/import-local-project" => {
+                let selected: crate::conversation_import::ProjectSelection = serde_json::from_str(args)?;
+                let status = self.import_conversations(selected.sessions, true, Some(&selected.workspace))?;
+                self.complete_import(&status, true);
+                Ok(status)
+            }
+            "/import-improve-titles" => Ok(self.improve_imported_titles()),
             "/cancel-import" => {
                 self.complete_import("The user closed the import picker.", false);
                 Ok("Import closed".into())
@@ -1512,7 +1520,7 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 };
                 let result = self.import_conversations(vec![crate::conversation_import::Selection {
                     path: path.clone(), title: String::new(), origin: String::new(), archived: false,
-                }], false);
+                }], false, None);
                 if temporary {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -7698,6 +7706,44 @@ mod tests {
     }
 
     #[test]
+    fn imports_multiple_chats_and_then_groups_them_without_switching_or_duplicating() -> Result<()> {
+        use crate::conversation_import::{ProjectSelection, Selection};
+        let root = tempfile::tempdir()?;
+        let mut engine = fixture(root.path());
+        let project = root.path().join("Test project");
+        std::fs::create_dir(&project)?;
+        std::fs::write(project.join("existing.txt"), "Original workspace file")?;
+        let chat = engine.state.chat_id;
+        engine.state.history.push(Message::new("user", "Keep this conversation open"));
+        let mut sessions = Vec::new();
+        for id in ["first", "second"] {
+            let path = root.path().join(format!("{id}.jsonl"));
+            let rows = [serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":project}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"user_message","message":format!("Fix the {id} validation error")}})];
+            std::fs::write(&path, rows.iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n"))?;
+            let selection = Selection { path, title: "Guardian Review".into(), origin: format!("codex:{id}"), archived: false };
+            let status = engine.command(&format!("/import-chat-local {}", serde_json::json!([&selection])), false)?;
+            assert_eq!(status, "Imported 1 conversation");
+            sessions.push(selection);
+        }
+        assert_eq!(engine.state.chat_id, chat);
+        assert_eq!(engine.state.chats.len(), 2);
+        let request = serde_json::to_string(&ProjectSelection { workspace: project.clone(), sessions })?;
+        let status = engine.command(&format!("/import-local-project {request}"), false)?;
+        assert!(status.contains("2 existing chats added to the project"), "{status}");
+        assert_eq!(engine.state.history[0].content, "Keep this conversation open");
+        let folder = project.canonicalize()?;
+        for imported in engine.state.chats.values() {
+            assert_eq!(imported.thread.project.as_ref(), Some(&folder));
+            assert!(imported.thread.title.starts_with("Fix the"));
+        }
+        assert!(engine.command(&format!("/import-local-project {request}"), false)?.contains("2 already imported"));
+        assert_eq!(engine.state.chats.len(), 2);
+        assert_eq!(std::fs::read_to_string(project.join("existing.txt"))?, "Original workspace file");
+        Ok(())
+    }
+
+    #[test]
     fn image_tool_accepts_named_workflow_and_transparent_batch_options() {
         let (_, call) = crate::tools::extract(r#"{"name":"image","args":{"prompt":"test","model":"flux3","workflow":"Example","aspect_ratio":"16:9","transparent":true,"count":2,"parameters":{"steps":12}}}"#);
         let crate::tools::Call::Image { options, .. } = call.unwrap().unwrap().call else { panic!("Expected image tool") };
@@ -8819,6 +8865,7 @@ impl Engine {
                     web_region_prompt,
                     composer_receipt: composer_receipt.take(),
                     import_panel: self.jobs.import_panel.take(),
+                    import_request_pending: self.jobs.import_request.is_some(),
                     #[cfg(windows)]
                     completed_reply: completed_reply.take(),
                 })

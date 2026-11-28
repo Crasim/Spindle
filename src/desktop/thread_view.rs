@@ -12,9 +12,10 @@ pub(super) struct Threads {
     pub(super) archived: bool,
     collapsed: BTreeSet<std::path::PathBuf>,
     projects_hidden: bool,
-    pub(super) importing: bool,
     asked_to_import: bool,
+    #[cfg(not(any(windows, target_os = "android")))]
     import_path: String,
+    import_feedback: String,
     #[cfg(not(target_os = "android"))]
     local_import: LocalImport,
 }
@@ -28,6 +29,7 @@ struct LocalImport {
     scanned: bool,
     filter: String,
     selected: BTreeSet<String>,
+    projects: bool,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -74,9 +76,17 @@ impl LocalImport {
             ui.weak("No local sessions found. For a Claude account export, use Choose file.");
             return None;
         }
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.projects, false, "Conversations");
+            ui.selectable_value(&mut self.projects, true, "Projects");
+        });
+        if self.projects {
+            return self.show_projects(ui);
+        }
         let imported: BTreeSet<&str> = std::iter::once(&state.thread)
             .chain(state.chats.values().map(|chat| &chat.thread))
             .filter_map(|thread| thread.imported_from.as_deref()).collect();
+        self.selected.retain(|origin| !imported.contains(origin.as_str()));
         ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Find a local conversation"));
         let filter = self.filter.to_lowercase();
         let matches = self.sessions.iter().filter(|s| s.title.to_lowercase().contains(filter.trim()));
@@ -111,6 +121,42 @@ impl LocalImport {
             return Some(format!("/import-chat-local {}", serde_json::json!(selected)));
         }
         None
+    }
+
+    fn show_projects(&self, ui: &mut egui::Ui) -> Option<String> {
+        let mut groups = BTreeMap::<&Path, Vec<&crate::conversation_import::LocalSession>>::new();
+        for session in &self.sessions {
+            if let Some(folder) = &session.workspace {
+                groups.entry(folder).or_default().push(session);
+            }
+        }
+        ui.weak("Import a workspace’s conversations together. Spindle adds project metadata to the original folder so the project can use its existing files.");
+        if groups.is_empty() {
+            ui.weak("No workspace folders were recorded in these sessions.");
+        }
+        let mut selected = None;
+        egui::ScrollArea::vertical().id_salt("local-import-projects").max_height(350.).show(ui, |ui| {
+            for (folder, sessions) in groups {
+                ui.push_id(folder, |ui| {
+                    ui.group(|ui| {
+                        let name = folder.file_name().unwrap_or(folder.as_os_str()).to_string_lossy();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.strong(name);
+                            ui.weak(format!("{} chats", sessions.len()));
+                            if ui.button("Import project").clicked() {
+                                selected = Some(crate::conversation_import::ProjectSelection {
+                                    workspace: folder.to_owned(),
+                                    sessions: sessions.iter().map(|session| (*session).into()).collect(),
+                                });
+                            }
+                        });
+                        let path = projects::display_path(folder);
+                        ui.add(egui::Label::new(Text::new(&path).color(muted())).truncate()).on_hover_text(path);
+                    });
+                });
+            }
+        });
+        selected.map(|project| format!("/import-local-project {}", serde_json::json!(project)))
     }
 }
 
@@ -386,12 +432,12 @@ impl Editor {
 }
 impl Threads {
     pub(super) fn open_import_request(&mut self, source: &str) {
-        self.importing = true;
         self.asked_to_import = true;
         #[cfg(not(target_os = "android"))]
         {
             self.local_import.source = usize::from(source == "claude");
             self.local_import.scanned = false;
+            self.local_import.projects = false;
         }
         #[cfg(target_os = "android")]
         let _ = source;
@@ -403,12 +449,12 @@ impl Threads {
 
 
     pub fn observe(&mut self, v: &View) {
+        self.asked_to_import &= v.import_request_pending;
         if v.notice.starts_with("Imported ") && v.notice.contains("conversation") {
-            self.importing = false;
-            self.asked_to_import = false;
-            self.import_path.clear();
-            #[cfg(not(target_os = "android"))]
-            self.local_import.selected.clear();
+            self.import_feedback.clone_from(&v.notice);
+        } else if (v.notice.starts_with("Updated ") && v.notice.contains("imported conversation title"))
+            || (self.import_feedback.starts_with("Importing ") && v.notice.starts_with("Error:")) {
+            self.import_feedback.clone_from(&v.notice);
         }
         self.editors.retain(|id, e| {
             if v.state.thread_data(*id).is_none() {
@@ -600,12 +646,7 @@ impl Desktop {
                         Entry::ChatsHeader => {
                             ui.add_space(4.);
                             ui.horizontal(|ui| {
-                                left_label_with(ui, Text::new("Chats").size(14.).strong(), 2);
-                                if small(ui, Icon::Import, "Import conversations") {
-                                    self.threads.importing = true;
-                                    self.notice.clear();
-                                    self.drawer = false;
-                                }
+                                left_label_with(ui, Text::new("Chats").size(14.).strong(), 1);
                                 if small(ui, Icon::New, "New chat outside any project (Ctrl+N)") {
                                     new_chat = true;
                                 }
@@ -1170,55 +1211,61 @@ impl Desktop {
         }
     }
 
-    pub(super) fn conversation_import_panel(&mut self, ui: &mut egui::Ui) {
-        let mut open = self.threads.importing;
-        #[cfg(not(target_os = "android"))]
-        let mut command = None;
-        #[cfg(not(target_os = "android"))]
-        let mut selected: Option<std::path::PathBuf> = None;
-        super::detail_panel(ui, "Import conversations", "Back", &mut open, |ui| {
-            #[cfg(not(target_os = "android"))]
-            {
-                ui.weak("Select local chats to copy into Spindle.");
-                command = self.threads.local_import.show(ui, &self.view.state);
-                ui.separator();
-            }
-            ui.weak("Import from a session file or a Claude export (.jsonl, .json, .zip).");
-            ui.add_space(8.);
-            #[cfg(windows)]
-            if ui.button("Choose file…").clicked() {
-                selected = rfd::FileDialog::new()
-                    .add_filter("Conversation files", &["json", "jsonl", "zip"])
-                    .pick_file();
-            }
-            #[cfg(target_os = "android")]
-            if ui.button("Choose file…").clicked() {
-                if let Err(error) = crate::android::choose_conversation_file() {
-                    self.notice = format!("Could not open the file picker: {error}");
-                }
-            }
-            #[cfg(not(any(windows, target_os = "android")))]
-            {
-                ui.label("File path");
-                ui.text_edit_singleline(&mut self.threads.import_path);
-                let path = self.threads.import_path.trim();
-                if ui.add_enabled(!path.is_empty(), egui::Button::new("Import")).clicked() {
-                    selected = Some(std::path::PathBuf::from(path));
-                }
-            }
-            if !self.notice.is_empty() {
-                ui.weak(&self.notice);
-            }
-        });
-        self.threads.importing = open;
-        if !open && std::mem::take(&mut self.threads.asked_to_import) {
+    pub(super) fn close_import_request(&mut self) {
+        if std::mem::take(&mut self.threads.asked_to_import) {
             self.send("/cancel-import");
         }
+    }
+
+    #[cfg(target_os = "android")]
+    pub(super) fn show_import_picker_error(&mut self, error: String) {
+        self.threads.import_feedback = error;
+    }
+
+    pub(super) fn conversation_import_panel(&mut self, ui: &mut egui::Ui) {
+        #[cfg(not(target_os = "android"))]
+        let command = self.threads.local_import.show(ui, &self.view.state);
+        #[cfg(not(target_os = "android"))]
+        ui.separator();
+        ui.strong("Import a file");
+        ui.weak("Use a Codex or Claude Code session file, or a Claude account export (.jsonl, .json, .zip).");
+        ui.add_space(8.);
+        #[cfg(not(target_os = "android"))]
+        let mut selected: Option<std::path::PathBuf> = None;
+        #[cfg(windows)]
+        if ui.button("Choose file…").clicked() {
+            selected = rfd::FileDialog::new()
+                .add_filter("Conversation files", &["json", "jsonl", "zip"])
+                .pick_file();
+        }
+        #[cfg(target_os = "android")]
+        if ui.button("Choose file…").clicked() {
+            if let Err(error) = crate::android::choose_conversation_file() {
+                self.threads.import_feedback = format!("Could not open the file picker: {error}");
+            } else {
+                self.threads.import_feedback = "Importing a conversation file…".into();
+            }
+        }
+        #[cfg(not(any(windows, target_os = "android")))]
+        {
+            ui.label("File path");
+            ui.text_edit_singleline(&mut self.threads.import_path);
+            let path = self.threads.import_path.trim();
+            if ui.add_enabled(!path.is_empty(), egui::Button::new("Import file")).clicked() {
+                selected = Some(PathBuf::from(path));
+            }
+        }
+        ui.separator();
+        if ui.button("Improve existing imported titles").clicked() {
+            self.send("/import-improve-titles");
+        }
+        if !self.threads.import_feedback.is_empty() { ui.label(&self.threads.import_feedback); }
         #[cfg(not(target_os = "android"))]
         if let Some(command) = command {
-            self.notice = "Importing selected conversations…".into();
+            self.threads.import_feedback = "Importing selected conversations…".into();
             self.send(command);
         } else if let Some(path) = selected {
+            self.threads.import_feedback = "Importing a conversation file…".into();
             self.send(format!("/import-chat {}", serde_json::json!(path)));
         }
     }
@@ -1267,6 +1314,31 @@ mod tests {
         ]);
     }
     use egui::{Event, PointerButton, Pos2};
+
+    #[test]
+    fn completed_import_notice_does_not_close_the_settings_importer() {
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (views, rx) = std::sync::mpsc::channel();
+        let (_stream, preview) = tokio::sync::watch::channel(String::new());
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let mut app = Desktop::new(&cc, dir.path().into(), tx, rx, preview, Accent::Blue);
+        #[cfg(not(target_os = "android"))]
+        { app.threads.local_import.scanned = true; }
+        let mut frame = eframe::Frame::_new_kittest();
+        for _ in 0..2 {
+            app.send("/import-chat");
+            let mut view = app.view.clone();
+            view.notice = "Imported 1 conversation".into();
+            views.send(view).unwrap();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| eframe::App::update(&mut app, ctx, &mut frame));
+            assert!(app.page == Page::Settings);
+            assert!(app.integration_tab == Some(settings::IntegrationTab::Imports));
+            assert_eq!(app.threads.import_feedback, "Imported 1 conversation");
+            app.leave_settings();
+        }
+    }
 
     // Drive the same sidebar and settings windows as the desktop, without creating a native window.
     fn frame(app: &mut Desktop, ctx: &egui::Context, events: Vec<Event>) -> BTreeMap<String, Pos2> {

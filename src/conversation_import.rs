@@ -24,6 +24,7 @@ pub struct LocalSession {
     pub origin: String,
     pub modified: SystemTime,
     pub archived: bool,
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -32,6 +33,24 @@ pub struct Selection {
     pub title: String,
     pub origin: String,
     pub archived: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ProjectSelection {
+    pub workspace: PathBuf,
+    pub sessions: Vec<Selection>,
+}
+
+#[derive(Default)]
+struct Header {
+    id: Option<String>,
+    prompt: Option<String>,
+    workspace: Option<PathBuf>,
+}
+
+fn guardian_session(payload: &Value) -> bool {
+    payload["thread_source"] == "guardian_review"
+        || payload["source"]["subagent"]["other"] == "guardian_review"
 }
 
 impl From<&LocalSession> for Selection {
@@ -103,40 +122,47 @@ impl Source {
         paths
             .into_iter()
             .filter_map(|(path, modified, archived)| {
-                let (id, first) = self.header(&path)?;
+                let header = self.header(&path)?;
+                let id = header.id?;
                 let origin = format!("{}:{id}", self.prefix());
                 if !seen.insert(origin.clone()) {
                     return None;
                 }
-                let title = names.get(&id).cloned().or(first);
                 Some(LocalSession {
-                    title: conversation_title(title.as_deref(), "Untitled conversation"),
+                    title: conversation_title(names.get(&id).map(String::as_str), header.prompt.as_deref()),
                     path,
                     origin,
                     modified,
                     archived,
+                    workspace: header.workspace,
                 })
             })
             .collect()
     }
 
-    fn header(self, path: &Path) -> Option<(String, Option<String>)> {
-        let mut id = None;
+    fn header(self, path: &Path) -> Option<Header> {
+        let mut header = Header::default();
         for row in json_lines(path, 512 * 1024).take(128) {
             let payload = &row["payload"];
             let prompt = match self {
                 Self::Codex => {
-                    if row["type"] == "session_meta" && id.is_none() {
-                        id = payload["id"].as_str().map(str::to_owned).or(id);
+                    if row["type"] == "session_meta" && header.id.is_none() {
+                        if guardian_session(payload) { return None; }
+                        header.id = payload["id"].as_str().map(str::to_owned);
+                        header.workspace = workspace_path(&payload["cwd"]);
                     }
                     if row["type"] == "event_msg" && payload["type"] == "user_message" {
                         message("user", conversation_text(&payload["message"]))
+                    } else if row["type"] == "response_item" && payload["type"] == "message" && payload["role"] == "user" {
+                        message("user", conversation_text(&payload["content"]))
                     } else {
                         None
                     }
                 }
                 Self::ClaudeCode => {
-                    id = row["sessionId"].as_str().map(str::to_owned).or(id);
+                    if row["isSidechain"] == true { continue; }
+                    if header.id.is_none() { header.id = row["sessionId"].as_str().map(str::to_owned); }
+                    if header.workspace.is_none() { header.workspace = workspace_path(&row["cwd"]); }
                     if row["type"] == "user" && row["isSidechain"] != true && row["isMeta"] != true
                     {
                         message("user", conversation_text(&row["message"]["content"]))
@@ -145,12 +171,20 @@ impl Source {
                     }
                 }
             };
-            if let (Some(id), Some(prompt)) = (&id, prompt) {
-                return Some((id.clone(), Some(prompt.content)));
+            if header.prompt.is_none() {
+                header.prompt = prompt.and_then(|m| prompt_title(&m.content).map(str::to_owned));
+            }
+            if header.id.is_some() && header.prompt.is_some() && (header.workspace.is_some() || matches!(self, Self::Codex)) {
+                break;
             }
         }
-        id.map(|id| (id, None))
+        header.id.is_some().then_some(header)
     }
+}
+
+fn workspace_path(value: &Value) -> Option<PathBuf> {
+    let path = PathBuf::from(value.as_str()?);
+    (path.is_absolute() && path.parent().is_some()).then_some(path)
 }
 
 fn session_paths(
@@ -179,7 +213,7 @@ fn json_lines(path: &Path, limit: u64) -> impl Iterator<Item = Value> {
         .ok()
         .into_iter()
         .flat_map(move |file| BufReader::new(file.take(limit)).lines())
-        .filter_map(|line| serde_json::from_str(&line.ok()?).ok())
+        .filter_map(|line| serde_json::from_str(line.ok()?.trim_start_matches('\u{feff}')).ok())
 }
 
 pub fn load(path: &Path) -> Result<Vec<Conversation>> {
@@ -359,6 +393,7 @@ fn load_session(mut reader: impl BufRead) -> Result<Conversation> {
         let payload = &row["payload"];
         let entry = match row["type"].as_str() {
             Some("session_meta") => {
+                ensure!(!guardian_session(payload), "This file is an internal Guardian Review. Choose the original Codex conversation.");
                 imported_from = payload["id"].as_str().map(|id| format!("codex:{id}"));
                 continue;
             }
@@ -456,8 +491,8 @@ fn message(role: &str, text: String) -> Option<Message> {
 }
 
 fn conversation(title: Option<&str>, history: Vec<Message>) -> Option<Conversation> {
-    let prompt = history.iter().find(|m| m.role == "user")?;
-    let title = conversation_title(title, &prompt.content);
+    history.iter().find(|m| m.role == "user")?;
+    let title = conversation_title(title, title_from_history(&history));
     let mut chat = Conversation {
         history,
         ..Default::default()
@@ -467,16 +502,27 @@ fn conversation(title: Option<&str>, history: Vec<Message>) -> Option<Conversati
     Some(chat)
 }
 
-fn conversation_title(title: Option<&str>, prompt: &str) -> String {
-    title
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| {
-            prompt
-                .trim()
-                .lines()
-                .next()
-                .unwrap_or("Imported conversation")
-        })
+fn generic_title(title: &str) -> bool {
+    matches!(title.trim().to_ascii_lowercase().as_str(),
+        "" | "guardian review" | "untitled" | "untitled conversation" | "new chat" | "imported conversation")
+}
+
+fn prompt_title(prompt: &str) -> Option<&str> {
+    let lines = if let Some((_, request)) = prompt.split_once("## My request") {
+        request.trim_start_matches(" for Codex").trim_start_matches(':').trim()
+    } else { prompt };
+    lines.lines().map(str::trim).find(|line| !generic_title(line)
+        && !matches!(line.trim_end_matches(['.', '!', '?']).to_ascii_lowercase().as_str(),
+            "continue" | "resume" | "retry" | "try again")
+        && !line.starts_with("<") && !line.starts_with("# Files mentioned"))
+}
+
+fn title_from_history(history: &[Message]) -> Option<&str> {
+    history.iter().filter(|m| m.role == "user").find_map(|m| prompt_title(&m.content))
+}
+
+fn conversation_title(title: Option<&str>, prompt: Option<&str>) -> String {
+    title.filter(|s| !generic_title(s)).or(prompt).unwrap_or("Untitled conversation")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -486,6 +532,19 @@ fn conversation_title(title: Option<&str>, prompt: &str) -> String {
 }
 
 impl crate::engine::Engine {
+    pub(crate) fn improve_imported_titles(&mut self) -> String {
+        let mut count = 0;
+        for (thread, history) in std::iter::once((&mut self.state.thread, self.state.history.as_slice()))
+            .chain(self.state.chats.values_mut().map(|chat| (&mut chat.thread, chat.history.as_slice())))
+        {
+            if thread.imported_from.is_some() && generic_title(&thread.title) && let Some(prompt) = title_from_history(history) {
+                thread.title = conversation_title(None, Some(prompt));
+                count += 1;
+            }
+        }
+        format!("Updated {count} imported conversation title{}", if count == 1 { "" } else { "s" })
+    }
+
     pub(crate) fn complete_import(&mut self, status: &str, imported: bool) {
         if let Some(pending) = self.jobs.import_request.take() {
             crate::engine::record_outcome(&mut self.state, pending.id, status, imported);
@@ -499,17 +558,29 @@ impl crate::engine::Engine {
         &mut self,
         paths: Vec<Selection>,
         discovered: bool,
+        workspace: Option<&Path>,
     ) -> Result<String> {
         ensure!(!paths.is_empty(), "Select at least one conversation");
-        let mut known: std::collections::HashSet<String> = std::iter::once(&self.state.thread)
-            .chain(self.state.chats.values().map(|chat| &chat.thread))
-            .filter_map(|thread| thread.imported_from.clone())
+        let mut known: HashMap<String, u64> = std::iter::once((self.state.chat_id, &self.state.thread))
+            .chain(self.state.chats.iter().map(|(&id, chat)| (id, &chat.thread)))
+            .filter_map(|(id, thread)| Some((thread.imported_from.clone()?, id)))
             .collect();
-        let mut first = None;
+        let workspace = workspace.map(Path::canonicalize).transpose()?;
+        let mut project = None;
         let mut count = 0;
+        let mut attached = 0;
         let mut skipped = 0;
         let mut failed = 0;
         for source in paths {
+            if let Some(workspace) = &workspace {
+                let kind = if source.origin.starts_with("codex:") { Source::Codex } else { Source::ClaudeCode };
+                let reported = kind.header(&source.path).and_then(|header| header.workspace)
+                    .and_then(|path| path.canonicalize().ok());
+                if reported.as_ref() != Some(workspace) {
+                    failed += 1;
+                    continue;
+                }
+            }
             let mut chats = match load(&source.path) {
                 Ok(chats) => chats,
                 Err(_) if discovered => {
@@ -525,38 +596,53 @@ impl crate::engine::Engine {
                     failed += 1;
                     continue;
                 }
-                if source.title != "Untitled conversation" {
-                    chats[0].thread.title =
-                        conversation_title(Some(&source.title), &chats[0].thread.title);
+                if source.origin.starts_with("codex:") && !generic_title(&source.title) {
+                    chats[0].thread.title = conversation_title(Some(&source.title), None);
                 }
                 chats[0].thread.archived = source.archived;
             }
+            if project.is_none() && let Some(folder) = &workspace {
+                let project_info = match crate::projects::existing(folder)? {
+                    Some(p) => p,
+                    None => {
+                        let name: String = folder.file_name().context("Choose a project folder")?
+                            .to_string_lossy().chars().filter(|ch| !ch.is_control()).take(100).collect();
+                        crate::projects::create(folder, &name)?
+                    }
+                };
+                crate::projects::library(Some(&project_info))?;
+                project = Some(project_info);
+            }
             for mut chat in chats {
-                if chat
-                    .thread
-                    .imported_from
-                    .as_ref()
-                    .is_some_and(|id| !known.insert(id.clone()))
+                if let Some(existing) = chat.thread.imported_from.as_ref().and_then(|id| known.get(id)).copied()
                 {
-                    skipped += 1;
+                    let busy = self.state.queue.iter().any(|t| t.origin.unwrap_or(self.state.chat_id) == existing)
+                        || self.state.requests.iter().any(|p| p.chat == existing);
+                    let thread = if existing == self.state.chat_id { &mut self.state.thread }
+                        else { &mut self.state.chats.get_mut(&existing).context("Missing previously imported chat")?.thread };
+                    // Leave any existing workspace or generated files with the conversation.
+                    if let Some(project) = &project && !busy && thread.project.is_none() && thread.turns.is_empty() {
+                        thread.project = Some(project.path.clone());
+                        attached += 1;
+                    } else {
+                        skipped += 1;
+                    }
                     continue;
                 }
                 chat.thread.model.clone_from(&self.state.model);
+                chat.thread.project = project.as_ref().map(|p| p.path.clone());
                 self.state.serial += 1;
-                if !chat.thread.archived {
-                    first.get_or_insert(self.state.serial);
-                }
+                if let Some(origin) = &chat.thread.imported_from { known.insert(origin.clone(), self.state.serial); }
                 self.state.chats.insert(self.state.serial, chat);
                 count += 1;
             }
-        }
-        if let Some(first) = first {
-            self.state.switch_chat(Some(first))?;
         }
         let mut status = format!(
             "Imported {count} conversation{}",
             if count == 1 { "" } else { "s" }
         );
+        if let Some(project) = project { status.push_str(&format!(" into {}", project.name)); }
+        if attached != 0 { status.push_str(&format!(" · {attached} existing chats added to the project")); }
         if skipped != 0 {
             status.push_str(&format!(" · {skipped} already imported"));
         }
@@ -611,6 +697,29 @@ mod tests {
                 .as_deref(),
             Some("claude-code:def")
         );
+    }
+
+    #[test]
+    fn discovery_excludes_guardian_sessions_and_recovers_descriptive_titles() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sessions = dir.path().join("sessions");
+        fs::create_dir(&sessions)?;
+        let cwd = dir.path().canonicalize()?;
+        let rows = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"original","cwd":cwd}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Update the checkout form validation"}]}}),
+        ];
+        fs::write(dir.path().join("session_index.jsonl"), r#"{"id":"original","thread_name":"Guardian Review"}"#)?;
+        fs::write(sessions.join("original.jsonl"), rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n"))?;
+        let review = sessions.join("review.jsonl");
+        fs::write(&review, r#"{"type":"session_meta","payload":{"id":"review","thread_source":"guardian_review"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Tool assessment"}}"#)?;
+        let found = Source::Codex.discover_in(dir.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].title, "Update the checkout form validation");
+        assert_eq!(found[0].workspace.as_ref(), Some(&cwd));
+        assert!(load(&review).err().unwrap().to_string().contains("Guardian Review"));
+        Ok(())
     }
 
     #[test]
