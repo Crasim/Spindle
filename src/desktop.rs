@@ -2210,6 +2210,8 @@ impl Desktop {
                     next_row += 1;
                     let message = &state.history[index];
                     let copy_row = copy_rows.as_ref().is_some_and(|rows| rows.contains(&index));
+                    let mut folded_header_top = None;
+                    let mut folded_progress = false;
                     chat_text.message(index);
                     if let Some((slot,top,s))=group_box && groups[index]!=Some(s) {
                         find_scrolled_steps(ui, &mut scrolled_steps, top, s);
@@ -2227,9 +2229,11 @@ impl Desktop {
                     }
                     if let Some(start)=groups[index] {
                         let open=self.open_steps.contains(&(state.chat_id,start));
+                        let has_progress = message.role == "assistant" && !message.content.trim().is_empty();
                         if start==index {
+                            let estimate = 46. + if has_progress { self.transcript.estimates[index] } else { 0. };
                             if !open && !copy_row && index + 1 < state.history.len()
-                                && TranscriptRows::skip(ui, self.transcript.heights[index].unwrap_or(46.)) { continue; }
+                                && TranscriptRows::skip(ui, self.transcript.heights[index].unwrap_or(estimate)) { continue; }
                             let top=ui.cursor().top();
                             let live=self.view.busy || self.view.job.is_some() || state.queue.front().is_some_and(|t|t.origin.unwrap_or(state.chat_id)==state.chat_id);
                             let working=live && groups.last().copied().flatten()==Some(start);
@@ -2251,15 +2255,22 @@ impl Desktop {
                             });
                             if !open {
                                 close_group_box(ui,slot,group_box.take().unwrap().1);
-                                self.transcript.heights[index]=Some(ui.cursor().top()-top);
+                                if has_progress {
+                                    folded_header_top = Some(top);
+                                } else {
+                                    self.transcript.heights[index]=Some(ui.cursor().top()-top);
+                                }
                             }
                         }
-                        if !open {continue;}
+                        if !open {
+                            if !has_progress { continue; }
+                            folded_progress = true;
+                        }
                     }
-                    let cache_row = ordinary_transcript_row(state, groups, index)
+                    let cache_row = (folded_progress || ordinary_transcript_row(state, groups, index))
                         && editing_row != Some(index) && !(index + 1 == state.history.len()
                             && state.can_continue_stopped_goal());
-                    if cache_row && !copy_row && TranscriptRows::skip(ui,
+                    if cache_row && folded_header_top.is_none() && !copy_row && TranscriptRows::skip(ui,
                         self.transcript.heights[index].unwrap_or(self.transcript.estimates[index])) { continue; }
                     let top = ui.cursor().top();
                     if !copy_row && ui.clip_rect().y_range().contains(top) { visible_row = Some(index); }
@@ -2276,7 +2287,7 @@ impl Desktop {
                     }
                     ui.push_id(("history-row", state.chat_id, index), |ui| {
                     ui.add_space(12.);
-                    let inset = if groups[index].is_some() { 11 } else { 0 };
+                    let inset = if group_box.is_some() { 11 } else { 0 };
                     egui::Frame::new().inner_margin(egui::Margin::symmetric(inset,0)).show(ui,|ui| {
                     message_row(ui,user,|ui|{
                     let failed=turn.is_some_and(|turn|turn.failed);
@@ -2369,7 +2380,7 @@ impl Desktop {
                         });
                     }
                     if let Some(turn)=turn.filter(|_|!user) {
-                        ui.push_id(("reply-notes",index),|ui| if let Some(a)=notes::reply_notes(ui,turn,&state.memories) {note=Some(a);});
+                        ui.push_id(("reply-notes",index),|ui| if let Some(a)=notes::reply_notes(ui,turn,&state.memories,!folded_progress) {note=Some(a);});
                         if groups[index].is_none() {
                             if let Some(applied)=&turn.applied {
                                 ui.push_id(("applied",index),|ui| if notes::applied_note(ui,applied,can_undo_edits) {undo_at=Some(index);});
@@ -2447,7 +2458,7 @@ impl Desktop {
                     });
                     });
                     });
-                    let height = cache_row.then(|| ui.cursor().top() - top);
+                    let height = cache_row.then(|| ui.cursor().top() - folded_header_top.unwrap_or(top));
                     if let Some(Some(total)) = self.transcript.block_heights.get_mut(index / TRANSCRIPT_BLOCK) {
                         use egui::emath::GuiRounding as _;
                         let estimate = self.transcript.estimates[index];
@@ -3917,11 +3928,15 @@ mod transcript_tests {
     }
 
     fn visible_text(output: &egui::FullOutput, label: &str) -> Option<egui::Pos2> {
-        fn find(shape: &egui::Shape, clip: egui::Rect, label: &str) -> Option<egui::Pos2> {
+        visible_text_rect(output, label).map(|rect| rect.center())
+    }
+
+    fn visible_text_rect(output: &egui::FullOutput, label: &str) -> Option<egui::Rect> {
+        fn find(shape: &egui::Shape, clip: egui::Rect, label: &str) -> Option<egui::Rect> {
             match shape {
                 egui::Shape::Text(text) if text.galley.text() == label => {
                     let visible = text.galley.rect.translate(text.pos.to_vec2()).intersect(clip);
-                    visible.is_positive().then(|| visible.center())
+                    visible.is_positive().then_some(visible)
                 }
                 egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, clip, label)),
                 _ => None,
@@ -3989,6 +4004,45 @@ mod transcript_tests {
     }
 
     #[test]
+    fn folded_tool_steps_keep_model_progress_messages_visible() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 0);
+        for (role, text) in [
+            ("user", "Check the project"),
+            ("assistant", "I’ll check the source first."),
+            ("user", "Tool result · Scan source\nContents of the source"),
+            ("assistant", ""),
+            ("user", "Tool result · List tests\nTest file names"),
+            ("assistant", "I found the bug in the tail-growth logic."),
+            ("user", "Tool result · Fix source\nPatch applied"),
+            ("assistant", "The fix is ready."),
+        ] {
+            app.view.state.history.push(crate::ollama::Message::new(role, text));
+        }
+        let thread = &mut app.view.state.thread;
+        thread.tool_results.extend([2, 4, 6]);
+        for (index, summary) in [(1, "Scan source"), (3, "List tests"), (5, "Fix source")] {
+            thread.turns.entry(index).or_default().tool = Some(crate::state::ToolNote {
+                summary: summary.into(),
+                status: "Done".into(),
+            });
+        }
+        draw(&ctx, &mut app, 0, vec![]);
+        let closed = draw(&ctx, &mut app, 1, vec![]);
+        let first = visible_text(&closed, "I’ll check the source first.").unwrap();
+        let second = visible_text(&closed, "I found the bug in the tail-growth logic.").unwrap();
+        assert!(first.y < second.y);
+        assert!(visible_text(&closed, "Result · Scan source").is_none());
+        assert!(visible_text(&closed, "List tests · Done").is_none());
+
+        let chat = app.view.state.chat_id;
+        app.open_steps.insert((chat, 1));
+        let expanded = draw(&ctx, &mut app, 2, vec![]);
+        assert!(visible_text(&expanded, "Result · Scan source").is_some());
+        assert!(visible_text(&expanded, "I’ll check the source first.").is_some());
+    }
+
+    #[test]
     fn a_folded_tool_run_shows_edit_totals_and_opens_the_diff() {
         use egui::{Event, Modifiers, PointerButton};
         let dir = tempfile::tempdir().unwrap();
@@ -4001,19 +4055,27 @@ mod transcript_tests {
         let turn = app.view.state.thread.turns.entry(1).or_default();
         turn.tool = Some(crate::state::ToolNote { summary: "Apply edits".into(), status: "Done".into() });
         turn.edits = (1..=4).map(|n| crate::edit_summary::Edit::between(&format!("file-{n}.txt"), b"before\n", b"after\nadded\n")).collect();
+        let patch = turn.edits[0].patch.as_deref().unwrap().lines().map(|line| format!("{line}\n")).collect::<String>();
         draw(&ctx, &mut app, 0, vec![]);
         let out = draw(&ctx, &mut app, 1, vec![]);
         for label in ["Edited 4 files", "+8", "−4", "Show 1 more file"] {
             assert!(visible_text(&out, label).is_some(), "Missing {label}");
         }
-        let pos = visible_text(&out, "View changes").unwrap();
-        for (frame, pressed) in [(2, true), (3, false)] {
-            draw(&ctx, &mut app, frame, vec![Event::PointerMoved(pos), Event::PointerButton {
-                pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
-            }]);
-        }
+        let removed = visible_text_rect(&out, "−4").unwrap();
+        let pos = egui::pos2(removed.right() + ctx.style().spacing.item_spacing.x + 16., removed.center().y);
+        let click = |app: &mut Desktop, frame| {
+            for (offset, pressed) in [true, false].into_iter().enumerate() {
+                draw(&ctx, app, frame + offset, vec![Event::PointerMoved(pos), Event::PointerButton {
+                    pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+                }]);
+            }
+        };
+        click(&mut app, 2);
         let out = draw(&ctx, &mut app, 4, vec![]);
-        assert!(visible_text(&out, "Hide changes").is_some());
+        assert!(visible_text(&out, &patch).is_some());
+        click(&mut app, 5);
+        let out = draw(&ctx, &mut app, 7, vec![]);
+        assert!(visible_text(&out, &patch).is_none());
     }
 
     #[test]
@@ -4160,7 +4222,8 @@ mod transcript_tests {
         draw_at_width(&ctx, &mut app, 0, vec![], 400.);
         let folded = draw_at_width(&ctx, &mut app, 1, vec![], 400.);
         let point = visible_text(&folded, "Worked · 1 step · Tool call · 1 didn't work").unwrap();
-        assert!(visible_text(&folded, "Checking the folder.").is_none());
+        assert!(visible_text(&folded, "Checking the folder.").is_some());
+        assert!(visible_text(&folded, "Tool call · Not understood · invalid JSON").is_none());
         let pos = egui::pos2(370., point.y);
         for (frame, pressed) in [(2, true), (3, false)] {
             draw_at_width(&ctx, &mut app, frame, vec![Event::PointerMoved(pos), Event::PointerButton {

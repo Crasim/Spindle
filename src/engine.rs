@@ -768,7 +768,7 @@ impl Engine {
                     let grant = crate::policy::Grant {
                         id: gid,
                         risk: p.risk,
-                        scope: crate::policy::scope_for(p.risk, &p.target, Some(&p.root)),
+                        scope: crate::policy::scope_for(p.risk, p.permission_target(), Some(&p.root)),
                         holder,
                         trust: p.trust,
                         created: automation::now(),
@@ -835,7 +835,8 @@ The user denied this action. Continue with other work or explain the denial. Do 
                 self.state.grants.retain(|g| g.id != id);
                 ensure!(self.state.grants.len() < before, "No permission #{id}");
                 for request in &mut self.state.requests {
-                    if request.risk == crate::policy::Risk::Browser && (request.reason == format!("Allowed by permission #{id}")
+                    if matches!(request.risk, crate::policy::Risk::Browser | crate::policy::Risk::SandboxBuild)
+                        && (request.reason == format!("Allowed by permission #{id}")
                         || request.reason.ends_with(&format!("(permission #{id})"))) {
                         request.approved = false;
                         request.reason.clear();
@@ -3973,16 +3974,6 @@ Error: {detail}",
         preview = diff;
     }
     let trust = crate::policy::trust(state, model);
-    let decision = crate::policy::decide(
-        &state.grants,
-        &crate::policy::Request {
-            risk,
-            target: &target,
-            chat,
-            project: if browser_tab { project.as_deref() } else { Some(&root) },
-            trust,
-        },
-    );
     let id = state
         .requests
         .iter()
@@ -4009,6 +4000,16 @@ Error: {detail}",
         reason: String::new(),
         preview,
     };
+    let decision = crate::policy::decide(
+        &state.grants,
+        &crate::policy::Request {
+            risk,
+            target: pending.permission_target(),
+            chat,
+            project: if browser_tab { project.as_deref() } else { Some(&root) },
+            trust,
+        },
+    );
     match decision {
         crate::policy::Decision::Allow(grant) => {
             pending.approved = true;
@@ -7324,6 +7325,60 @@ mod tests {
         assert!(e.command(&format!("/approve {id} conversation"), false).is_err());
         e.command(&format!("/deny {id}"), false).unwrap();
         assert!(e.state.requests.is_empty() && e.state.queue[0].text.contains("denied"));
+    }
+
+    #[test]
+    fn build_approval_covers_the_project_across_sandbox_copies_and_can_be_revoked() -> Result<()> {
+        use crate::policy::{Holder, Risk, Trust};
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let mut engine = fixture(&root);
+        let project = root.join("project");
+        let copy = root.join("sandbox-copy");
+        let mut pending = crate::state::Pending {
+            remote: None,
+            chat_read_only: false,
+            id: 1,
+            chat: engine.state.chat_id,
+            project: Some(project.clone()),
+            root: copy.clone(),
+            target: copy.join("main.rs"),
+            call: crate::tools::Envelope {
+                v: 1,
+                id: "build".into(),
+                call: crate::tools::Call::BuildBinary {
+                    path: "main.rs".into(),
+                    inputs: vec![],
+                    name: "example".into(),
+                    args: vec![],
+                },
+            },
+            risk: Risk::SandboxBuild,
+            model: engine.state.model.clone(),
+            trust: Trust::Standard,
+            steps: 0,
+            created: 0,
+            approved: false,
+            reason: String::new(),
+            preview: String::new(),
+        };
+        engine.state.requests.push(pending.clone());
+        assert!(engine.command("/approve 1 project", false).is_err());
+        assert!(engine.command("/approve 1 always", false).is_err());
+        engine.command("/approve 1 conversation", false)?;
+        let grant = &engine.state.grants[0];
+        assert_eq!(grant.scope, project);
+        assert_eq!(grant.holder, Holder::Conversation(pending.chat));
+        assert!(engine.jobs.started.is_none(), "approval alone cannot enable the sandbox");
+
+        pending.id = 2;
+        pending.approved = true;
+        pending.reason = format!("Allowed by permission #{}", grant.id);
+        engine.state.requests.push(pending);
+        engine.command(&format!("/revoke {}", grant.id), false)?;
+        assert!(engine.state.grants.is_empty());
+        assert!(!engine.state.requests[0].approved);
+        Ok(())
     }
 
     #[tokio::test]

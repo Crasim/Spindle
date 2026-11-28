@@ -280,6 +280,7 @@ pub(super) fn reply_notes(
     ui: &mut egui::Ui,
     turn: &crate::state::Turn,
     memories: &[crate::memory::Memory],
+    show_tool: bool,
 ) -> Option<NoteAction> {
     let mut action = None;
     let kept: Vec<&crate::memory::Memory> = turn
@@ -287,11 +288,12 @@ pub(super) fn reply_notes(
         .iter()
         .filter_map(|id| memories.iter().find(|m| m.id == *id))
         .collect();
-    if turn.remembered.is_empty() && turn.plan.is_none() && turn.tool.is_none() {
+    let tool = turn.tool.as_ref().filter(|_| show_tool);
+    if turn.remembered.is_empty() && turn.plan.is_none() && tool.is_none() {
         return None;
     }
     ui.horizontal_wrapped(|ui| {
-        if let Some(tool) = &turn.tool {
+        if let Some(tool) = tool {
             let text = format!("{} · {}", tool.summary, tool.status);
             let sandbox = tool.summary.starts_with("Set up the sandbox")
                 || tool.summary.starts_with("Install Python packages");
@@ -456,6 +458,8 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
                 format!("Paired tab for chat #{}", req.chat)
             } else if matches!(req.call.call, crate::tools::Call::DesktopControl(_)) {
                 "Local desktop".into()
+            } else if req.risk == crate::policy::Risk::SandboxBuild {
+                "This device".into()
             } else {
                 crate::projects::display_path(&req.target)
             };
@@ -494,6 +498,9 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
                         (crate::tools::Call::LoadTool{..}, Level::Once, _) => "Load this tool".to_owned(),
                         (crate::tools::Call::Setup {}, Level::Once, _) => "Set up the sandbox".to_owned(),
                         (crate::tools::Call::BuildApk { .. }, Level::Once, _) => "Build APK".to_owned(),
+                        (_, Level::Conversation, _) if req.risk == crate::policy::Risk::SandboxBuild => {
+                            "Allow builds and tests in this chat".to_owned()
+                        }
                         (_, Level::Once, true) => "Install".to_owned(),
                         (_, Level::Conversation, true) => "Allow installs in this conversation".to_owned(),
                         _ => level.label().to_owned(),
@@ -525,8 +532,10 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
                 ui.weak("Approval applies only to the command shown above.");
             } else if matches!(req.call.call, crate::tools::Call::DesktopControl(_)) {
                 ui.weak("Approve only this action. Press Esc to revoke desktop access and invalidate pending approvals.");
+            } else if req.risk == crate::policy::Risk::SandboxBuild {
+                ui.weak("Review saved approvals with /permissions. Revoke with /revoke.");
             } else if req.risk == crate::policy::Risk::Native {
-                ui.weak("Each build or test needs its own approval.");
+                ui.weak("Approval applies only to the action shown above.");
             } else if req.risk == crate::policy::Risk::Browser {
                 ui.weak("Standing approvals apply to this URL, model, and action type. Manage them in Computer use.");
             } else if req.risk == crate::policy::Risk::Connector {
@@ -610,10 +619,7 @@ pub(super) fn applied_note(ui: &mut egui::Ui, applied: &crate::state::Applied, c
         });
         if can_undo && !failed
             && applied.undone.is_none()
-            && ui
-                .small_button("Undo")
-                .on_hover_text("Put the project files back as they were before this reply")
-                .clicked()
+            && small(ui, Icon::Undo, "Undo the edits from this reply")
         {
             undo = true;
         }
@@ -650,11 +656,13 @@ pub(super) fn edit_summary<'a>(ui: &mut egui::Ui, edits: impl IntoIterator<Item 
             ui.strong(format!("Edited {count} file{}", if count == 1 { "" } else { "s" }));
             edit_counts(ui, &edits);
             if applied.is_some_and(|apply| apply.undone.is_none() && !apply.keep.as_os_str().is_empty()) {
-                if ui.add_enabled(can_undo, egui::Button::new("Undo"))
+                if ui.add_enabled_ui(can_undo, |ui| small_control(ui, Icon::Undo, "Undo edits", false)).inner
                     .on_disabled_hover_text("Finish work in this conversation before undoing edits")
                     .clicked() { confirming = true; }
             }
-            if ui.button(if selected.is_some() { "Hide changes" } else { "View changes" }).clicked() {
+            let diff_open = selected.is_some();
+            let diff_label = if diff_open { "Hide changes" } else { "View changes" };
+            if small_control(ui, Icon::Diff, diff_label, diff_open).clicked() {
                 selected = if selected.is_some() { None } else { files.keys().next().map(|name| (*name).to_owned()) };
             }
         });

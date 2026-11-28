@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn native_tools_reject_paths_and_require_one_time_approval() {
+    fn native_tools_reject_paths_and_scope_saved_approval_to_the_chat() {
         if !supported() {
             return;
         }
@@ -782,22 +782,36 @@ mod tests {
             args: vec![],
         };
         assert!(crate::tools::classify(&path, &call, false).is_err());
-        let (risk, target) = crate::tools::classify(&path, &call, true).unwrap();
-        use crate::policy::{Decision, Level, Request, Trust};
-        assert_eq!(crate::policy::levels(risk, Trust::Trusted), &[Level::Once]);
-        assert_eq!(
-            crate::policy::decide(
-                &[],
-                &Request {
-                    risk,
-                    target: &target,
-                    chat: 1,
-                    project: Some(&path),
-                    trust: Trust::Trusted,
-                }
-            ),
-            Decision::Ask
-        );
+        use crate::policy::{Decision, Grant, Holder, Level, Request, Risk, Trust};
+        let (risk, _) = crate::tools::classify(&path, &call, true).unwrap();
+        let test = Call::TestBinary { name: format!("calculator.{}", output_extension()), args: vec![] };
+        assert_eq!(risk, Risk::SandboxBuild);
+        assert_eq!(crate::tools::classify(&path, &test, true).unwrap().0, risk);
+        assert_eq!(crate::policy::levels(risk, Trust::Standard), &[Level::Once, Level::Conversation]);
+        let mut request = Request {
+            risk, target: &path, chat: 1, project: Some(&path), trust: Trust::Standard,
+        };
+        assert_eq!(crate::policy::decide(&[], &request), Decision::Ask);
+        let grants = [Grant {
+            id: 7, risk, scope: path.clone(), holder: Holder::Conversation(1),
+            trust: Trust::Standard, created: 0, access: None,
+        }];
+        let decide = |request: &Request<'_>| crate::policy::decide(&grants, request);
+        assert_eq!(decide(&request), Decision::Allow(Some(7)));
+        request.chat = 2;
+        assert_eq!(decide(&request), Decision::Ask);
+        request.chat = 1;
+        let another_workspace = path.join("another-project");
+        request.target = &another_workspace;
+        assert_eq!(decide(&request), Decision::Ask);
+        request.target = &path;
+        request.trust = Trust::Restricted;
+        assert_eq!(decide(&request), Decision::Ask);
+        request.trust = Trust::Standard;
+        for risk in [Risk::Native, Risk::Destructive, Risk::Install] {
+            request.risk = risk;
+            assert_eq!(decide(&request), Decision::Ask);
+        }
     }
 
     /// Uses the official archive and the OS sandbox, with a disposable state directory.

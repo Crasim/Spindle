@@ -313,7 +313,15 @@ impl Engine {
     pub(crate) fn start_run(&mut self, p: Pending) -> Result<()> {
         if p.call.call.native() {
             ensure!(ready(&self.state), "{}", unavailable(&self.state));
-            ensure!(p.risk == crate::policy::Risk::Native && p.approved, "Native execution requires approval");
+            use crate::policy::Risk;
+            ensure!(p.approved && matches!(p.risk, Risk::Native | Risk::SandboxBuild), "Native execution requires approval");
+            if p.risk == Risk::SandboxBuild {
+                ensure!(
+                    crate::engine::tool_folder(&self.state, p.chat, Some(&self.root))
+                        .is_some_and(|(folder, _)| folder == p.permission_target()),
+                    "The chat's workspace changed. Request a build or test in the current workspace."
+                );
+            }
             let workspace = self.root.clone();
             let data = crate::runtime::data_dir();
             self.jobs.cancel = Arc::new(AtomicBool::new(false));

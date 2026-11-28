@@ -271,6 +271,8 @@ pub enum Icon {
     Chip,
     Arrow,
     Back,
+    Undo,
+    Diff,
     Star,
     Plug,
     Check,
@@ -598,6 +600,18 @@ pub fn draw_with(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32
             path(&[(12., 5.), (5., 12.), (12., 19.)]);
             path(&[(5., 12.), (19., 12.)]);
         }
+        Icon::Undo => {
+            path(&[(9., 5.), (4., 10.), (9., 15.)]);
+            path(&[(4., 10.), (14., 10.), (17., 10.6), (19., 12.3), (20., 14.8), (19., 17.3), (17., 19.), (14., 19.6)]);
+        }
+        Icon::Diff => {
+            box_at(4., 3., 20., 21.);
+            path(&[(7., 9.), (12., 9.)]);
+            path(&[(9.5, 6.5), (9.5, 11.5)]);
+            path(&[(15., 9.), (17., 9.)]);
+            path(&[(7., 15.), (12., 15.)]);
+            path(&[(15., 15.), (17., 15.)]);
+        }
         Icon::Chevron => path(&[(7., 10.), (12., 15.), (17., 10.)]),
         Icon::Memory => path(&[
             (6., 3.),
@@ -698,12 +712,16 @@ pub fn starter(ui: &mut Ui, icon: Icon, title: &str, detail: &str, width: f32) -
     res.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-pub fn small(ui: &mut Ui, icon: Icon, label: &str) -> bool {
-    let response = control(ui, icon, "", vec2(32., 30.), false);
+pub fn small_control(ui: &mut Ui, icon: Icon, label: &str, selected: bool) -> Response {
+    let response = control(ui, icon, "", vec2(32., 30.), selected);
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
     });
-    response.on_hover_text(label).clicked()
+    response.on_hover_text(label)
+}
+
+pub fn small(ui: &mut Ui, icon: Icon, label: &str) -> bool {
+    small_control(ui, icon, label, false).clicked()
 }
 
 pub fn symbol(ui: &mut Ui, icon: Icon, color: Color32) {

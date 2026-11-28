@@ -116,6 +116,15 @@ pub struct Pending {
 }
 
 impl Pending {
+    /// The project or private chat folder stays the same when build inputs use a sandbox copy.
+    pub(crate) fn permission_target(&self) -> &Path {
+        if self.risk == crate::policy::Risk::SandboxBuild {
+            self.project.as_deref().unwrap_or(&self.root)
+        } else {
+            &self.target
+        }
+    }
+
     pub(crate) fn confirmed_change(&self) -> bool {
         self.risk == crate::policy::Risk::Destructive && self.approved && self.reason == "Allowed once by you"
     }
@@ -1034,6 +1043,13 @@ impl Store {
         crate::artifacts::upgrade_history(&mut state.thread, &mut state.history);
         for c in state.chats.values_mut() {
             crate::artifacts::upgrade_history(&mut c.thread, &mut c.history);
+        }
+        for request in &mut state.requests {
+            if !request.approved && request.remote.is_none() && request.call.call.native()
+                && request.risk == crate::policy::Risk::Native
+            {
+                request.risk = crate::policy::Risk::SandboxBuild;
+            }
         }
         state.held |= !state.queue.is_empty();
         let store = Self {

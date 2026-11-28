@@ -128,6 +128,8 @@ pub enum Risk {
     Sandboxed,
     /// Run code in the sandbox.
     Run,
+    /// Compile staged source or test a stored build in a disposable sandbox on this device.
+    SandboxBuild,
     Native,
     Browser,
     Connector,
@@ -145,6 +147,7 @@ impl Risk {
             Risk::WriteOutside => "Change files outside the project",
             Risk::Sandboxed => "Change files in the sandbox copy",
             Risk::Run => "Run code in the sandbox",
+            Risk::SandboxBuild => "Build or test in the sandbox",
             Risk::Native => "Load, build or run executable tools",
             Risk::Browser => "Use the connected browser tab",
             Risk::Connector => "Read from a connected account",
@@ -189,6 +192,7 @@ pub fn levels(risk: Risk, trust: Trust) -> &'static [Level] {
         (Risk::WriteOutside, Trust::Trusted) => &[Once, Conversation, Project],
         (Risk::Install, Trust::Trusted) => &[Once, Conversation],
         (Risk::Install, _) => &[Once],
+        (Risk::SandboxBuild, _) => &[Once, Conversation],
         (Risk::Native | Risk::Connector | Risk::Destructive, _) => &[Once],
         (Risk::Browser, _) => &[Once, Conversation, Project, Always],
     }
@@ -202,6 +206,9 @@ pub fn warning(risk: Risk, level: Level) -> Option<&'static str> {
         ),
         (Risk::WriteOutside, Level::Conversation) | (Risk::Write, Level::Project) => {
             Some("Changes will be made without asking again. Each one is still logged.")
+        }
+        (Risk::SandboxBuild, Level::Conversation) => {
+            Some("Covers local sandboxed builds and tests in this chat and its current workspace.")
         }
         _ => None,
     }
@@ -237,9 +244,14 @@ impl Grant {
         project: Option<&Path>,
         trust: Trust,
     ) -> bool {
+        let in_scope = if risk == Risk::SandboxBuild {
+            self.scope == target && matches!(self.holder, Holder::Conversation(_))
+        } else {
+            target.starts_with(&self.scope)
+        };
         self.risk == risk
             && trust >= self.trust
-            && target.starts_with(&self.scope)
+            && in_scope
             && match &self.holder {
                 Holder::Conversation(id) => *id == chat,
                 Holder::Project(p) => project == Some(p.as_path()),
@@ -324,7 +336,7 @@ pub fn scope_for(risk: Risk, target: &Path, project: Option<&Path>) -> PathBuf {
     if risk == Risk::Browser {
         return target.parent().unwrap_or(target).to_owned();
     }
-    if risk == Risk::Install {
+    if matches!(risk, Risk::Install | Risk::SandboxBuild) {
         return target.to_owned();
     }
     match (risk.outside(), project) {

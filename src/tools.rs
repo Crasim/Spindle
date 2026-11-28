@@ -1468,7 +1468,7 @@ pub fn classify(root: &Path, call: &Call, sandboxed: bool) -> Result<(Risk, Path
         crate::native::validate(call)?;
         let (path, inside) = resolve(root, call.raw_path())?;
         ensure!(inside, "Native build inputs must be inside the conversation's folder");
-        return Ok((Risk::Native, path));
+        return Ok((Risk::SandboxBuild, path));
     }
     let (path, inside) = resolve(root, call.raw_path())?;
     classify_resolved(root, call, sandboxed, path, inside)
