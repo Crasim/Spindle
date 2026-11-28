@@ -4,7 +4,7 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct SyncForm {
-    name: String,
+    name: Option<String>,
     server: String,
     admin: String,
     user: String,
@@ -37,6 +37,36 @@ pub(super) struct SyncForm {
     check: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     /// A branch being read: (chat, branch id).
     pub reading: Option<(u64, String)>,
+}
+
+const DEVICE_NAME: android_ime::Field = android_ime::Field { password: false, limit: 64 };
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    #[test]
+    fn clearing_the_suggested_device_name_survives_a_layout_pass() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+        let (tx, _commands) = tokio::sync::mpsc::unbounded_channel();
+        let (_views, rx) = std::sync::mpsc::channel();
+        let (_stream, preview) = tokio::sync::watch::channel(String::new());
+        let mut app = Desktop::new(&cc, workspace.path().into(), tx, rx, preview, Accent::Blue);
+        let draw = |app: &mut Desktop, height| {
+            let _ = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600., height))),
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.sync_settings(ui));
+            });
+        };
+        draw(&mut app, 850.);
+        app.sync_form.name.as_mut().unwrap().clear();
+        draw(&mut app, 460.);
+        assert_eq!(app.sync_form.name.as_deref(), Some(""));
+    }
 }
 
 fn when(t: i64) -> String {
@@ -143,69 +173,57 @@ impl Desktop {
         let mut pick_projects_folder = false;
         let state = &self.view.state;
         let f = &mut self.sync_form;
-        if f.name.is_empty() {
-            f.name = crate::sync::live::hostname();
-        }
+        let ime = &mut self.android_ime;
         let Some(sync) = state.space.as_ref() else {
+            let device_name = f.name.get_or_insert_with(crate::sync::live::hostname);
             // Not set up: start a space, or join one.
             card(ui, "Sync this Spindle across your devices", |ui| {
                 ui.weak("Conversations, projects, settings, skills, memories and API keys, end-to-end encrypted. Servers and shared folders only ever hold encrypted data.");
                 ui.add_space(6.);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("This device's name");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.name)
-                            .id_salt("sync_view-field-1")
-                            .hint_text("This computer's name")
-                            .desired_width((ui.available_width().max(230.)).min(200.)),
-                    );
+                    ime.field(ui, "sync-create-name", device_name, DEVICE_NAME, |edit| {
+                        edit.hint_text("This device's name").desired_width(200.)
+                    });
                     if ui
                         .add_enabled(
-                            !f.name.trim().is_empty(),
+                            !device_name.trim().is_empty(),
                             egui::Button::new("Start syncing"),
                         )
                         .clicked()
                     {
-                        send.push(format!("/sync create {}", f.name.trim()));
+                        send.push(format!("/sync create {}", device_name.trim()));
                     }
                 });
             });
             card(ui, "Join from another device", |ui| {
                 ui.weak("On the other device: Settings › Sync › Add a device. Paste its link here, or type its code and the address it shows.");
                 ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.join)
-                            .id_salt("sync_view-field-2")
-                            .hint_text("spindle://pair… or ABCD-EFGH-JKLM")
-                            .desired_width((ui.available_width().max(230.)).min(260.)),
-                    );
+                    let width = ui.available_width().clamp(120., 260.);
+                    ime.field(ui, "sync-join-link", &mut f.join, Default::default(), |edit| {
+                        edit.hint_text("spindle://pair… or ABCD-EFGH-JKLM").desired_width(width)
+                    });
                     // A phone: read the code off the other device's screen instead.
                     #[cfg(target_os = "android")]
                     if ui.button("Scan QR code").clicked() {
                         crate::scan::begin();
                     }
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.join_where)
-                            .id_salt("sync_view-field-3")
-                            .hint_text("server or address (for a code)")
-                            .desired_width((ui.available_width().max(230.)).min(200.)),
-                    );
+                    ime.field(ui, "sync-join-address", &mut f.join_where, Default::default(), |edit| {
+                        edit.hint_text("Server or address (for a code)").desired_width(200.)
+                    });
                 });
                 ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.name)
-                            .id_salt("sync_view-field-4")
-                            .hint_text("This device's name")
-                            .desired_width((ui.available_width().max(230.)).min(200.)),
-                    );
+                    ime.field(ui, "sync-join-name", device_name, DEVICE_NAME, |edit| {
+                        edit.hint_text("This device's name").desired_width(200.)
+                    });
                     if ui
                         .add_enabled(!f.join.trim().is_empty(), egui::Button::new("Join"))
                         .clicked()
                     {
-                        let name = if f.name.trim().is_empty() {
+                        let name = if device_name.trim().is_empty() {
                             "New device".to_owned()
                         } else {
-                            f.name.trim().replace(' ', "-")
+                            device_name.trim().replace(' ', "-")
                         };
                         send.push(
                             format!(
@@ -224,25 +242,16 @@ impl Desktop {
                 ui.add_space(6.);
                 ui.label(Text::new("Or sign in to your sync server").strong());
                 ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.server)
-                            .id_salt("sync_view-field-5")
-                            .hint_text("https://sync.example")
-                            .desired_width((ui.available_width().max(230.)).min(200.)),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.join_user)
-                            .id_salt("sync_view-field-6")
-                            .hint_text("user")
-                            .desired_width(100.),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut f.join_password)
-                            .id_salt("sync_view-field-7")
-                            .password(true)
-                            .hint_text("password")
-                            .desired_width(140.),
-                    );
+                    ime.field(ui, "sync-account-server", &mut f.server, Default::default(), |edit| {
+                        edit.hint_text("https://sync.example").desired_width(200.)
+                    });
+                    ime.field(ui, "sync-account-user", &mut f.join_user, Default::default(), |edit| {
+                        edit.hint_text("User").desired_width(100.)
+                    });
+                    ime.field(ui, "sync-account-password", &mut f.join_password, android_ime::Field {
+                        password: true,
+                        ..Default::default()
+                    }, |edit| edit.hint_text("Password").desired_width(140.));
                     let ready = !f.server.trim().is_empty()
                         && !f.join_user.trim().is_empty()
                         && !f.join_password.is_empty();
@@ -250,10 +259,10 @@ impl Desktop {
                         .add_enabled(ready, egui::Button::new("Sign in"))
                         .clicked()
                     {
-                        let name = if f.name.trim().is_empty() {
+                        let name = if device_name.trim().is_empty() {
                             "New-device".to_owned()
                         } else {
-                            f.name.trim().replace(' ', "-")
+                            device_name.trim().replace(' ', "-")
                         };
                         send.push(format!(
                             "/sync join-account {} {} {name} {}",
@@ -380,11 +389,9 @@ impl Desktop {
             ui.horizontal_wrapped(|ui| match &mut f.rename {
                 Some(new) => {
                     ui.label("This device's name");
-                    let field = ui.add(
-                        egui::TextEdit::singleline(new)
-                            .id_salt("sync_view-field-8")
-                            .desired_width((ui.available_width().max(230.)).min(200.)),
-                    );
+                    let field = ime.field(ui, "sync-current-name", new, DEVICE_NAME, |edit| {
+                        edit.desired_width(200.)
+                    });
                     let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let ok = !new.trim().is_empty();
                     if ui.add_enabled(ok, egui::Button::new("Save")).clicked() || (enter && ok) {

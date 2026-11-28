@@ -1,6 +1,6 @@
 [package]
 name = "spindle"
-version = "0.3.0-beta.55"
+version = "0.3.0-beta.56"
 edition = "2024"
 rust-version = "1.89"
 

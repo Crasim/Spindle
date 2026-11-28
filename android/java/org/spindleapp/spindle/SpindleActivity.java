@@ -7,6 +7,8 @@ import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.EditText;
@@ -531,6 +533,8 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
     private int revision;
     private int editorMode;
     private boolean applying;
+    private boolean composerShowPending;
+    private final Runnable showComposerKeyboard = this::showComposerKeyboardIfReady;
     private final AtomicReference<String[]> snapshot = new AtomicReference<>();
 
     private static final class ComposerEditor extends EditText {
@@ -558,12 +562,37 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
         editor.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE
                 | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES | InputType.TYPE_TEXT_FLAG_AUTO_CORRECT);
         editor.setImeOptions(EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN);
+        editor.setFocusableInTouchMode(true);
         editor.setAlpha(0);
         editor.setSaveEnabled(false);
         editor.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         editor.setVisibility(View.INVISIBLE);
         editor.addTextChangedListener(this);
         content.addView(editor, new ViewGroup.LayoutParams(1, 1));
+    }
+
+    @Override
+    public void onWindowFocusChanged(boolean focused) {
+        super.onWindowFocusChanged(focused);
+        if (focused && composerShowPending && editor != null) {
+            editor.post(showComposerKeyboard);
+        }
+    }
+
+    private void showComposerKeyboardIfReady() {
+        if (!composerShowPending || revision == 0 || editor == null
+                || !editor.isShown() || !editor.hasWindowFocus()) return;
+        if (!editor.hasFocus() && !editor.requestFocus()) return;
+        composerShowPending = false;
+        if (android.os.Build.VERSION.SDK_INT >= 30) {
+            WindowInsetsController controller = editor.getWindowInsetsController();
+            if (controller != null) {
+                controller.show(WindowInsets.Type.ime());
+                return;
+            }
+        }
+        InputMethodManager keyboard = getSystemService(InputMethodManager.class);
+        if (keyboard != null) keyboard.showSoftInput(editor, 0);
     }
 
     @Override
@@ -615,12 +644,9 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
                 if (opening) editor.setVisibility(View.VISIBLE);
                 if (!editor.hasFocus()) editor.requestFocus();
                 if (opening || show) {
-                    editor.post(() -> {
-                        if (revision != 0 && editor.hasFocus()) {
-                            getSystemService(InputMethodManager.class)
-                                    .showSoftInput(editor, InputMethodManager.SHOW_IMPLICIT);
-                        }
-                    });
+                    composerShowPending = true;
+                    editor.removeCallbacks(showComposerKeyboard);
+                    editor.post(showComposerKeyboard);
                 }
             } finally {
                 applying = false;
@@ -636,6 +662,8 @@ public final class SpindleActivity extends NativeActivity implements TextWatcher
         runOnUiThread(() -> {
             if (editor == null || editor.getVisibility() != View.VISIBLE) return;
             revision = 0;
+            composerShowPending = false;
+            editor.removeCallbacks(showComposerKeyboard);
             getSystemService(InputMethodManager.class)
                     .hideSoftInputFromWindow(editor.getWindowToken(), 0);
             editor.clearFocus();
