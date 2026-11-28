@@ -549,7 +549,10 @@ pub(super) fn approval_card(ui: &mut egui::Ui, req: &crate::state::Pending) -> O
 /// indicator for code running in the sandbox. Returns a command.
 /// The note under a reply whose edits Spindle applied to the project. Returns true when the
 /// user clicks Undo.
-pub(super) fn applied_note(ui: &mut egui::Ui, applied: &crate::state::Applied) -> bool {
+pub(super) fn applied_note(ui: &mut egui::Ui, applied: &crate::state::Applied, can_undo: bool) -> bool {
+    if !applied.edits.is_empty() {
+        return edit_summary(ui, applied.edits.iter(), Some(applied), can_undo);
+    }
     let mut undo = false;
     ui.add_space(4.);
     let failed = applied.keep.as_os_str().is_empty();
@@ -605,7 +608,7 @@ pub(super) fn applied_note(ui: &mut egui::Ui, applied: &crate::state::Applied) -
                     ui.add(egui::Label::new(job).selectable(true));
                 });
         });
-        if !failed
+        if can_undo && !failed
             && applied.undone.is_none()
             && ui
                 .small_button("Undo")
@@ -614,6 +617,98 @@ pub(super) fn applied_note(ui: &mut egui::Ui, applied: &crate::state::Applied) -
         {
             undo = true;
         }
+    });
+    undo
+}
+
+fn edit_counts(ui: &mut egui::Ui, edits: &[&crate::edit_summary::Edit]) {
+    let mut counts = edits.iter().filter_map(|edit| edit.lines).peekable();
+    if counts.peek().is_some() {
+        let (added, removed) = counts.fold((0, 0), |(a, r), (da, dr)| (a + da, r + dr));
+        ui.label(Text::new(format!("+{added}")).color(Color::from_rgb(110, 185, 125)));
+        ui.label(Text::new(format!("−{removed}")).color(Color::from_rgb(225, 112, 112)));
+    }
+}
+
+pub(super) fn edit_summary<'a>(ui: &mut egui::Ui, edits: impl IntoIterator<Item = &'a crate::edit_summary::Edit>, applied: Option<&crate::state::Applied>, can_undo: bool) -> bool {
+    let edits: Vec<_> = edits.into_iter().collect();
+    if edits.is_empty() { return false; }
+    let mut files = std::collections::BTreeMap::<&str, Vec<_>>::new();
+    for edit in &edits { files.entry(&edit.path).or_default().push(*edit); }
+    let id = ui.id().with("edit-summary");
+    let (mut show_all, mut selected, mut confirming) = ui.data(|data| (
+        data.get_temp::<bool>(id.with("all")).unwrap_or(false),
+        data.get_temp::<String>(id.with("selected")),
+        data.get_temp::<bool>(id.with("undo")).unwrap_or(false),
+    ));
+    let mut undo = false;
+    egui::Frame::new().fill(raised()).corner_radius(10).inner_margin(12).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_wrapped(|ui| {
+            symbol(ui, Icon::Rename, accent());
+            let count = files.len();
+            ui.strong(format!("Edited {count} file{}", if count == 1 { "" } else { "s" }));
+            edit_counts(ui, &edits);
+            if applied.is_some_and(|apply| apply.undone.is_none() && !apply.keep.as_os_str().is_empty()) {
+                if ui.add_enabled(can_undo, egui::Button::new("Undo"))
+                    .on_disabled_hover_text("Finish work in this conversation before undoing edits")
+                    .clicked() { confirming = true; }
+            }
+            if ui.button(if selected.is_some() { "Hide changes" } else { "View changes" }).clicked() {
+                selected = if selected.is_some() { None } else { files.keys().next().map(|name| (*name).to_owned()) };
+            }
+        });
+        ui.separator();
+        for (name, changes) in files.iter().take(if show_all { files.len() } else { 3 }) {
+            ui.push_id(name, |ui| ui.horizontal(|ui| {
+                edit_counts(ui, changes);
+                if ui.add(egui::Button::new(*name).selected(selected.as_deref() == Some(*name)).truncate())
+                    .on_hover_text(*name).clicked() { selected = Some((*name).to_owned()); }
+            }));
+        }
+        if files.len() > 3 {
+            let extra = files.len() - 3;
+            let label = if show_all { "Show fewer files".to_owned() } else { format!("Show {extra} more file{}", if extra == 1 { "" } else { "s" }) };
+            if ui.small_button(label).clicked() { show_all = !show_all; }
+        }
+        if let Some(apply) = applied {
+            for issue in apply.summary.lines().skip(1) { ui.weak(issue); }
+            if let Some(undone) = &apply.undone { ui.weak(undone); }
+        }
+        if confirming {
+            ui.label("Undo this batch of edits? Files changed since then will be left alone.");
+            ui.horizontal_wrapped(|ui| {
+                undo = ui.add_enabled(can_undo, egui::Button::new("Undo edits")).clicked();
+                if undo || ui.button("Cancel").clicked() { confirming = false; }
+            });
+        }
+        if let Some(name) = selected.as_deref() && let Some(changes) = files.get(name) {
+            ui.separator();
+            ui.strong(name);
+            egui::ScrollArea::both().id_salt(id.with("diff")).max_height(320.).show(ui, |ui| {
+                let mut job = egui::text::LayoutJob::default();
+                for edit in changes {
+                    let patch = edit.patch.as_deref().filter(|patch| !patch.is_empty())
+                        .unwrap_or("Text diff unavailable for this change.");
+                    for line in patch.lines() {
+                        let color = match line.as_bytes().first() {
+                            Some(b'+') if !line.starts_with("+++") => Color::from_rgb(120, 200, 130),
+                            Some(b'-') if !line.starts_with("---") => Color::from_rgb(230, 120, 120),
+                            Some(b'@') => accent(),
+                            _ => muted(),
+                        };
+                        job.append(&format!("{line}\n"), 0., egui::TextFormat::simple(egui::FontId::monospace(12.), color));
+                    }
+                }
+                ui.add(egui::Label::new(job).extend().selectable(true));
+            });
+        }
+    });
+    ui.data_mut(|data| {
+        data.insert_temp(id.with("all"), show_all);
+        if let Some(name) = selected { data.insert_temp(id.with("selected"), name); }
+        else { data.remove::<String>(id.with("selected")); }
+        data.insert_temp(id.with("undo"), confirming);
     });
     undo
 }

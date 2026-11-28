@@ -4,6 +4,7 @@ use anyhow::{Context, Result, ensure};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::edit_summary::Edit;
 
 const MAX_VERSION: u64 = 32 * 1024 * 1024;
 const MAX_DIFF: usize = 1024 * 1024;
@@ -61,7 +62,7 @@ impl History {
         Ok(versions)
     }
 
-    fn saved(&self, id: &str) -> Result<Vec<u8>> {
+    pub(crate) fn saved(&self, id: &str) -> Result<Vec<u8>> {
         ensure!(
             valid_id(id),
             "Choose a revision ID from this file's history"
@@ -86,7 +87,7 @@ impl History {
         .into_bytes()
     }
 
-    fn snapshot(&self, before: &[u8]) -> Result<()> {
+    fn snapshot(&self, before: &[u8]) -> Result<String> {
         let time = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
         let suffix = crate::sync::core::hex(&crate::vault::random::<8>()?);
         let id = format!("{time:016}-{suffix}");
@@ -94,7 +95,8 @@ impl History {
         record.extend_from_slice(before);
         let sealed = crate::vault::local(&record, true)?;
         std::fs::create_dir_all(&self.folder)?;
-        crate::tools::write_generated(&self.folder.join(format!("{id}.rev")), &sealed, false)
+        crate::tools::write_generated(&self.folder.join(format!("{id}.rev")), &sealed, false)?;
+        Ok(id)
     }
 
     pub(crate) fn compare(&self, revision: &str) -> Result<Comparison> {
@@ -132,15 +134,13 @@ impl History {
         Ok(())
     }
 
-    fn write(&self, bytes: &[u8], before: Option<&[u8]>, replace: bool) -> Result<bool> {
+    fn write(&self, bytes: &[u8], before: Option<&[u8]>, replace: bool) -> Result<Option<String>> {
         if before == Some(bytes) {
-            return Ok(false);
+            return Ok(None);
         }
-        if let Some(before) = before {
-            self.snapshot(before)?;
-        }
+        let revision = before.map(|before| self.snapshot(before)).transpose()?;
         crate::tools::write_generated(&self.path, bytes, replace)?;
-        Ok(before.is_some())
+        Ok(revision)
     }
 }
 
@@ -218,33 +218,44 @@ fn read_current(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 pub(crate) fn write(path: &Path, bytes: &[u8], replace: bool) -> Result<bool> {
+    Ok(write_recorded(path, bytes, replace, None)?.0.is_some())
+}
+
+pub(crate) fn write_recorded(path: &Path, bytes: &[u8], replace: bool, name: Option<&str>) -> Result<(Option<String>, Option<Edit>)> {
     let _guard = WRITES
         .lock()
         .map_err(|_| anyhow::anyhow!("File history is unavailable"))?;
     if !replace {
         crate::tools::write_generated(path, bytes, false)?;
-        return Ok(false);
+        return Ok((None, name.map(|name| Edit::between(name, &[], bytes))));
     }
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() > MAX_VERSION) {
         crate::tools::write_generated(path, bytes, true)?;
-        return Ok(false);
+        return Ok((None, name.map(Edit::unknown)));
     }
     let before = read_current(path)?;
     let history = History::for_path(path)?;
-    history.write(bytes, before.as_deref(), before.is_some())
+    let revision = history.write(bytes, before.as_deref(), before.is_some())?;
+    let edit = name.filter(|_| before.as_deref() != Some(bytes))
+        .map(|name| Edit::between(name, before.as_deref().unwrap_or_default(), bytes));
+    Ok((revision, edit))
 }
 
 pub(crate) fn remove(path: &Path) -> Result<()> {
+    remove_recorded(path, None).map(|_| ())
+}
+
+pub(crate) fn remove_recorded(path: &Path, name: Option<&str>) -> Result<(Option<String>, Option<Edit>)> {
     let _guard = WRITES
         .lock()
         .map_err(|_| anyhow::anyhow!("File history is unavailable"))?;
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() <= MAX_VERSION)
+    let (revision, edit) = if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && m.len() <= MAX_VERSION)
         && let Some(before) = read_current(path)?
     {
-        History::for_path(path)?.snapshot(&before)?;
-    }
+        (Some(History::for_path(path)?.snapshot(&before)?), name.map(|name| Edit::between(name, &before, &[])))
+    } else { (None, name.map(Edit::unknown)) };
     std::fs::remove_file(path)?;
-    Ok(())
+    Ok((revision, edit))
 }
 
 fn text_comparison(path: &Path, saved: &[u8], current: Option<&[u8]>) -> Option<String> {

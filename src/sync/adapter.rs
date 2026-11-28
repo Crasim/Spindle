@@ -687,6 +687,7 @@ fn chat_turns(state: &State, id: u64) -> Vec<Turn> {
             if let Some(o) = info.as_object_mut() {
                 // Undo data points at folders on this device.
                 o.remove("applied");
+                o.remove("edits");
             }
             if thread.tool_results.contains(&i) {
                 info = json!({ "tool_result": true });
@@ -1592,6 +1593,7 @@ fn restore_turn(index: usize, info: &Value, turns: &mut BTreeMap<usize, crate::s
     } else if !info.is_null() && let Ok(mut turn) = serde_json::from_value::<crate::state::Turn>(info.clone()) {
         // A remote Undo entry points at files on a different device.
         turn.applied = None;
+        turn.edits.clear();
         turns.insert(index, turn);
     }
 }

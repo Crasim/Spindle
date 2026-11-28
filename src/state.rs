@@ -699,6 +699,9 @@ pub struct Turn {
     /// Edits Spindle applied to the project when this reply finished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<Applied>,
+    /// Successful tool edits to files in the chat's own workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<crate::edit_summary::Edit>,
     /// The tool this reply called, with what happened.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<ToolNote>,
@@ -736,6 +739,8 @@ pub struct Turn {
 pub struct Applied {
     pub summary: String,
     pub diff: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub edits: Vec<crate::edit_summary::Edit>,
     /// Folder holding the project's earlier versions of the files.
     pub keep: std::path::PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]

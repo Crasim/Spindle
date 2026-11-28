@@ -2181,6 +2181,9 @@ impl Desktop {
                 let editing_row = self.message_editors.editing_row(state.chat_id);
                 let mut note=None;
                 let mut undo_at=None;
+                let can_undo_edits = !self.view.busy && self.view.job.is_none()
+                    && !state.queue.iter().any(|task| task.origin.unwrap_or(state.chat_id) == state.chat_id)
+                    && !state.requests.iter().any(|request| request.chat == state.chat_id);
                 let mut listen:Option<((u64,usize),String)>=None;
                 // Runs of tool calls and their results fold into one line, closed by default.
                 let groups=&self.transcript.groups;
@@ -2232,6 +2235,16 @@ impl Desktop {
                             if steps_header(ui,state,groups,start,open,working) {
                                 toggle_steps=Some((state.chat_id,start));
                             }
+                            let end = start + groups[start..].iter().take_while(|g| **g == Some(start)).count();
+                            let turns = state.thread.turns.range(start..end);
+                            ui.push_id(("tool-edit-summary",start), |ui| {
+                                notes::edit_summary(ui, turns.clone().flat_map(|(_, turn)| &turn.edits), None, false);
+                                for (&at, turn) in turns {
+                                    if let Some(applied) = &turn.applied {
+                                        ui.push_id(at, |ui| if notes::applied_note(ui, applied, can_undo_edits) { undo_at = Some(at); });
+                                    }
+                                }
+                            });
                             if !open {
                                 close_group_box(ui,slot,group_box.take().unwrap().1);
                                 self.transcript.heights[index]=Some(ui.cursor().top()-top);
@@ -2353,8 +2366,11 @@ impl Desktop {
                     }
                     if let Some(turn)=turn.filter(|_|!user) {
                         ui.push_id(("reply-notes",index),|ui| if let Some(a)=notes::reply_notes(ui,turn,&state.memories) {note=Some(a);});
-                        if let Some(applied)=&turn.applied {
-                            ui.push_id(("applied",index),|ui| if notes::applied_note(ui,applied) {undo_at=Some(index);});
+                        if groups[index].is_none() {
+                            if let Some(applied)=&turn.applied {
+                                ui.push_id(("applied",index),|ui| if notes::applied_note(ui,applied,can_undo_edits) {undo_at=Some(index);});
+                            }
+                            ui.push_id(("direct-edits",index), |ui| { notes::edit_summary(ui, &turn.edits, None, false); });
                         }
                     }
                     if !message.images.is_empty() {
@@ -3906,6 +3922,34 @@ mod transcript_tests {
         let bottom = draw(&ctx, &mut app, 8, vec![]);
         assert!(visible_text(&bottom, "Message 69").is_some());
         assert!(visible_text(&bottom, "Scroll to latest").is_none());
+    }
+
+    #[test]
+    fn a_folded_tool_run_shows_edit_totals_and_opens_the_diff() {
+        use egui::{Event, Modifiers, PointerButton};
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 0);
+        for (role, body) in [("user", "Update these files"), ("assistant", "Applying the updates"),
+            ("user", "Tool result"), ("assistant", "The updates are ready")] {
+            app.view.state.history.push(crate::ollama::Message::new(role, body));
+        }
+        app.view.state.thread.tool_results.insert(2);
+        let turn = app.view.state.thread.turns.entry(1).or_default();
+        turn.tool = Some(crate::state::ToolNote { summary: "Apply edits".into(), status: "Done".into() });
+        turn.edits = (1..=4).map(|n| crate::edit_summary::Edit::between(&format!("file-{n}.txt"), b"before\n", b"after\nadded\n")).collect();
+        draw(&ctx, &mut app, 0, vec![]);
+        let out = draw(&ctx, &mut app, 1, vec![]);
+        for label in ["Edited 4 files", "+8", "−4", "Show 1 more file"] {
+            assert!(visible_text(&out, label).is_some(), "Missing {label}");
+        }
+        let pos = visible_text(&out, "View changes").unwrap();
+        for (frame, pressed) in [(2, true), (3, false)] {
+            draw(&ctx, &mut app, frame, vec![Event::PointerMoved(pos), Event::PointerButton {
+                pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+            }]);
+        }
+        let out = draw(&ctx, &mut app, 4, vec![]);
+        assert!(visible_text(&out, "Hide changes").is_some());
     }
 
     #[test]

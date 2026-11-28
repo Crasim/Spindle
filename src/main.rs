@@ -31,6 +31,7 @@ mod desktop;
 mod diff;
 mod diagnostics;
 mod documents;
+mod edit_summary;
 mod editing;
 mod engine;
 mod eval;

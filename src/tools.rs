@@ -1677,10 +1677,20 @@ fn read_page(root: &Path, path: &Path, body: &str, start: usize, count: usize, o
 
 /// Run a call that the broker has allowed. `path` is the resolved target from `classify`.
 pub fn run(root: &Path, call: &Call, path: &Path, replace_file: bool) -> Result<String> {
-    run_scoped(root, call, path, replace_file, |_| true)
+    run_scoped(root, call, path, replace_file, |_| true, None)
 }
 
-pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bool, visible: fn(&str) -> bool) -> Result<String> {
+pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bool, visible: fn(&str) -> bool, edit: Option<&mut Option<crate::edit_summary::Edit>>) -> Result<String> {
+    let write = |bytes: &[u8], replace, edit: Option<&mut Option<crate::edit_summary::Edit>>| {
+        if let Some(out) = edit && let Ok(name) = path.strip_prefix(root) {
+            let name = name.to_string_lossy().replace('\\', "/");
+            let (revision, recorded) = crate::file_history::write_recorded(path, bytes, replace, Some(&name))?;
+            *out = recorded;
+            Ok(revision.is_some())
+        } else {
+            crate::file_history::write(path, bytes, replace)
+        }
+    };
     let out = match call {
         Call::List { .. } => {
             ensure!(path.is_dir(), "{} is not a folder", rel(root, path));
@@ -1843,7 +1853,7 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 )
             })?;
             let next = format!("{}{}{}", &body[..range.start], replace, &body[range.end..]);
-            let saved = crate::file_history::write(path, next.as_bytes(), true)?;
+            let saved = write(next.as_bytes(), true, edit)?;
             // Show the file as it is now: all of a short file, or the edited lines with a
             // little around them, so the model sees what is (and isn't) changed yet.
             let lines: Vec<&str> = next.lines().collect();
@@ -1883,7 +1893,7 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let saved = crate::file_history::write(path, content.as_bytes(), replace_file)?;
+            let saved = write(content.as_bytes(), replace_file, edit)?;
             format!(
                 "{} {} · hash {}{}",
                 if existed { "Replaced" } else { "Created" },

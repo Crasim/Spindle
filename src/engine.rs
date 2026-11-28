@@ -1329,6 +1329,9 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     .split_once(' ')
                     .and_then(|(c, i)| Some((c.parse().ok()?, i.parse().ok()?)))
                     .context("Use /undo-apply CHAT INDEX")?;
+                ensure!(!self.inference_in_chat(chat, busy) && !self.awaiting_tool(chat)
+                    && !self.state.queue.iter().any(|task| task.origin.unwrap_or(self.state.chat_id) == chat),
+                    "Finish the work in this conversation before undoing the edits");
                 undo_apply(&mut self.state, chat, index)
             }
             "/compact" => {
@@ -2935,16 +2938,9 @@ pub(crate) fn auto_apply(state: &mut State, chat: u64) {
     let keep = data
         .join("checkpoints")
         .join(format!("{chat}-{}", state.serial));
-    let (note, ok) = match crate::workcopy::apply_checkpointed_changes(&copy, &keep, changes) {
-        Ok((summary, diff, _)) => (
-            crate::state::Applied {
-                summary,
-                diff,
-                keep,
-                undone: None,
-            },
-            true,
-        ),
+    let (note, ok) = match crate::workcopy::check_project(&copy, &project)
+        .and_then(|()| crate::workcopy::apply_checkpointed_changes(&copy, &keep, changes)) {
+        Ok(note) => (note, true),
         Err(e) => (
             crate::state::Applied {
                 summary: format!("Couldn't apply the changes to the project: {e:#}"),
@@ -3006,8 +3002,15 @@ fn undo_apply(state: &mut State, chat: u64, index: usize) -> Result<String> {
         .and_then(|t| t.applied.clone())
         .context("Nothing was applied there")?;
     ensure!(applied.undone.is_none(), "Already undone");
-    let copy = crate::workcopy::folder(&crate::runtime::data_dir(), chat, &project);
-    let text = crate::workcopy::undo(&copy, &applied.keep)?;
+    let data = crate::runtime::data_dir();
+    let keep = applied.keep.canonicalize().context("The saved versions are unavailable")?;
+    let checkpoints = data.join("checkpoints").canonicalize()?;
+    ensure!(keep.parent() == Some(checkpoints.as_path()) && keep.file_name().and_then(|name| name.to_str())
+        .is_some_and(|name| name.split_once('-').is_some_and(|(owner, serial)| owner.parse::<u64>() == Ok(chat) && serial.parse::<u64>().is_ok())),
+        "This undo checkpoint belongs to another conversation");
+    let copy = crate::workcopy::folder(&data, chat, &project);
+    crate::workcopy::check_project(&copy, &project)?;
+    let text = crate::workcopy::undo(&copy, &keep)?;
     if let Some(turn) = thread_of(state, chat).and_then(|t| t.turns.get_mut(&index))
         && let Some(a) = &mut turn.applied
     {
@@ -4535,6 +4538,8 @@ impl Engine {
                 Ok(Attachment { path, text })
             };
             let mut output_preview = None;
+            let mut edit = None;
+            let mut applied = None;
             let result = if matches!(p.call.call, crate::tools::Call::PreviewHtml { .. }) {
                 preview(&p.root, &p.target).map(|artifact| {
                     let notice = format!("Preview available. Link it in the final answer as [Open HTML preview](<{}>).", artifact.path);
@@ -4543,17 +4548,25 @@ impl Engine {
                 })
             } else if matches!(p.call.call, crate::tools::Call::Apply {}) {
                 let approved = p.confirmed_change().then_some(p.preview.as_str());
-                crate::workcopy::apply_approved(&p.root, approved)
+                self.state.serial += 1;
+                let keep = crate::runtime::data_dir().join("checkpoints").join(format!("{}-{}", p.chat, self.state.serial));
+                p.project.as_deref().context("Choose a project to apply these edits")
+                    .and_then(|project| crate::workcopy::check_project(&p.root, project))
+                    .and_then(|()| crate::workcopy::apply_approved(&p.root, approved, &keep)).map(|note| {
+                    let text = note.summary.clone();
+                    if !note.edits.is_empty() { applied = Some(note); }
+                    text
+                })
             } else if matches!(p.call.call, crate::tools::Call::Read { .. }) {
                 let window = self.state.thread_data(p.chat).and_then(|(thread, _)| {
                     thread.turns.values().rev().filter(|turn| turn.model == p.model).find_map(|turn| turn.window)
                 }).or_else(|| self.state.tuning.get(&p.model).and_then(|tuning| tuning.context))
                     .unwrap_or(crate::compaction::UNKNOWN_WINDOW);
                 crate::tools::read_chunk(&p.root, &p.call.call, &p.target, window)
-            } else if self.state.bobbins.runs.contains_key(&p.chat) {
-                crate::tools::run_scoped(&p.root, &p.call.call, &p.target, p.confirmed_change(), crate::bobbins::visible_file)
             } else {
-                crate::tools::run(&p.root, &p.call.call, &p.target, p.confirmed_change())
+                let visible: fn(&str) -> bool = if self.state.bobbins.runs.contains_key(&p.chat) { crate::bobbins::visible_file } else { |_| true };
+                let writes_live_files = p.project.as_ref().is_none_or(|project| p.root == *project);
+                crate::tools::run_scoped(&p.root, &p.call.call, &p.target, p.confirmed_change(), visible, writes_live_files.then_some(&mut edit))
             };
             if result.is_ok()
                 && matches!(p.call.call, crate::tools::Call::Create { .. } | crate::tools::Call::Patch { .. })
@@ -4561,10 +4574,12 @@ impl Engine {
             {
                 output_preview = preview(&p.root, &p.target).ok();
             }
-            if let Some(artifact) = output_preview {
+            if output_preview.is_some() || edit.is_some() || applied.is_some() {
                 let index = self.state.thread_data(p.chat).map_or(0, |(_, h)| h.len().saturating_sub(1));
                 if let Some(turn) = thread_of(&mut self.state, p.chat).and_then(|t| t.turns.get_mut(&index)) {
-                    turn.html_previews.push(artifact);
+                    turn.html_previews.extend(output_preview);
+                    turn.edits.extend(edit);
+                    if applied.is_some() { turn.applied = applied; }
                 }
             }
             let (text, ok) = match &result {
@@ -4916,6 +4931,7 @@ fn finish_turn(
             let files = state.files_root(root, origin);
             let saved = crate::artifacts::outputs(&files, origin, &task.text, &answer);
             turn.files = saved.files.iter().map(|a| a.path.clone()).collect();
+            turn.edits.extend(saved.files.iter().map(|file| crate::edit_summary::Edit::between(&file.path, &[], file.text.as_bytes())));
             turn.artifacts = saved.files;
             answer = saved.text;
         }
@@ -6686,7 +6702,7 @@ mod tests {
             "{}",
             applied.summary
         );
-        assert!(applied.diff.contains("+ hi"));
+        assert!(applied.edits[0].patch.as_deref().unwrap().contains("+hi"));
         let chat = e.state.chat_id;
         let undone = e
             .command(&format!("/undo-apply {chat} {index}"), false)
@@ -6808,6 +6824,10 @@ mod tests {
         )
         .unwrap();
         e.dispatch_ready(false).unwrap();
+        let recorded = &e.state.thread.turns[&1].edits[0];
+        assert_eq!(recorded.path, "snake.html");
+        assert_eq!(recorded.lines, Some((1, 0)));
+        assert!(recorded.patch.as_deref().unwrap().contains("+<p>hi</p>"));
         let (_, mut messages) = request(&e.state, &e.state.queue[0]).unwrap();
         let chat = e.state.chat_id;
         e.state

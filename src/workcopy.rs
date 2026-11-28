@@ -113,6 +113,11 @@ fn base(copy: &Path) -> Result<Base> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+pub(crate) fn check_project(copy: &Path, project: &Path) -> Result<()> {
+    ensure!(base(copy)?.project.canonicalize()? == project.canonicalize()?, "The sandbox belongs to a different project");
+    Ok(())
+}
+
 /// Bring a restored project file into this chat's sandbox when its copy is clean.
 pub(crate) fn refresh_restored_file(data: &Path, chat: u64, project: &Path, file: &Path) -> Result<()> {
     let project_root = project.canonicalize()?;
@@ -205,7 +210,7 @@ pub fn preview(copy: &Path, changes: &[Change], limit: usize) -> String {
             Change::Modified(_) => text.push_str(&crate::diff::unified(&old, &new, 3)),
         }
         if text.len() > limit {
-            text.truncate(limit);
+            text.truncate(text.floor_char_boundary(limit));
             text.push_str("\n…");
             break;
         }
@@ -217,7 +222,7 @@ pub fn preview(copy: &Path, changes: &[Change], limit: usize) -> String {
 /// left alone and reported as a conflict. Returns a summary.
 #[cfg(test)]
 fn apply(copy: &Path) -> Result<String> {
-    apply_changes(copy, changes(copy)?)
+    Ok(apply_changes(copy, changes(copy)?, None)?.summary)
 }
 
 pub(crate) fn deletion_preview(changes: &[Change]) -> Option<String> {
@@ -228,16 +233,19 @@ pub(crate) fn deletion_preview(changes: &[Change]) -> Option<String> {
     (!paths.is_empty()).then(|| format!("Apply the sandbox changes and delete these project files?\n\n{}", paths.join("\n")))
 }
 
-pub(crate) fn apply_approved(copy: &Path, confirmed: Option<&str>) -> Result<String> {
+pub(crate) fn apply_approved(copy: &Path, confirmed: Option<&str>, keep: &Path) -> Result<crate::state::Applied> {
     let found = changes(copy)?;
     ensure!(deletion_preview(&found).as_deref() == confirmed, "Project deletions require confirmation for the current list of files");
-    apply_changes(copy, found)
+    apply_checkpointed_changes(copy, keep, found)
 }
 
-fn apply_changes(copy: &Path, changes: Vec<Change>) -> Result<String> {
+fn apply_changes(copy: &Path, changes: Vec<Change>, keep: Option<&Path>) -> Result<crate::state::Applied> {
     let mut record = base(copy)?;
     let project = record.project.clone();
     let mut applied = vec![];
+    let mut edits = vec![];
+    let mut checkpoint = Checkpoint::default();
+    let mut patch_bytes = 0usize;
     let mut conflicts = vec![];
     let canonical = project.canonicalize()?;
     let result = (|| -> Result<()> {
@@ -254,28 +262,40 @@ fn apply_changes(copy: &Path, changes: Vec<Change>) -> Result<String> {
                 conflicts.push(rel);
                 continue;
             }
-            match &change {
+            let (revision, edit, wrote) = match &change {
                 Change::Deleted(_) => {
-                    crate::file_history::remove(&target)?;
-                    record.files.remove(&rel);
+                    let (revision, edit) = crate::file_history::remove_recorded(&target, keep.map(|_| rel.as_str()))?;
+                    (revision, edit, None)
                 }
                 Change::Added(_) | Change::Modified(_) => {
                     let bytes = std::fs::read(copy.join(&rel))?;
                     if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    crate::file_history::write(&target, &bytes, current.is_some())?;
-                    record.files.insert(rel.clone(), crate::tools::hash(&bytes));
+                    let (revision, edit) = crate::file_history::write_recorded(&target, &bytes, current.is_some(), keep.map(|_| rel.as_str()))?;
+                    (revision, edit, Some(crate::tools::hash(&bytes)))
                 }
+            };
+            if let Some(mut edit) = edit {
+                if let Some(patch) = &edit.patch {
+                    patch_bytes = patch_bytes.saturating_add(patch.len());
+                    if patch_bytes > 96_000 { edit.patch = None; }
+                }
+                edits.push(edit);
+            }
+            if current.is_none() || revision.is_some() {
+                checkpoint.files.push((rel.clone(), revision.map(|id| format!("history:{id}")), wrote.clone()));
+            }
+            if let Some(wrote) = wrote {
+                record.files.insert(rel, wrote);
+            } else {
+                record.files.remove(&rel);
             }
             applied.push(change.label());
         }
         Ok(())
     })();
-    if !applied.is_empty() {
-        crate::tools::write_generated(&copy.join(MANIFEST), &serde_json::to_vec(&record)?, true)?;
-    }
-    result?;
+    if applied.is_empty() && let Err(error) = &result { anyhow::bail!("{error:#}"); }
     let mut text = if applied.is_empty() {
         "No changes were applied.".to_owned()
     } else {
@@ -292,7 +312,25 @@ fn apply_changes(copy: &Path, changes: Vec<Change>) -> Result<String> {
             conflicts.join(", ")
         ));
     }
-    Ok(text)
+    if let Err(error) = result { text.push_str(&format!("\nStopped applying: {error:#}")); }
+    let mut saved = PathBuf::new();
+    if !applied.is_empty() {
+        let save = (|| -> Result<()> {
+            crate::tools::write_generated(&copy.join(MANIFEST), &serde_json::to_vec(&record)?, true)?;
+            if let Some(keep) = keep {
+                if checkpoint.files.len() == applied.len() {
+                    std::fs::create_dir_all(keep)?;
+                    crate::tools::write_generated(&keep.join("checkpoint.json"), &serde_json::to_vec(&checkpoint)?, false)?;
+                    saved = keep.to_owned();
+                } else {
+                    text.push_str("\nUndo is unavailable because a previous version could not be saved.");
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = save { text.push_str(&format!("\nCould not save the change checkpoint: {error:#}")); }
+    }
+    Ok(crate::state::Applied { summary: text, edits, keep: saved, ..Default::default() })
 }
 
 /// What an automatic apply did, kept so it can be undone.
@@ -305,45 +343,8 @@ pub struct Checkpoint {
 
 /// Apply the copy's changes, first saving the project's versions of those files in `keep`
 /// so the apply can be undone. Returns the summary, a diff and what to keep.
-#[cfg(test)]
-fn apply_checkpointed(copy: &Path, keep: &Path) -> Result<(String, String, Checkpoint)> {
-    apply_checkpointed_changes(copy, keep, changes(copy)?)
-}
-
-pub(crate) fn apply_checkpointed_changes(copy: &Path, keep: &Path, found: Vec<Change>) -> Result<(String, String, Checkpoint)> {
-    let diff = preview(copy, &found, 20_000);
-    let project = base(copy)?.project;
-    std::fs::create_dir_all(keep)?;
-    let mut saved = BTreeMap::new();
-    for change in &found {
-        let rel = change.path();
-        let target = project.join(rel);
-        let before = if target.is_file() {
-            let bytes = std::fs::read(&target)?;
-            let name = crate::tools::hash(rel.as_bytes());
-            std::fs::write(keep.join(&name), &bytes)?;
-            Some(name)
-        } else {
-            None
-        };
-        saved.insert(rel.to_owned(), before);
-    }
-    let summary = apply_changes(copy, found)?;
-    let record = base(copy)?;
-    let mut checkpoint = Checkpoint::default();
-    for (rel, before) in saved {
-        let target = project.join(&rel);
-        let now = target.is_file().then(|| file_hash(&target)).transpose()?;
-        // Only files the apply actually changed (not conflicts) can be undone.
-        if now.as_ref() == record.files.get(&rel) {
-            checkpoint.files.push((rel, before, now));
-        }
-    }
-    std::fs::write(
-        keep.join("checkpoint.json"),
-        serde_json::to_vec(&checkpoint)?,
-    )?;
-    Ok((summary, diff, checkpoint))
+pub(crate) fn apply_checkpointed_changes(copy: &Path, keep: &Path, found: Vec<Change>) -> Result<crate::state::Applied> {
+    apply_changes(copy, found, Some(keep))
 }
 
 /// Put back the project files an automatic apply changed, and the copy with them, so the
@@ -360,14 +361,21 @@ pub fn undo(copy: &Path, keep: &Path) -> Result<String> {
         let (target, inside) = crate::tools::resolve(&project, rel)?;
         ensure!(inside && target == canonical.join(rel) && !crate::policy::protected(&target), "{rel} is in a protected location");
         let now = target.is_file().then(|| file_hash(&target)).transpose()?;
-        if &now != wrote {
+        let (in_copy, inside_copy) = crate::tools::resolve(copy, rel)?;
+        ensure!(inside_copy && in_copy == copy.canonicalize()?.join(rel), "The sandbox path changed: {rel}");
+        let now_copy = in_copy.is_file().then(|| file_hash(&in_copy)).transpose()?;
+        if &now != wrote || &now_copy != wrote || record.files.get(rel) != wrote.as_ref() {
             skipped.push(rel.clone());
             continue;
         }
-        let in_copy = copy.join(rel);
         match before {
             Some(name) => {
-                let bytes = std::fs::read(keep.join(name))?;
+                let bytes = if let Some(id) = name.strip_prefix("history:") {
+                    crate::file_history::History::for_path(&target)?.saved(id)?
+                } else {
+                    ensure!(name == &crate::tools::hash(rel.as_bytes()), "Invalid saved version for {rel}");
+                    std::fs::read(keep.join(name))?
+                };
                 if let Some(parent) = target.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
@@ -426,14 +434,16 @@ mod tests {
         std::fs::create_dir(&project)?;
         for name in ["keep.txt", "remove.txt"] { std::fs::write(project.join(name), name)?; }
         let copy = ensure(&tmp.path().join("data"), 1, &project)?;
+        let checkpoint = tmp.path().join("checkpoint");
         std::fs::remove_file(copy.join("remove.txt"))?;
-        assert!(apply_approved(&copy, None).is_err());
+        assert!(apply_approved(&copy, None, &checkpoint).is_err());
         let old = deletion_preview(&changes(&copy)?).unwrap();
         std::fs::remove_file(copy.join("keep.txt"))?;
-        assert!(apply_approved(&copy, Some(&old)).is_err());
+        assert!(apply_approved(&copy, Some(&old), &checkpoint).is_err());
         assert!(project.join("keep.txt").exists());
         std::fs::write(copy.join("keep.txt"), "keep.txt")?;
-        apply_approved(&copy, Some(&old))?;
+        let note = apply_approved(&copy, Some(&old), &checkpoint)?;
+        assert_eq!(note.edits[0].lines, Some((0, 1)));
         assert!(!project.join("remove.txt").exists());
         Ok(())
     }
@@ -448,10 +458,10 @@ mod tests {
         std::fs::write(copy.join("snake.html"), "new\n").unwrap();
         std::fs::write(copy.join("added.js"), "x\n").unwrap();
         let keep = tmp.path().join("keep");
-        let (summary, diff, cp) = apply_checkpointed(&copy, &keep).unwrap();
-        assert!(summary.contains("Applied 2"), "{summary}");
-        assert!(diff.contains("- old\n+ new"), "{diff}");
-        assert_eq!(cp.files.len(), 2);
+        let note = apply_checkpointed_changes(&copy, &keep, changes(&copy).unwrap()).unwrap();
+        assert!(note.summary.contains("Applied 2"), "{}", note.summary);
+        assert!(note.edits.iter().any(|edit| edit.patch.as_deref().unwrap().contains("-old\n+new")));
+        assert_eq!(note.edits.len(), 2);
         assert_eq!(
             std::fs::read_to_string(project.join("snake.html")).unwrap(),
             "new\n"
@@ -467,6 +477,30 @@ mod tests {
             changes(&copy).unwrap().is_empty(),
             "the copy matches the project again"
         );
+    }
+
+    #[test]
+    fn only_applied_files_are_listed_and_undo_keeps_newer_sandbox_edits() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project)?;
+        std::fs::write(project.join("changed.txt"), "one\n")?;
+        std::fs::write(project.join("conflict.txt"), "initial\n")?;
+        let copy = ensure(&tmp.path().join("data"), 1, &project)?;
+        std::fs::write(project.join("conflict.txt"), "user edit\n")?;
+        std::fs::write(copy.join("conflict.txt"), "sandbox edit\n")?;
+        std::fs::write(copy.join("changed.txt"), "two\nthree\n")?;
+        let keep = tmp.path().join("checkpoint");
+        let applied = apply_approved(&copy, None, &keep)?;
+        assert_eq!(applied.edits.len(), 1);
+        assert_eq!(applied.edits[0].path, "changed.txt");
+        assert_eq!(applied.edits[0].lines, Some((2, 1)));
+        assert!(applied.summary.contains("conflict.txt"));
+        std::fs::write(copy.join("changed.txt"), "next edit\n")?;
+        assert!(undo(&copy, &keep)?.contains("Left alone"));
+        assert_eq!(std::fs::read_to_string(copy.join("changed.txt"))?, "next edit\n");
+        assert_eq!(std::fs::read_to_string(project.join("changed.txt"))?, "two\nthree\n");
+        Ok(())
     }
 
     #[test]

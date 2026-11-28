@@ -145,6 +145,8 @@ Opening a document previews it locally. **Excerpt to chat** attaches up to 6,000
 
 ### File history
 
+An **Edited files** card in chat shows paths and added and removed lines. Use **View changes** to inspect the diff recorded when the edit landed. Text previews are bounded, and binary files appear by name. Project apply cards offer **Undo** when their previous versions are available on this device. Undo leaves newer project and sandbox edits alone.
+
 Choose **History** beside a file in **Panel → Files** or **Library**, or choose **More → File history** on a file card. Select a saved version to compare it with the file on disk. Copy the comparison or save a `.diff` file for UTF-8 text up to 1 MiB. **Restore this version** asks for confirmation and saves the current contents first, so you can switch back.
 
 Spindle saves previous contents when its file tools, document editor, or sandbox apply replace files up to 32 MiB. These snapshots stay encrypted on this device. History starts with changes made after the update. Edits made outside Spindle have their own history.
