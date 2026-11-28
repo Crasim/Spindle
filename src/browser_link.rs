@@ -613,7 +613,8 @@ async fn serve(
     let rule = initial.rule_for(&url);
     if write(
         &mut stream,
-        &json!({"ready":true,"rule":rule,"rules":initial.rules,"mode":initial.mode}),
+        &json!({"ready":true,"rule":rule,"rules":initial.rules,"mode":initial.mode,
+            "appearance":crate::browser::activity_appearance()}),
     )
     .await
     .is_err()
@@ -659,7 +660,8 @@ async fn serve(
                     continue;
                 }
                 serial += 1;
-                let msg = json!({"id": serial, "operation": command.action});
+                let msg = json!({"id": serial, "operation": command.action,
+                    "appearance": crate::browser::activity_appearance()});
                 if write(&mut output, &msg).await.is_err() { break }
                 waiting = Some((serial, command.reply));
                 deadline = tokio::time::Instant::now() + Duration::from_secs(10);

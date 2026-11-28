@@ -296,6 +296,7 @@ impl Engine {
                 }
                 self.state.serial += 1;
                 let branch = self.state.serial;
+                crate::artifacts::inherit_files(&self.state.files_root(&self.root, id), id, branch, &version.thread)?;
                 self.state.chats.insert(branch, version);
                 let attachment = self.state.attachment.take();
                 let pending = self.state.pending.take();
@@ -417,6 +418,7 @@ impl Engine {
                 c.thread.forked_from = Some((id, c.history.len()));
                 self.state.serial += 1;
                 let new_id = self.state.serial;
+                crate::artifacts::inherit_files(&self.state.files_root(&self.root, id), id, new_id, &c.thread)?;
                 self.state.chats.insert(new_id, c);
                 self.state.switch_chat(Some(new_id))?;
                 "Branch opened".into()
@@ -517,10 +519,6 @@ fn make_branch(c: &mut Conversation) {
     c.thread.prompt_family = None;
     c.thread.forked_from = None;
     c.thread.pending_steering.clear();
-    // A scratch branch may get a different artifact directory.
-    for turn in c.thread.turns.values_mut() {
-        turn.files.clear();
-    }
 }
 
 #[derive(Serialize, Deserialize)]

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-const MANIFEST: &str = ".spindle-base.json";
+pub(crate) const MANIFEST: &str = ".spindle-base.json";
 /// Where files the user attaches in a project chat go inside the copy. Never applied.
 pub const ATTACHMENTS: &str = "_attachments";
 const MAX_FILES: usize = 20_000;

@@ -1,9 +1,48 @@
-:host { box-shadow: inset 0 0 0 2px #54c788, inset 0 0 18px #54c78860 !important; }
-      :host([data-working]) { box-shadow: inset 0 0 0 4px #70efa7, inset 0 0 32px #54c7889c !important; }
-      div { position: absolute; right: 16px; top: 16px; background: #10251b; color: #f0fff5;
-        border: 1px solid #70efa7; border-radius: 10px; padding: 9px 13px;
-        max-width: calc(100% - 60px); font: 600 13px/1.4 system-ui; box-shadow: 0 4px 18px #0009; }
-      span { position: absolute; top: -0.5px; left: -0.5px; width: 34.65px; height: 44px;
-        background: var(--spindle-pointer) left top / 100% 100% no-repeat;
-        transform: translate(16px, 64px); transition: transform 140ms ease-out; }
-      @media (prefers-reduced-motion: reduce) { span { transition: none; } }
+:host {
+  --spindle-accent: #64a0f5;
+  --spindle-badge: #17202a;
+  --spindle-text: #f2f5fa;
+  --spindle-pointer-tone: invert(1);
+  box-shadow: inset 0 0 0 2px var(--spindle-accent),
+    inset 0 0 18px color-mix(in srgb, var(--spindle-accent) 45%, transparent) !important;
+}
+:host([data-light]) {
+  --spindle-badge: #f8fafc;
+  --spindle-text: #152033;
+  --spindle-pointer-tone: invert(0);
+}
+:host([data-working]) {
+  box-shadow: inset 0 0 0 4px var(--spindle-accent),
+    inset 0 0 32px color-mix(in srgb, var(--spindle-accent) 60%, transparent) !important;
+}
+div {
+  position: absolute;
+  box-sizing: border-box;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: max-content;
+  max-width: calc(100% - 36px);
+  background: var(--spindle-badge);
+  color: var(--spindle-text);
+  border: 2px solid var(--spindle-accent);
+  border-radius: 14px;
+  padding: 13px 20px;
+  text-align: center;
+  font: 600 16px/1.4 system-ui, sans-serif;
+  box-shadow: 0 5px 20px #0006;
+}
+span {
+  position: absolute;
+  top: -0.5px;
+  left: -0.5px;
+  width: 34.65px;
+  height: 44px;
+  background: var(--spindle-pointer) left top / 100% 100% no-repeat;
+  filter: var(--spindle-pointer-tone)
+    drop-shadow(0 0 3px var(--spindle-accent))
+    drop-shadow(0 0 6px var(--spindle-accent));
+  transform: translate(16px, 64px);
+  transition: transform 140ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) { span { transition: none; } }

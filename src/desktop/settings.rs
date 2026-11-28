@@ -1306,23 +1306,31 @@ impl Desktop {
             self.browser_management(ui, browser);
             return;
         }
-        self.app_control_card(ui);
-        let shells = crate::host_shell::available();
-        if !shells.is_empty() {
-            ui.add_space(8.);
-            ui.weak(format!("Local shells: {shells}. Each command requires approval."));
-        }
-        ui.add_space(12.);
         if !crate::browser::SUPPORTED {
+            self.app_control_card(ui);
+            ui.add_space(8.);
             ui.label("Spindle Browser Link is available on Windows and Linux.");
             return;
         }
         self.poll_browser_setup(ui);
-        ui.label("Use Browser Link with the tabs in your regular browser.");
-        ui.add_space(10.);
-        for browser in crate::browser::LinkBrowser::ALL {
-            self.browser_settings_card(ui, browser);
+        let [edge, chrome] = crate::browser::LinkBrowser::ALL;
+        if ui.available_width() >= 795. {
+            ui.columns(3, |cols| {
+                self.browser_settings_card(&mut cols[0], edge);
+                self.browser_settings_card(&mut cols[1], chrome);
+                self.app_control_card(&mut cols[2]);
+            });
+        } else {
+            self.browser_settings_card(ui, edge);
             ui.add_space(8.);
+            self.browser_settings_card(ui, chrome);
+            ui.add_space(8.);
+            self.app_control_card(ui);
+        }
+        let shells = crate::host_shell::available();
+        if !shells.is_empty() {
+            ui.add_space(8.);
+            ui.weak(format!("Local shells: {shells}. Each command requires approval."));
         }
         ui.add_space(12.);
         ui.horizontal_wrapped(|ui| {
@@ -1339,17 +1347,21 @@ impl Desktop {
 
     fn app_control_card(&mut self, ui: &mut egui::Ui) {
         let mut enabled = self.view.state.preferences.app_control.enabled;
-        egui::Frame::new().fill(raised()).corner_radius(8).inner_margin(12).show(ui, |ui| {
+        egui::Frame::new().fill(panel()).corner_radius(10).inner_margin(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                ui.strong("App control");
-                if ui.button("Manage").clicked() { self.app_control_manage = true; }
+                symbol(ui, Icon::Shield, if enabled { accent() } else { ui.visuals().weak_text_color() });
+                ui.strong("Control desktop apps");
                 ui.add_enabled_ui(crate::computer_use::SUPPORTED, |ui| {
-                    if crate::widgets::switch(ui, &mut enabled, "App control").changed() {
+                    if crate::widgets::switch(ui, &mut enabled, "Control desktop apps").changed() {
                         if !enabled { crate::computer_use::stop(None); }
                         self.set_app_access("enabled", enabled);
                     }
                 });
+                ui.label(if !crate::computer_use::SUPPORTED { "Unavailable" } else if enabled { "On" } else { "Off" });
+                if ui.button("Manage desktop access").clicked() { self.app_control_manage = true; }
             });
+            ui.weak("Let models inspect and interact with desktop windows after you approve each action.");
             ui.weak(crate::computer_use::setup_status());
         });
     }
@@ -1359,7 +1371,7 @@ impl Desktop {
     }
 
     fn app_control_management(&mut self, ui: &mut egui::Ui) {
-        if super::panel_header(ui, "App control", "Back") {
+        if super::panel_header(ui, "Control desktop apps", "Back") {
             self.app_control_manage = false;
             return;
         }

@@ -76,7 +76,8 @@ async function requestedTab(address) {
   // A newly created tab starts at about:blank. Bind only after the requested
   // document commits, and don't read an account sign-in or redirect by accident.
   for (let attempt = 0; attempt < 100; attempt++) {
-    const loaded = await chrome.tabs.get(tab.id);
+    const loaded = await chrome.tabs.get(tab.id).catch(() => null);
+    if (!loaded) throw Error("That browser tab was closed. Retry to connect Browser Link to the page again.");
     if (loaded.status === "complete" && matchesPage(loaded, page)) return loaded;
     if (loaded.status === "complete" && /^https?:/.test(loaded.url || "") && !matchesPage(loaded, page)) {
       throw Error("The website redirected to a different page. Finish any sign-in in the browser, then ask Spindle to try again.");
@@ -310,7 +311,7 @@ async function runInTab(session, operation) {
   return chrome.scripting.executeScript({
     target: {tabId: session.tabId},
     func: operate,
-    args: [operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce, await cursorStyle]
+    args: [operation, session.rule, session.mode === "blocklist" ? session.rules : [], session.nonce, await cursorStyle, session.appearance]
   });
 }
 
@@ -319,6 +320,7 @@ function markActivity(session) {
 }
 
 async function receivePacket(session, message) {
+  if (message.appearance) session.appearance = message.appearance;
   if (Array.isArray(message.rules)) {
     session.rule = message.rule;
     session.rules = message.rules;
@@ -335,7 +337,14 @@ async function receivePacket(session, message) {
   }
   let reply;
   try {
-    const tab = await chrome.tabs.get(session.tabId);
+    const tab = await chrome.tabs.get(session.tabId).catch(() => null);
+    if (!tab) {
+      if (current === session) {
+        sendPacket({id: message.id, error: "That browser tab was closed. Retry to reconnect Browser Link."});
+        stop();
+      }
+      return;
+    }
     const requested = message.operation?.action === "read" && message.operation.url ? new URL(message.operation.url) : null;
     if (await isRevoked(tab.id) || current !== session || !allowed(tab.url, session.rule) ||
         (requested && (new URL(tab.url).origin !== requested.origin || new URL(tab.url).pathname !== requested.pathname
@@ -355,7 +364,7 @@ async function receivePacket(session, message) {
   if (current === session) sendPacket({ id: message.id, ...reply });
 }
 
-async function operate(operation, rule, blocked, sessionNonce, cursorStyle) {
+async function operate(operation, rule, blocked, sessionNonce, cursorStyle, appearance) {
   const site = new URL(rule);
   const prefix = site.pathname.replace(/\/+$/, "");
   const matches = (url, site, prefix) => url.origin === site.origin && !url.username && !url.password &&
@@ -387,7 +396,7 @@ async function operate(operation, rule, blocked, sessionNonce, cursorStyle) {
     style.textContent = cursorStyle;
     const badge = document.createElement("div");
     badge.setAttribute("role", "status");
-    badge.textContent = "Spindle has access to this tab · Esc to revoke access";
+    badge.textContent = "Spindle has access to this tab · Press Esc to revoke";
     const cursor = document.createElement("span");
     cursor.setAttribute("aria-hidden", "true");
     shadow.append(style, badge, cursor);
@@ -403,6 +412,14 @@ async function operate(operation, rule, blocked, sessionNonce, cursorStyle) {
     window.addEventListener("keydown", onKey, {capture: true});
     activity = globalThis.spindleTabActivity = {
       nonce: sessionNonce,
+      theme(appearance) {
+        const light = typeof appearance?.light === "boolean" ? appearance.light :
+          matchMedia("(prefers-color-scheme: light)").matches;
+        host.toggleAttribute("data-light", light);
+        if (/^#[a-f0-9]{6}$/i.test(appearance?.accent || "")) {
+          host.style.setProperty("--spindle-accent", appearance.accent);
+        }
+      },
       clear() {
         clearTimeout(timer);
         host.remove();
@@ -417,16 +434,17 @@ async function operate(operation, rule, blocked, sessionNonce, cursorStyle) {
           cursor.style.transform = `translate(${x}px, ${y}px)`;
         }
         host.setAttribute("data-working", "");
-        badge.textContent = action === "read" ? "Spindle is reading this tab · Esc to revoke access" :
-          "Spindle is using this tab · Esc to revoke access";
+        badge.textContent = action === "read" ? "Spindle is reading this tab · Press Esc to revoke" :
+          "Spindle is using this tab · Press Esc to revoke";
         clearTimeout(timer);
         timer = setTimeout(() => {
           host.removeAttribute("data-working");
-          badge.textContent = "Spindle has access to this tab · Esc to revoke access";
+          badge.textContent = "Spindle has access to this tab · Press Esc to revoke";
         }, 2600);
       }
     };
   }
+  activity.theme(appearance);
   if (operation.action === "mark") return;
   const visible = element => Boolean(element.getClientRects().length) &&
     getComputedStyle(element).visibility === "visible" && !element.closest("[hidden],[inert]");

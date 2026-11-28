@@ -40,15 +40,15 @@ impl Default for Access {
 impl Access {
     pub fn check(self, action: &Action) -> Result<()> {
         if matches!(action, Action::Release) { return Ok(()); }
-        ensure!(SUPPORTED, "App control is unavailable on this device. See Settings › Computer use › App control.");
-        ensure!(self.enabled, "App control is off. Turn it on in Settings › Computer use › App control.");
+        ensure!(SUPPORTED, "Desktop control is unavailable on this device. See Settings › Computer use › Control desktop apps.");
+        ensure!(self.enabled, "Desktop control is off. Turn it on in Settings › Computer use › Control desktop apps.");
         ensure!(match action {
             Action::Windows => self.list,
             Action::Inspect { .. } => self.inspect,
             Action::Click { .. } => self.click,
             Action::Type { .. } => self.type_text,
             Action::Release => true,
-        }, "This action is disabled. Change its permission in Settings › Computer use › App control › Manage.");
+        }, "This action is disabled. Change its permission in Settings › Computer use › Control desktop apps › Manage.");
         Ok(())
     }
 }

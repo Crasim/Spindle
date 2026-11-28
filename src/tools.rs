@@ -534,7 +534,7 @@ pub fn definitions() -> serde_json::Value {
         ),
         f(
             "search",
-            "Search files for literal text.",
+            "Find an exact phrase in a file or folder. If a multi-word query has no exact hit, show matches for its separate terms.",
             serde_json::json!({"query": s("Text to find"), "path": s("File or folder to search")}),
             &["query"]
         ),
@@ -997,7 +997,7 @@ fn normalize(value: &mut serde_json::Value) {
         .and_then(|t| t.as_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let tool = match tool
+    let mut tool = match tool
         .trim_start_matches("spindle_")
         .trim_start_matches("spindle-")
     {
@@ -1021,6 +1021,11 @@ fn normalize(value: &mut serde_json::Value) {
     .to_owned();
     if let Some(args) = map.get_mut("args").and_then(|a| a.as_object_mut()) {
         args.retain(|_, v| !v.is_null());
+        if tool == "desktop_control" && args.get("action").and_then(|value| value.as_str()) == Some("read")
+            && args.get("url").and_then(|value| value.as_str()).is_some() && !args.contains_key("window")
+        {
+            tool = "browser_tab".into();
+        }
         let mut rename = |from: &[&str], to: &str| {
             for f in from {
                 if !args.contains_key(to) && args.contains_key(*f) {
@@ -1465,6 +1470,8 @@ pub fn classify(root: &Path, call: &Call, sandboxed: bool) -> Result<(Risk, Path
 
 /// Classify a filesystem target already resolved by the caller's scope checks.
 pub(crate) fn classify_resolved(root: &Path, call: &Call, sandboxed: bool, path: PathBuf, inside: bool) -> Result<(Risk, PathBuf)> {
+    ensure!(!path.file_name().is_some_and(|name| name.eq_ignore_ascii_case(crate::workcopy::MANIFEST)),
+        "That file is reserved for Spindle's sandbox bookkeeping");
     if matches!(call, Call::FileHistory { .. }) {
         ensure!(inside && !crate::policy::protected(&path), "Choose a file inside this working folder");
         return Ok((Risk::Read, path));
@@ -1687,6 +1694,7 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 })
                 .filter(|(dir, name, _)| {
                     !(*dir && skip_dir(name)) && name != ".spindle-access" && name != ".tmp"
+                        && !name.eq_ignore_ascii_case(crate::workcopy::MANIFEST)
                 })
                 .collect();
             entries.sort_by(|a, b| {
@@ -1728,12 +1736,25 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 "Search for 1 to 200 characters"
             );
             let mut hits = vec![];
-            let collect = |path: &Path, hits: &mut Vec<String>| -> Result<()> {
+            let mut alternate = vec![];
+            let mut terms: Vec<_> = query.split_whitespace().filter(|term| term.len() >= 3)
+                .take(9).map(str::to_ascii_lowercase).collect();
+            if !(2..=8).contains(&terms.len()) { terms.clear(); }
+            let mut collect = |path: &Path, hits: &mut Vec<String>| -> Result<()> {
                 let body = text_of(path)?;
+                let name = rel(root, path);
                 for (n, line) in body.lines().enumerate() {
-                    if let Some(at) = line.find(query.as_str()) {
+                    let hit = if let Some(at) = line.find(query.as_str()) {
+                        Some((at, &mut *hits))
+                    } else if !terms.is_empty() && alternate.len() < 30 {
+                        let lower = line.to_ascii_lowercase();
+                        terms.iter().filter_map(|term| lower.find(term)).min().map(|at| (at, &mut alternate))
+                    } else {
+                        None
+                    };
+                    if let Some((at, found)) = hit {
                         let from = line.floor_char_boundary(at.saturating_sub(55));
-                        hits.push(format!("{}:{}: {}", rel(root, path), n + 1, short(line[from..].trim(), 160)));
+                        found.push(format!("{name}:{}: {}", n + 1, short(line[from..].trim(), 160)));
                         if hits.len() >= 50 {
                             break;
                         }
@@ -1756,7 +1777,7 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                 for entry in read.filter_map(|e| e.ok()) {
                     let p = entry.path();
                     let name = entry.file_name().to_string_lossy().into_owned();
-                    if !visible(&name) { continue; }
+                    if !visible(&name) || name.eq_ignore_ascii_case(crate::workcopy::MANIFEST) { continue; }
                     let Ok(kind) = entry.file_type() else {
                         continue;
                     };
@@ -1773,7 +1794,9 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
                     }
                 }
             }
-            if hits.is_empty() {
+            if hits.is_empty() && !alternate.is_empty() {
+                format!("No exact match for \"{query}\". Matches for individual terms:\n{}", alternate.join("\n"))
+            } else if hits.is_empty() {
                 format!("No matches for \"{query}\"")
             } else {
                 format!(
@@ -2089,6 +2112,25 @@ pub(crate) fn write_generated(path: &Path, bytes: &[u8], replace: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_url_reads_use_the_browser_tool_and_keyword_search_keeps_exact_priority() -> Result<()> {
+        let (_, call) = extract(r#"{"name":"desktop_control","args":{"action":"read","url":"https://example.com/cart"}}"#);
+        assert!(matches!(call.unwrap().unwrap().call,
+            Call::BrowserTab(crate::browser_link::Action::Read { url: Some(url) }) if url.ends_with("/cart")));
+        let folder = tempfile::tempdir()?;
+        let root = folder.path().canonicalize()?;
+        let path = root.join("game.html");
+        let search = Call::Search { query: "harvestOre craftTool buildBase".into(), path: Some("game.html".into()) };
+        std::fs::write(&path, "function spawnFish() {}\nfunction HarvestORE() {}\nfunction craftTool() {}\n")?;
+        let results = run(&root, &search, &path, false)?;
+        assert!(results.contains("Matches for individual terms"));
+        assert!(results.contains("game.html:2:") && results.contains("game.html:3:"));
+        std::fs::write(&path, "function craftTool() {}\nharvestOre craftTool buildBase\n")?;
+        let results = run(&root, &search, &path, false)?;
+        assert!(results.contains("game.html:2:") && !results.contains("game.html:1:"));
+        Ok(())
+    }
 
     #[test]
     fn file_pages_resume_exactly_at_the_unread_line_or_byte() -> Result<()> {

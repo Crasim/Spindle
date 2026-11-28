@@ -1801,8 +1801,11 @@ mod tests {
         app.view.state.preferences.app_control.enabled = true;
         run(&mut app, &ctx, vec![]);
         let labels = run(&mut app, &ctx, vec![]);
-        assert!(labels.contains_key("App control"));
-        let labels = click(&mut app, &ctx, labels["Manage"]);
+        let edge = labels["Microsoft Edge"];
+        let chrome = labels["Google Chrome"];
+        let desktop = labels["Control desktop apps"];
+        assert!(edge.x < chrome.x && chrome.x < desktop.x);
+        let labels = click(&mut app, &ctx, labels["Manage desktop access"]);
         assert!(labels.contains_key("Back") && labels.contains_key("Revoke access"));
         assert!(!labels.contains_key("Google Chrome"));
         click(&mut app, &ctx, labels["Click in an approved window"]);

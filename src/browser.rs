@@ -15,6 +15,11 @@ pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
 pub(crate) const POINTER_PNG: &[u8] = include_bytes!("../browser-extension/cursor.png");
 const SETTINGS: &str = "Settings → Sandbox → Model browser";
 
+pub(crate) fn activity_appearance() -> Value {
+    let [r, g, b, _] = crate::widgets::accent().to_array();
+    json!({"accent": format!("#{r:02x}{g:02x}{b:02x}"), "light": crate::widgets::is_light()})
+}
+
 pub(crate) fn public_page(address: &str) -> Result<reqwest::Url> {
     #[cfg(any(windows, target_os = "linux", target_os = "android"))]
     { crate::public_web::url(address) }
@@ -63,15 +68,20 @@ pub(crate) fn panel_cursor_script() -> String {
     let css = include_str!("../browser-extension/activity.css");
     let pointer = base64::engine::general_purpose::STANDARD.encode(POINTER_PNG);
     let css = serde_json::to_string(&format!("{css}\n:host {{ --spindle-pointer: url(data:image/png;base64,{pointer}); }}")).unwrap();
+    let appearance = activity_appearance();
     format!(r#"if (window === top && !document.querySelector('spindle-browser-activity')) {{
             const host = document.createElement('spindle-browser-activity');
             host.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;pointer-events:none!important;z-index:2147483647!important';
+            const appearance = {appearance};
+            host.toggleAttribute('data-light', appearance.light);
+            host.style.setProperty('--spindle-accent', appearance.accent);
             host.setAttribute('data-working','');
             const shadow = host.attachShadow({{mode:'closed'}});
             const style = document.createElement('style');
             style.textContent = {css};
             const badge = document.createElement('div');
-            badge.textContent = 'Spindle is reading this page · Esc to stop';
+            badge.setAttribute('role', 'status');
+            badge.textContent = 'Spindle is reading this page · Press Esc to stop';
             const pointer = document.createElement('span');
             const first = document.querySelector('main h1, [role=main] h1, h1, main, article');
             if (first) {{
@@ -879,7 +889,9 @@ pub fn check(
                 .as_str()
                 .or(d["text"].as_str())
                 .unwrap_or("threw an exception");
-            format!("threw: {}", text.lines().next().unwrap_or(text))
+            let error = text.lines().next().unwrap_or(text);
+            c.report.errors.push(format!("Test script: {error}"));
+            format!("threw: {error}")
         } else {
             let v = &r["result"]["value"];
             let s = match v {
@@ -1393,6 +1405,9 @@ mod tests {
                 .as_ref()
                 .is_some_and(|png| png.starts_with(b"\x89PNG"))
         );
+        let failed_script = check(&exe, &page, Some("throw new Error('interaction test failed')"),
+            Duration::from_millis(100), false).unwrap();
+        assert!(!failed_script.ok() && failed_script.errors.iter().any(|error| error.contains("Test script: Error: interaction test failed")));
         // With web traffic blocked, an internet request fails while the page still runs.
         std::fs::write(&page, "<!doctype html><title>Net</title><script>fetch('https://example.com/x').catch(e => console.log('fetch failed'));</script>").unwrap();
         let r = check(&exe, &page, None, Duration::from_millis(800), true).unwrap();

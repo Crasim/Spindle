@@ -443,6 +443,42 @@ pub fn existing_file(root: &Path, thread: u64, name: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Copy the files already introduced in the fork's saved transcript. Project
+/// chats continue to use the same project files.
+pub(crate) fn inherit_files(root: &Path, parent: u64, branch: u64, thread: &crate::state::ThreadInfo) -> Result<()> {
+    if crate::projects::existing(root)?.is_some() {
+        return Ok(());
+    }
+    let names: std::collections::BTreeSet<_> = thread.turns.values()
+        .flat_map(|turn| turn.files.iter()).collect();
+    if names.is_empty() {
+        return Ok(());
+    }
+    let source = folder(root, parent)?;
+    let dest = folder(root, branch)?;
+    for name in names {
+        let relative = Path::new(name);
+        if !relative.components().all(|part| matches!(part, std::path::Component::Normal(_)))
+            || crate::policy::protected(relative)
+        {
+            continue;
+        }
+        let from = source.join(relative);
+        if from.canonicalize().ok().as_ref() != Some(&from) || !from.is_file() {
+            continue;
+        }
+        let (to, inside) = crate::tools::resolve(&dest, name)?;
+        ensure!(inside && to == dest.join(relative), "A branch file path left its scratch folder");
+        let directory = to.parent().context("Missing branch folder")?;
+        fs::create_dir_all(directory)?;
+        ensure!(directory.canonicalize()? == directory, "A branch file path left its scratch folder");
+        let mut tmp = tempfile::NamedTempFile::new_in(directory)?;
+        std::io::copy(&mut fs::File::open(&from)?, &mut tmp)?;
+        tmp.persist_noclobber(to)?;
+    }
+    Ok(())
+}
+
 pub fn read_html(path: &Path) -> Result<String> {
     ensure!(
         path.extension()

@@ -27,6 +27,8 @@ Use **Tag** or type a tag such as `#release/checklist`. Spindle also recognizes 
 
 Use **Search chats** in the sidebar or Ctrl+Shift+F to find conversations by title or message text. Project chats and archived chats are included. Click a result to open the conversation.
 
+When you edit and resend a message, the new version keeps the files from earlier messages. In a chat without a project, each version can edit its own copy of those files.
+
 **Settings → Troubleshooting** shows the latest model and tool failures on this device, with a jump back to the chat. For eligible public-page failures, the chat offers **Use regular browser** through Browser Link and asks for normal tab access. **Copy troubleshooting report** groups failures by category and tool. The report omits conversation content, URLs, local paths, and model names by default. You can opt in to including model names.
 
 Start a **2-day capture** or **3-day capture** in Troubleshooting and use Spindle normally. It records failures, Browser Link outcomes, and sync decisions while Spindle is running. A capture survives an app restart and stops at the end of its window. It keeps up to 5,000 events and reports any older events omitted at that limit. The report stays available until you replace the capture. Sync entries distinguish branches inside a chat from conflicts preserved as separate chats. A same-title entry counts chats in the same project and notes how many share a history prefix or import identity.
