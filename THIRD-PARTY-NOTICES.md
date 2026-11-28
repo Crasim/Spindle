@@ -72,6 +72,7 @@ Each entry links to the exact upstream release and records its manifest license 
 | [clipboard-win 5.4.3](https://crates.io/crates/clipboard-win/5.4.3) | BSL-1.0 |
 | [codepage 0.1.3](https://crates.io/crates/codepage/0.1.3) | Apache-2.0 OR MIT |
 | [codespan-reporting 0.11.1](https://crates.io/crates/codespan-reporting/0.11.1) | Apache-2.0 |
+| [color_quant 1.1.0](https://crates.io/crates/color_quant/1.1.0) | MIT |
 | [combine 4.6.9](https://crates.io/crates/combine/4.6.9) | MIT |
 | [concurrent-queue 2.5.0](https://crates.io/crates/concurrent-queue/2.5.0) | Apache-2.0 OR MIT |
 | [cookie 0.18.2](https://crates.io/crates/cookie/0.18.2) | MIT OR Apache-2.0 |
@@ -174,6 +175,7 @@ Each entry links to the exact upstream release and records its manifest license 
 | [getrandom 0.2.17](https://crates.io/crates/getrandom/0.2.17) | MIT OR Apache-2.0 |
 | [getrandom 0.3.4](https://crates.io/crates/getrandom/0.3.4) | MIT OR Apache-2.0 |
 | [getrandom 0.4.3](https://crates.io/crates/getrandom/0.4.3) | MIT OR Apache-2.0 |
+| [gif 0.14.2](https://crates.io/crates/gif/0.14.2) | MIT OR Apache-2.0 |
 | [gio 0.18.4](https://crates.io/crates/gio/0.18.4) | MIT |
 | [gio-sys 0.18.1](https://crates.io/crates/gio-sys/0.18.1) | MIT |
 | [gl_generator 0.14.0](https://crates.io/crates/gl_generator/0.14.0) | Apache-2.0 |
@@ -230,6 +232,7 @@ Each entry links to the exact upstream release and records its manifest license 
 | [idna_adapter 1.2.2](https://crates.io/crates/idna_adapter/1.2.2) | Apache-2.0 OR MIT |
 | [if-addrs 0.13.4](https://crates.io/crates/if-addrs/0.13.4) | MIT OR BSD-3-Clause |
 | [image 0.25.10](https://crates.io/crates/image/0.25.10) | MIT OR Apache-2.0 |
+| [image-webp 0.2.4](https://crates.io/crates/image-webp/0.2.4) | MIT OR Apache-2.0 |
 | [indexmap 2.14.2](https://crates.io/crates/indexmap/2.14.2) | Apache-2.0 OR MIT |
 | [ipnet 2.12.2](https://crates.io/crates/ipnet/2.12.2) | MIT OR Apache-2.0 |
 | [itertools 0.13.0](https://crates.io/crates/itertools/0.13.0) | MIT OR Apache-2.0 |

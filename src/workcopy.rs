@@ -45,6 +45,7 @@ pub struct Base {
 
 fn walk(root: &Path, mut each: impl FnMut(&str, &Path) -> Result<()>) -> Result<()> {
     let mut stack = vec![root.to_owned()];
+    let builds = root.join(crate::native::PROJECT_OUTPUTS);
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
@@ -54,6 +55,7 @@ fn walk(root: &Path, mut each: impl FnMut(&str, &Path) -> Result<()>) -> Result<
             }
             let kind = entry.file_type()?;
             let path = entry.path();
+            if path == builds { continue; }
             if kind.is_dir() {
                 stack.push(path);
             } else if kind.is_file() {
@@ -116,6 +118,49 @@ fn base(copy: &Path) -> Result<Base> {
 pub(crate) fn check_project(copy: &Path, project: &Path) -> Result<()> {
     ensure!(base(copy)?.project.canonicalize()? == project.canonicalize()?, "The sandbox belongs to a different project");
     Ok(())
+}
+
+/// Merge current project files into the sandbox wherever it still matches its starting point.
+pub(crate) fn refresh(copy: &Path, project: &Path) -> Result<()> {
+    let project = project.canonicalize()?;
+    let mut record = base(copy)?;
+    ensure!(record.project.canonicalize()? == project, "The sandbox belongs to a different project");
+    let copy = copy.canonicalize()?;
+    let mut incoming = BTreeMap::new();
+    let mut bytes = 0u64;
+    walk(&project, |rel, path| {
+        if path.canonicalize()? != path { return Ok(()); }
+        bytes += std::fs::metadata(path)?.len();
+        ensure!(incoming.len() < MAX_FILES && bytes <= MAX_BYTES, "The project exceeds the sandbox copy limits");
+        incoming.insert(rel.to_owned(), file_hash(path)?);
+        Ok(())
+    })?;
+    let changed: std::collections::BTreeSet<_> = incoming.keys().chain(record.files.keys())
+        .filter(|rel| incoming.get(*rel) != record.files.get(*rel)).cloned().collect();
+    let mut updated = false;
+    let result = (|| -> Result<()> {
+        for rel in changed {
+            let (target, inside) = crate::tools::resolve(&copy, &rel)?;
+            ensure!(inside && target == copy.join(&rel), "Sandbox file path has changed: {rel}");
+            let current = target.is_file().then(|| file_hash(&target)).transpose()?;
+            if current.as_ref() != record.files.get(&rel) { continue; }
+            if incoming.contains_key(&rel) {
+                let path = project.join(&rel);
+                ensure!(path.canonicalize()? == path, "Project file path has changed: {rel}");
+                let contents = std::fs::read(path)?;
+                std::fs::create_dir_all(target.parent().context("Missing sandbox folder")?)?;
+                crate::tools::write_generated(&target, &contents, current.is_some())?;
+                record.files.insert(rel, crate::tools::hash(&contents));
+            } else if target.is_file() {
+                std::fs::remove_file(target)?;
+                record.files.remove(&rel);
+            }
+            updated = true;
+        }
+        Ok(())
+    })();
+    if updated { crate::tools::write_generated(&copy.join(MANIFEST), &serde_json::to_vec(&record)?, true)?; }
+    result
 }
 
 /// Bring a restored project file into this chat's sandbox when its copy is clean.
@@ -426,6 +471,31 @@ pub fn discard(data: &Path, chat: u64, project: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_brings_in_project_updates_and_preserves_unapplied_edits() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let project = tmp.path().join("project");
+        std::fs::create_dir(&project)?;
+        for file in ["clean.rs", "editing.rs", "removed.rs"] { std::fs::write(project.join(file), "initial")?; }
+        let copy = ensure(&tmp.path().join("data"), 1, &project)?;
+        std::fs::write(copy.join("editing.rs"), "unapplied model edit")?;
+        std::fs::write(project.join("editing.rs"), "conflicting project edit")?;
+        std::fs::write(project.join("clean.rs"), "latest project version")?;
+        std::fs::write(project.join("new.rs"), "new project file")?;
+        std::fs::remove_file(project.join("removed.rs"))?;
+        let builds = project.join(crate::native::PROJECT_OUTPUTS);
+        std::fs::create_dir_all(&builds)?;
+        std::fs::write(builds.join("game.exe"), b"fixture")?;
+        refresh(&copy, &project)?;
+        assert_eq!(std::fs::read_to_string(copy.join("clean.rs"))?, "latest project version");
+        assert_eq!(std::fs::read_to_string(copy.join("editing.rs"))?, "unapplied model edit");
+        assert!(copy.join("new.rs").is_file());
+        assert!(!copy.join("removed.rs").exists());
+        assert!(!copy.join(crate::native::PROJECT_OUTPUTS).exists());
+        assert_eq!(changes(&copy)?, vec![Change::Modified("editing.rs".into())]);
+        Ok(())
+    }
 
     #[test]
     fn applying_project_deletions_requires_the_current_list() -> Result<()> {

@@ -9,6 +9,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 mod audio;
+mod attachments;
 mod chat_selection;
 mod audio_settings;
 mod html_preview;
@@ -529,6 +530,7 @@ struct TranscriptRows {
     markdown: std::collections::BTreeMap<usize, reader::Markdown>,
     file_sizes: std::collections::HashMap<String, Option<usize>>,
     file_images: std::collections::HashMap<String, Option<egui::TextureHandle>>,
+    sent_images: attachments::SentImages,
     file_metadata: Option<Receiver<Vec<ArtifactMetadata>>>,
 }
 
@@ -640,6 +642,7 @@ impl TranscriptRows {
             self.file_metadata = None;
         }
         let common = before.history.iter().zip(&after.history).take_while(|(a, b)| a == b).count();
+        self.sent_images.retain_before(common, after.queue.front().map(|task| task.id));
         for name in after.thread.turns.range(common..).flat_map(|(_, turn)| &turn.files) {
             self.file_sizes.remove(name);
             self.file_images.remove(name);
@@ -2373,12 +2376,7 @@ impl Desktop {
                             ui.push_id(("direct-edits",index), |ui| { notes::edit_summary(ui, &turn.edits, None, false); });
                         }
                     }
-                    if !message.images.is_empty() {
-                        ui.horizontal(|ui| {
-                            symbol(ui, Icon::Eye, muted());
-                            ui.weak(format!("{} image{} attached", message.images.len(), if message.images.len() == 1 { "" } else { "s" }));
-                        });
-                    }
+                    if !message.images.is_empty() { self.transcript.sent_images.show(ui, attachments::Key::Message(index), &message.images); }
                     match clicked {
                         Some(reader::CodeAction::OpenFile(name))=>chosen.push((name,reader::FileAction::Open)),
                         Some(cmd)=>action=Some((cmd,state.history.get(index.saturating_sub(1)).map(|m|m.content.clone()).unwrap_or_default())),
@@ -2542,6 +2540,7 @@ impl Desktop {
                             });
                             chat_text.message(self.view.state.history.len());
                             chat_text.label(ui, t.text.as_str(), false);
+                            if !t.images.is_empty() { self.transcript.sent_images.show(ui, attachments::Key::Pending(t.id), &t.images); }
                         });
                     }
                     if let Some(actual) = t.actual.as_deref() && let Some(from) = t.fallback_from(actual) {
@@ -2649,6 +2648,7 @@ impl Desktop {
         if files.is_empty() {
             return;
         }
+        let mut save = None;
         egui::CollapsingHeader::new(format!("Build outputs · {}", files.len()))
             .id_salt(("native-outputs", chat))
             .show(ui, |ui| {
@@ -2657,6 +2657,10 @@ impl Desktop {
                     for name in files {
                         ui.horizontal_wrapped(|ui| {
                             ui.label(name);
+                            if self.view.state.thread.project.is_some() && ui.small_button("Save to project").clicked() {
+                                save = Some(name.clone());
+                                return;
+                            }
                             if !ui.small_button(label).clicked() {
                                 return;
                             }
@@ -2675,6 +2679,7 @@ impl Desktop {
                     }
                 });
             });
+        if let Some(name) = save { self.send(format!("/save-build {}", serde_json::json!(name))); }
     }
 
     fn queue(&mut self, ui: &mut egui::Ui) {
@@ -4699,16 +4704,12 @@ impl Desktop {
             self.notice = "A message can carry up to four images".into();
             return;
         }
-        let thumb = image::load_from_memory(&bytes).ok().map(|img| {
-            let small = img.thumbnail(96, 96).to_rgba8();
-            let size = [small.width() as usize, small.height() as usize];
-            ctx.load_texture(
-                format!("attachment-{}", self.image_drafts.len()),
-                egui::ColorImage::from_rgba_unmultiplied(size, small.as_raw()),
-                egui::TextureOptions::LINEAR,
-            )
-        });
-        self.image_drafts.push((name, bytes, thumb));
+        let Some(pixels) = attachments::pixels(&bytes) else {
+            self.notice = "Could not open this image. Choose a readable image within the size and resolution limits.".into();
+            return;
+        };
+        let thumb = ctx.load_texture(format!("attachment-{}", self.image_drafts.len()), pixels, egui::TextureOptions::LINEAR);
+        self.image_drafts.push((name, bytes, Some(thumb)));
         self.focus = true;
     }
 
@@ -4730,19 +4731,13 @@ impl Desktop {
                         .corner_radius(8)
                         .inner_margin(4)
                         .show(ui, |ui| {
-                            ui.set_height(44.);
+                            ui.set_height(76.);
                             ui.with_layout(
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
-                                    match thumb {
-                                        Some(t) => {
-                                            let scale = 40. / t.size_vec2().max_elem();
-                                            ui.image((t.id(), t.size_vec2() * scale));
-                                        }
-                                        None => symbol(ui, Icon::Eye, muted()),
-                                    }
+                                    attachments::tile(ui, thumb.as_ref(), name);
                                     ui.vertical(|ui| {
-                                        ui.label(Text::new(name).size(12.));
+                                        ui.add_sized([102., 16.], egui::Label::new(Text::new(name).size(12.)).truncate()).on_hover_text(name);
                                         ui.weak(format!("{:.0} KB", bytes.len() as f64 / 1024.));
                                     });
                                     if small(ui, Icon::Trash, "Remove image") {

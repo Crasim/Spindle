@@ -1,6 +1,6 @@
 [package]
 name = "spindle"
-version = "0.3.0-beta.50"
+version = "0.3.0-beta.51"
 edition = "2024"
 rust-version = "1.89"
 
@@ -15,7 +15,7 @@ ring = "0.17"
 webbrowser = "1"
 eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11"] }
 reqwest = { version = "0.12", default-features = false, features = ["json","rustls-tls","multipart"] }
-image = {version="0.25",default-features=false,features=["png","jpeg"]}
+image = {version="0.25",default-features=false,features=["png","jpeg","gif","webp"]}
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 calamine = "0.31"
 csv = "1.3"

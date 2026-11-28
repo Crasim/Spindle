@@ -137,6 +137,8 @@ pub enum Call {
         #[serde(default)]
         args: Vec<String>,
     },
+    #[serde(rename = "save_build")]
+    SaveBuild { #[serde(default)] name: Option<String> },
     #[serde(rename = "build_apk")]
     BuildApk {
         package: String,
@@ -204,6 +206,7 @@ impl Call {
             Call::ReadSkill { .. } => "read_skill",
             Call::BuildBinary { .. } => "build_binary",
             Call::TestBinary { .. } => "test_binary",
+            Call::SaveBuild { .. } => "save_build",
             Call::BuildApk { .. } => "build_apk",
             Call::Apply {} => "apply",
             Call::Setup {} => "setup",
@@ -227,7 +230,7 @@ impl Call {
             Call::Read { path, .. } | Call::FileHistory { path, .. } | Call::Patch { path, .. } | Call::Create { path, .. } => path,
             Call::Python { file, .. } => file,
             Call::RemoteJob{path,..} | Call::BuildBinary { path, .. } => path,
-            Call::TestBinary { .. } | Call::BuildApk { .. } | Call::ReadSkill { .. } => ".",
+            Call::TestBinary { .. } | Call::BuildApk { .. } | Call::ReadSkill { .. } | Call::SaveBuild { .. } => ".",
             Call::HostShell { .. } | Call::DesktopControl(_) => ".",
             Call::Browser { path, .. } | Call::PreviewHtml { path } => path,
             Call::Image { path, .. } => path.as_deref().unwrap_or("image.png"),
@@ -301,6 +304,7 @@ impl Call {
             Call::DesktopControl(action) => action.summary(),
             Call::BuildBinary { name, .. } => format!("Build and test {name} from {p}"),
             Call::TestBinary { name, .. } => format!("Test {name} in isolation"),
+            Call::SaveBuild { name } => name.as_ref().map_or_else(|| "List build outputs".into(), |name| format!("Save {name} in the project")),
             Call::BuildApk { label, .. } => format!("Build {} APK on Android", short(label, 60)),
             Call::Apply {} => "Apply the sandbox changes to the project".into(),
             Call::Setup {} => "Set up the sandbox".into(),
@@ -601,6 +605,8 @@ pub fn definitions() -> serde_json::Value {
             serde_json::json!({"name":s("Exact stored binary filename"),"args":{"type":"array","items":{"type":"string"}}}),
             &["name"]
         ),
+        f("save_build", "List this conversation’s tested builds or copy one into its project’s artifacts/builds folder. A named copy requests approval and needs no rebuild.",
+            serde_json::json!({"name":s("Exact filename returned by build_binary. Omit to list outputs.")}), &[]),
         f(
             "apply",
             "Project chats only: copy the sandbox copy's changes into the project.",
@@ -1908,6 +1914,7 @@ pub(crate) fn run_scoped(root: &Path, call: &Call, path: &Path, replace_file: bo
         | Call::RemoteJob { .. } | Call::HostShell { .. } | Call::DesktopControl(_)
         | Call::BuildBinary { .. }
         | Call::TestBinary { .. }
+        | Call::SaveBuild { .. }
         | Call::BuildApk { .. }
         | Call::Apply {}
         | Call::Setup {}

@@ -1334,6 +1334,13 @@ The user denied this action. Continue with other work or explain the denial. Do 
                     "Finish the work in this conversation before undoing the edits");
                 undo_apply(&mut self.state, chat, index)
             }
+            "/save-build" => {
+                let name: String = serde_json::from_str(args).context("Use /save-build with a Build outputs filename")?;
+                let chat = self.state.chat_id;
+                let project = self.state.thread.project.as_ref().context("Open the project's conversation first")?;
+                let path = crate::native::save_to_project(&self.root, chat, project, &name)?;
+                Ok(format!("Saved project copy: {path}"))
+            }
             "/compact" => {
                 use crate::threads::Action;
                 let id = self.state.chat_id;
@@ -2712,7 +2719,7 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         }
         if crate::native::compiler(&crate::runtime::data_dir()).is_some() || crate::rust_build::available() {
             if crate::rust_build::available() { tools.push("For a Rust executable create main.rs, then call build_binary with that entry and any .rs modules. Spindle supplies rustc and the standard library in the build sandbox. No package installation or Python compiler probe is needed.".into()); }
-            tools.push(r#"- Build and smoke-test a native console program: {"name":"build_binary","args":{"path":"main.c","name":"program","inputs":[],"args":[]}}. List all needed source and header files explicitly. Requires approval. Tested binaries appear in local Build outputs."#.into());
+            tools.push(r#"- Build and smoke-test a native console program: {"name":"build_binary","args":{"path":"main.c","name":"program","inputs":[],"args":[]}}. List all needed source and header files explicitly. Requires approval. Use the result’s verified project path when it reports a project copy."#.into());
             tools.push(r#"- Retest a previously built executable: {"name":"test_binary","args":{"name":"EXACT_FILENAME_FROM_BUILD_OUTPUTS","args":[]}}. Requires approval."#.into());
         } else if crate::native::supported() && mentions(&["executable", "binary", ".exe", "compile", "c++"]) {
             tools.push("- For native C/C++ builds, ask the user to install the compiler in Settings › Sandbox › Native builds.".into());
@@ -2728,6 +2735,9 @@ fn chat_instructions(state: &State, chat: u64, request: &str, first: bool, andro
         }
     } else if !android {
         tools.push(r#"- Request sandbox setup if work needs code execution: {"name":"setup","args":{}}"#.into());
+    }
+    if project.is_some() && crate::native::supported() && !android {
+        tools.push(r#"- For a previously tested local build, use {"name":"save_build","args":{}} to list this chat’s outputs, or pass the exact name in args to save it to artifacts/builds in its project. Use this before considering a rebuild or a host shell."#.into());
     }
     let routed: Vec<_> = WorkKind::OPERATIONS.into_iter().filter_map(|kind| {
         let Some(WorkTarget::Device(id)) = state.placement.effective(state, &scope, kind) else { return None };
@@ -3705,8 +3715,15 @@ fn route_resolved_call(
     let host_access = matches!(env.call, crate::tools::Call::HostShell { .. } | crate::tools::Call::DesktopControl(_));
     let connector = matches!(env.call, crate::tools::Call::ConnectorRead { .. } | crate::tools::Call::SearchNotes { .. });
     let applied_history = matches!(&env.call, crate::tools::Call::FileHistory { applied: true, .. });
-    let tools_root = if sandboxed && project_chat && !is_bobbin && !catalog_lookup && !browser_tab && !connector && !host_access && !applied_history && !matches!(&env.call, crate::tools::Call::TestBinary { .. } | crate::tools::Call::LoadTool { .. }) {
-        match crate::workcopy::ensure(&crate::runtime::data_dir(), chat, &root) {
+    let tools_root = if sandboxed && project_chat && !is_bobbin && !catalog_lookup && !browser_tab && !connector && !host_access && !applied_history && !matches!(&env.call, crate::tools::Call::TestBinary { .. } | crate::tools::Call::SaveBuild { .. } | crate::tools::Call::LoadTool { .. }) {
+        let refresh = (steps == 0 || matches!(env.call, crate::tools::Call::BuildBinary { .. }))
+            && !matches!(env.call, crate::tools::Call::Apply {});
+        let data = crate::runtime::data_dir();
+        let existed = crate::workcopy::folder(&data, chat, &root).join(crate::workcopy::MANIFEST).is_file();
+        match crate::workcopy::ensure(&data, chat, &root).and_then(|copy| {
+            if refresh && existed { crate::workcopy::refresh(&copy, &root)?; }
+            Ok(copy)
+        }) {
             Ok(copy) => copy,
             Err(e) => {
                 set_tool_note(
@@ -3843,6 +3860,19 @@ fn route_resolved_call(
             );
             Ok((crate::policy::Risk::Install, crate::runtime::data_dir()))
         }
+    } else if let crate::tools::Call::SaveBuild { name } = &env.call {
+        if !project_chat || !crate::native::supported() {
+            Err(anyhow::anyhow!("Open a project conversation on the device that built the executable"))
+        } else if let Some(name) = name {
+            if !crate::native::valid_name(name) {
+                Err(anyhow::anyhow!("Use an exact filename from this conversation's Build outputs"))
+            } else {
+                preview = format!("Save a copy of {name} under {} in this project.", crate::native::PROJECT_OUTPUTS);
+                Ok((crate::policy::Risk::Native, root.clone()))
+            }
+        } else {
+            Ok((crate::policy::Risk::Read, root.clone()))
+        }
     } else if matches!(env.call, crate::tools::Call::Apply {}) {
         if !project_chat {
             Err(anyhow::anyhow!(
@@ -3880,7 +3910,7 @@ fn route_resolved_call(
             Err(anyhow::anyhow!("Install the compiler in Settings › Sandbox › Native builds first"))
         } else {
             preview = format!(
-                "Files staged for compilation: {}\nTest arguments: {}\nCompilation and the smoke test run in separate disposable folders. A passing binary is saved to local Build outputs.",
+                "Files staged for compilation: {}\nTest arguments: {}\nCompilation and the smoke test run in separate disposable folders. A passing binary is saved to Build outputs and copied into artifacts/builds for an assigned project.",
                 std::iter::once(path).chain(inputs).cloned().collect::<Vec<_>>().join(", "),
                 serde_json::to_string(args).unwrap_or_default(),
             );
@@ -4546,6 +4576,17 @@ impl Engine {
                     output_preview = Some(artifact);
                     notice
                 })
+            } else if let crate::tools::Call::SaveBuild { name } = &p.call.call {
+                if let Some(name) = name {
+                    self.state.thread_data(p.chat).and_then(|(thread, _)| thread.project.as_ref())
+                        .filter(|project| Some(*project) == p.project.as_ref())
+                        .context("The conversation's project changed before the copy")
+                        .and_then(|project| crate::native::save_to_project(&self.root, p.chat, project, name))
+                        .map(|path| format!("Saved project copy: {path}"))
+                } else {
+                    let files = crate::native::outputs(&self.root, p.chat);
+                    Ok(if files.is_empty() { "This chat has no local tested executables in Build outputs.".into() } else { files.join("\n") })
+                }
             } else if matches!(p.call.call, crate::tools::Call::Apply {}) {
                 let approved = p.confirmed_change().then_some(p.preview.as_str());
                 self.state.serial += 1;

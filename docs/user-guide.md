@@ -25,6 +25,10 @@ Use **Tag** or type a tag such as `#release/checklist`. Spindle also recognizes 
 
 ## Threads and generated files
 
+Image attachments show thumbnails in the composer, while a reply is running, and in the saved chat. Spindle previews PNG, JPEG, GIF, and WebP attachments. Animated images use their first frame for the preview.
+
+Successful local Windows and Linux builds in project chats save a tested copy to `artifacts/builds` in the selected project. To copy an earlier build, expand **Build outputs** and choose **Save to project**. The sandbox refreshes clean project files before new work and native builds, leaving unapplied sandbox edits in place.
+
 Use **Search chats** in the sidebar or Ctrl+Shift+F to find conversations by title or message text. Project chats and archived chats are included. Click a result to open the conversation.
 
 When you edit and resend a message, the new version keeps the files from earlier messages. In a chat without a project, each version can edit its own copy of those files.

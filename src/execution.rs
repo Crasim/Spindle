@@ -944,7 +944,21 @@ impl Engine {
                 let p = *pending;
                 let summary = p.call.call.summary();
                 let (text, ok) = match outcome {
-                    Ok(report) => (report.text, report.ok),
+                    Ok(mut report) => {
+                        if report.ok && let Some(project) = &p.project
+                            && let Some(name) = report.file.as_ref().and_then(|path| path.file_name()).and_then(|name| name.to_str())
+                        {
+                            let current = self.state.thread_data(p.chat).and_then(|(thread, _)| thread.project.as_ref());
+                            if current == Some(project) {
+                                let result = crate::native::save_to_project(&self.root, p.chat, project, name);
+                                match result {
+                                    Ok(path) => report.text.push_str(&format!("\nSaved project copy: {path}")),
+                                    Err(error) => report.text.push_str(&format!("\nThe tested binary is in Build outputs. Could not save the project copy: {error:#}")),
+                                }
+                            }
+                        }
+                        (report.text, report.ok)
+                    }
                     Err(err) => (format!("Error: {err:#}"), false),
                 };
                 crate::engine::record_outcome(&mut self.state, p.id, &text, ok);

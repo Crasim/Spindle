@@ -17,6 +17,7 @@ use std::{
 };
 
 const MAX_BINARY: u64 = 64 * 1024 * 1024;
+pub(crate) const PROJECT_OUTPUTS: &str = "artifacts/builds";
 const MAX_INPUT: u64 = 8 * 1024 * 1024;
 
 struct Bundle {
@@ -221,7 +222,7 @@ fn output_extension() -> &'static str {
     if cfg!(windows) { "exe" } else { "elf" }
 }
 
-fn valid_name(name: &str) -> bool {
+pub(crate) fn valid_name(name: &str) -> bool {
     component(name)
         && name
             .rsplit_once('.')
@@ -365,9 +366,13 @@ pub fn export(workspace: &Path, chat: u64, name: &str, destination: &Path) -> Re
         is_native(&bytes),
         "The stored file is not a native executable for this device"
     );
+    write_executable(destination, &bytes)
+}
+
+fn write_executable(destination: &Path, bytes: &[u8]) -> Result<()> {
     let parent = destination.parent().context("Choose an output folder")?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
-    file.write_all(&bytes)?;
+    file.write_all(bytes)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -378,6 +383,34 @@ pub fn export(workspace: &Path, chat: u64, name: &str, destination: &Path) -> Re
     file.persist_noclobber(destination)
         .context("Choose an unused filename for the executable")?;
     Ok(())
+}
+
+/// Copy a passing build from this conversation's managed store to its project.
+pub(crate) fn save_to_project(workspace: &Path, chat: u64, project: &Path, name: &str) -> Result<String> {
+    save_to_project_in(&crate::runtime::data_dir(), workspace, chat, project, name)
+}
+
+fn save_to_project_in(data: &Path, workspace: &Path, chat: u64, project: &Path, name: &str) -> Result<String> {
+    let (_, bytes) = artifact(data, workspace, chat, name).context("Choose a tested output from this conversation's Build outputs")?;
+    ensure!(is_native(&bytes), "The stored file is not a native executable for this device");
+    let project = crate::projects::existing(project)?.context("The conversation's project folder is unavailable")?;
+    let folder = project.path.join(PROJECT_OUTPUTS);
+    // Verify each parent before creating or writing anything below it.
+    for dir in [project.path.join("artifacts"), folder.clone()] {
+        match fs::create_dir(&dir) {
+            Ok(()) => (),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error).context("Create the project build folder"),
+        }
+        ensure!(dir.canonicalize()? == dir && dir.is_dir(), "The project build folder must stay inside this project");
+    }
+    let path = folder.join(name);
+    if fs::symlink_metadata(&path).is_ok() {
+        ensure!(regular(&path, &folder, MAX_BINARY)? == bytes, "A different output already uses this project filename");
+    } else {
+        write_executable(&path, &bytes)?;
+    }
+    Ok(format!("{PROJECT_OUTPUTS}/{name}"))
 }
 
 pub(crate) fn is_native(bytes: &[u8]) -> bool {
@@ -613,6 +646,41 @@ pub(crate) fn execute_in(data: &Path, workspace: &Path, chat: u64, work: &Path, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stored_build_can_be_saved_only_from_its_chat_without_replacing_project_files() -> Result<()> {
+        if !supported() { return Ok(()); }
+        let temp = tempfile::tempdir()?;
+        let workspace = temp.path().canonicalize()?;
+        let project = workspace.join("project");
+        std::fs::create_dir(&project)?;
+        crate::projects::create(&project, "Build fixture")?;
+        let data = workspace.join("data");
+        let chat = 21;
+        let name = format!("fixture.{}", output_extension());
+        let dir = store(&data, &workspace, chat);
+        std::fs::create_dir_all(&dir)?;
+        let mut bytes = vec![0; 128];
+        if cfg!(windows) {
+            bytes[..2].copy_from_slice(b"MZ");
+            bytes[60] = 64;
+            bytes[64..70].copy_from_slice(b"PE\0\0\x64\x86");
+        } else {
+            bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+            let machine = if cfg!(target_arch = "aarch64") { 183u16 } else { 62u16 };
+            bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        }
+        std::fs::write(dir.join(&name), &bytes)?;
+        assert!(save_to_project_in(&data, &workspace, chat + 1, &project, &name).is_err());
+        let relative = save_to_project_in(&data, &workspace, chat, &project, &name)?;
+        assert_eq!(relative, format!("{PROJECT_OUTPUTS}/{name}"));
+        assert_eq!(std::fs::read(project.join(&relative))?, bytes);
+        assert_eq!(save_to_project_in(&data, &workspace, chat, &project, &name)?, relative);
+        std::fs::write(project.join(&relative), b"keep this")?;
+        assert!(save_to_project_in(&data, &workspace, chat, &project, &name).is_err());
+        assert_eq!(std::fs::read(project.join(&relative))?, b"keep this");
+        Ok(())
+    }
 
     #[cfg(windows)]
     #[test]
