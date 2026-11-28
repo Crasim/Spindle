@@ -1947,6 +1947,12 @@ mod tests {
         app.page = Page::Chat;
         run(&mut app, &ctx, vec![]);
         let labels = run(&mut app, &ctx, vec![]);
+        let attention = click(&mut app, &ctx, labels["Needs attention · 1"]);
+        assert!(app.page == Page::Attention && attention.contains_key("Tool approval"));
+        click(&mut app, &ctx, attention["Review in conversation"]);
+        assert_eq!(commands.try_recv().unwrap(), format!("/open {}", app.view.state.chat_id));
+        assert!(app.page == Page::Chat);
+        let labels = run(&mut app, &ctx, vec![]);
         // Tool steps start folded into one line.
         let folded = "Worked · 1 step · Read src/a.py";
         assert!(labels.contains_key(folded), "{:?}", labels.keys());

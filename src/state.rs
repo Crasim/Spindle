@@ -372,12 +372,13 @@ impl ToolStepLimits {
 #[serde(default)]
 pub struct ReplyNotifications {
     pub enabled: bool,
+    pub approvals: bool,
     pub show_text: bool,
 }
 
 impl Default for ReplyNotifications {
     fn default() -> Self {
-        Self { enabled: true, show_text: true }
+        Self { enabled: true, approvals: true, show_text: true }
     }
 }
 

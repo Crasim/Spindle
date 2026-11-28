@@ -605,12 +605,7 @@ impl Desktop {
             .into_iter()
             .chain(state.requests.iter().filter(|r| r.approved).map(|r| r.chat))
             .collect();
-        let waiting: std::collections::BTreeSet<u64> = state
-            .requests
-            .iter()
-            .filter(|r| !r.approved)
-            .map(|r| r.chat)
-            .collect();
+        let waiting = crate::attention::waiting(&self.view);
         egui::ScrollArea::vertical()
             .id_salt("thread-list")
             .max_height((ui.available_height() - 94.).max(45.))
@@ -793,7 +788,7 @@ impl Desktop {
                                     )
                                     .on_hover_text(if working.contains(&id) {
                                         "Working · more options"
-                                    } else if waiting.contains(&id) {
+                                    } else if waiting.contains_key(&id) {
                                         "Waiting for your approval · more options"
                                     } else {
                                         "More options"
@@ -806,7 +801,7 @@ impl Desktop {
                                         ),
                                         egui::Spinner::new().size(9.).color(accent()),
                                     );
-                                } else if waiting.contains(&id) {
+                                } else if waiting.contains_key(&id) {
                                     ui.painter().circle_filled(dots.rect.center(), 4., accent());
                                 } else {
                                     draw(ui, Icon::More, dots.rect.shrink(6.), muted());

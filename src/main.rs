@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod artifacts;
+mod attention;
 mod android_apk;
 #[cfg(target_os = "android")]
 mod android_background;
@@ -861,11 +862,13 @@ fn main() -> Result<()> {
         let mut notifications = windows_notifications::Notifications::default();
         for view in engine_views {
             #[cfg(windows)]
-            if let Some(workspace) = &notification_workspace
-                && let Some((chat, index)) = view.completed_reply
-                && let Some(reply) = view.state.thread_data(chat).and_then(|(_, history)| history.get(index))
-            {
-                notifications.reply(workspace, view.state.preferences.reply_notifications, &reply.content);
+            if let Some(workspace) = &notification_workspace {
+                notifications.attention(workspace, &view);
+                if let Some((chat, index)) = view.completed_reply
+                    && let Some(reply) = view.state.thread_data(chat).and_then(|(_, history)| history.get(index))
+                {
+                    notifications.reply(workspace, view.state.preferences.reply_notifications, &reply.content);
+                }
             }
             if let Some(c) = &forward_control {
                 c.publish(&view);

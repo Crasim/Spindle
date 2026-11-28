@@ -920,10 +920,11 @@ impl Desktop {
                 ui.heading("Windows notifications");
                 let notifications = &mut prefs.reply_notifications;
                 changed |= ui.checkbox(&mut notifications.enabled, "Notify when a reply finishes and Spindle is out of focus").changed();
-                changed |= ui.add_enabled(notifications.enabled, egui::Checkbox::new(
-                    &mut notifications.show_text, "Show reply text in notifications",
+                changed |= ui.checkbox(&mut notifications.approvals, "Notify when a chat needs your approval").changed();
+                changed |= ui.add_enabled(notifications.enabled || notifications.approvals, egui::Checkbox::new(
+                    &mut notifications.show_text, "Show reply text and chat names in notifications",
                 )).changed();
-                ui.weak("Windows can display reply text on the lock screen and in Notification Center.");
+                ui.weak("Windows can display notification details on the lock screen and in Notification Center.");
             }
             ui.add_space(14.);
             ui.heading("Appearance");

@@ -228,6 +228,7 @@ enum Page {
     Skills,
     Notes,
     ChatSearch,
+    Attention,
     Settings,
 }
 
@@ -389,6 +390,7 @@ pub struct Desktop {
     /// Tool-step groups the user opened, by (chat, first message).
     open_steps: std::collections::HashSet<(u64, usize)>,
     transcript_scroll_to: Option<(u64, f32)>,
+    review_approval_in: Option<u64>,
     /// The notice shown as a toast, and when it appeared.
     toast: Option<(String, std::time::Instant)>,
     /// When the zoom last changed, to save it once the user stops scrolling.
@@ -1180,6 +1182,7 @@ impl Desktop {
             work_started: None,
             open_steps: Default::default(),
             transcript_scroll_to: None,
+            review_approval_in: None,
             toast: None,
             chat_selection: Default::default(),
             zoom_changed: None,
@@ -1510,6 +1513,15 @@ impl Desktop {
                     self.page = Page::Chat;
                 }
                 ui.add_space(10.);
+                let waiting = crate::attention::waiting(&self.view).len();
+                if waiting != 0 || self.page == Page::Attention {
+                    let label = format!("Needs attention · {waiting}");
+                    if control(ui, Icon::Shield, if compact { "" } else { &label },
+                        egui::vec2(ui.available_width(), 37.), self.page == Page::Attention)
+                        .on_hover_text(&label).clicked() {
+                        self.page = Page::Attention;
+                    }
+                }
                 for (page, icon, label) in [
                     (Page::ChatSearch, Icon::Search, "Search chats".into()),
                     (
@@ -1615,6 +1627,7 @@ impl Desktop {
                         Page::Notes => "Notes",
                         Page::Bobbins => "Bobbins",
                         Page::ChatSearch => "Search chats",
+                        Page::Attention => "Needs attention",
                         Page::Settings => "Settings",
                         Page::Projects => "Projects",
                         Page::Project => self.projects.home_title(),
@@ -1639,6 +1652,12 @@ impl Desktop {
                         if small(ui, Icon::Clock, "Session details") {
                             self.details = true;
                         }
+                    if phone {
+                        let waiting = crate::attention::waiting(&self.view).len();
+                        if waiting > 0 && small(ui, Icon::Shield, &format!("Needs attention · {waiting}")) {
+                            self.page = Page::Attention;
+                        }
+                    }
                     // Give the title exactly the space left over after the actions.
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         if mobile_navigation(ctx) && self.page != Page::Chat && !self.has_detail_panel()
@@ -2062,6 +2081,8 @@ impl Desktop {
         let copy_selection = self.chat_selection.touch_copy_visible().then(|| ui.small_button("Copy selection"));
         let mut chat_text = chat_selection::ChatText::collecting();
         let chat = self.view.state.chat_id;
+        let review_approval = self.review_approval_in == Some(chat);
+        if review_approval { self.review_approval_in = None; }
         let scroll_to = self.transcript_scroll_to.take().filter(|(id, _)| *id == chat);
         let mut scroll = egui::ScrollArea::vertical().id_salt(("conversation-history", chat))
             .stick_to_bottom(scroll_to.is_none() && !self.chat_selection.dragging());
@@ -2432,6 +2453,7 @@ impl Desktop {
                 }
                 if let Some(n)=state.thread.compactions.get(&state.history.len()) { compaction_divider(ui,*n); }
                 let mut decision=None;
+                let approval_start = ui.cursor().min;
                 for req in state.requests.iter().filter(|r|r.chat==state.chat_id && !r.approved) {
                     ui.push_id(("approval",req.id),|ui| if let Some(c)=notes::approval_card(ui,req) {decision=Some(c);});
                 }
@@ -2441,6 +2463,9 @@ impl Desktop {
                 let changes: &[String]=if state.preferences.auto_apply && live {&[]} else {&state.thread.sandbox_changes};
                 if let Some(c)=notes::sandbox_bar(ui,changes,self.view.job.as_deref(),applying,&mut self.discarding) {decision=Some(c);}
                 self.browser_access_card(ui);
+                if review_approval {
+                    ui.scroll_to_rect(egui::Rect::from_min_size(approval_start, egui::vec2(1., 1.)), Some(egui::Align::Min));
+                }
                 if let Some(a)=note {self.note_action(a);}
                 if let Some(c)=decision {self.send(c);}
                 if let Some(i)=undo_at {self.send(format!("/undo-apply {} {i}",self.view.state.chat_id));}
@@ -2685,6 +2710,43 @@ impl Desktop {
             });
         }
         self.remote_jobs(ui);
+    }
+
+    fn attention_page(&mut self, ui: &mut egui::Ui) {
+        let waiting = crate::attention::waiting(&self.view);
+        if waiting.is_empty() {
+            ui.label("No conversations are waiting for you.");
+            return;
+        }
+        egui::ScrollArea::vertical().id_salt("approval-inbox").show(ui, |ui| {
+            for (chat, decisions) in waiting.into_iter().rev() {
+                let Some((thread, history)) = self.view.state.thread_data(chat) else { continue };
+                let title: String = thread.label(history).chars().take(140).collect();
+                let reasons: std::collections::BTreeSet<_> = decisions.iter().map(|decision| decision.label()).collect();
+                let details = if decisions.len() == 1 {
+                    reasons.into_iter().next().unwrap_or_default().to_owned()
+                } else {
+                    format!("{} decisions · {}", decisions.len(), reasons.into_iter().collect::<Vec<_>>().join(", "))
+                };
+                let open = ui.push_id(chat, |ui| {
+                    ui.group(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.strong(title);
+                        ui.weak(details);
+                        ui.button("Review in conversation").clicked()
+                    }).inner
+                }).inner;
+                if open {
+                    self.page = Page::Chat;
+                    self.drawer = false;
+                    self.close_reader();
+                    self.focus = false;
+                    self.review_approval_in = Some(chat);
+                    self.send(format!("/open {chat}"));
+                }
+                ui.add_space(6.);
+            }
+        });
     }
 
     fn skills(&mut self, ui: &mut egui::Ui) {
@@ -3503,6 +3565,7 @@ impl eframe::App for Desktop {
                     Page::Notes => self.notes_page(ui),
                     Page::Bobbins => egui::ScrollArea::vertical().id_salt("bobbins").show(ui, |ui| self.bobbins_page(ui)).inner,
                     Page::ChatSearch => self.search_chats(ui),
+                    Page::Attention => self.attention_page(ui),
                     Page::Queue => {
                         egui::ScrollArea::vertical().show(ui, |ui| self.queue(ui));
                     }

@@ -413,6 +413,11 @@ pub fn status_of(v: &crate::engine::View) -> Status {
         let status = if v.state.held { "On hold" } else if v.busy { "Working" } else { "Queued" };
         lines.push(format!("{status}: {label}"));
     }
+    let waiting = crate::attention::waiting(v).len();
+    if waiting > 0 {
+        mood = Mood::Problem;
+        lines.insert(0, format!("Needs attention · {waiting} conversation{}", if waiting == 1 { "" } else { "s" }));
+    }
     Status {
         mood,
         lines,

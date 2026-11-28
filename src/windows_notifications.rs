@@ -1,7 +1,7 @@
-//! Native Windows notifications for finished replies.
+//! Native Windows notifications for finished replies and pending approvals.
 
 use anyhow::{Context, Result};
-use std::{os::windows::ffi::OsStrExt, path::Path};
+use std::{collections::{BTreeMap, BTreeSet}, os::windows::ffi::OsStrExt, path::Path};
 use windows::{
     Data::Xml::Dom::XmlDocument,
     UI::Notifications::{ToastNotification, ToastNotificationManager},
@@ -42,6 +42,35 @@ impl Drop for Runtime {
 #[derive(Default)]
 pub struct Notifications {
     registered: bool,
+    approvals: ApprovalAlerts,
+}
+
+fn spindle_is_foreground() -> bool {
+    let mut foreground = 0;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut foreground) };
+    foreground == std::process::id()
+}
+
+#[derive(Default)]
+struct ApprovalAlerts {
+    announced: BTreeSet<(u64, crate::attention::Decision)>,
+}
+
+impl ApprovalAlerts {
+    fn update(&mut self, waiting: &BTreeMap<u64, Vec<crate::attention::Decision>>, viewed: Option<u64>, enabled: bool) -> BTreeSet<u64> {
+        self.announced.retain(|(chat, decision)| waiting.get(chat).is_some_and(|active| active.contains(decision)));
+        let mut chats = BTreeSet::new();
+        if enabled {
+            for (&chat, decisions) in waiting {
+                if viewed != Some(chat) {
+                    for &decision in decisions {
+                        if self.announced.insert((chat, decision)) { chats.insert(chat); }
+                    }
+                }
+            }
+        }
+        chats
+    }
 }
 
 impl Notifications {
@@ -51,16 +80,26 @@ impl Notifications {
         prefs: crate::state::ReplyNotifications,
         response: &str,
     ) {
-        let mut foreground = 0;
-        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut foreground) };
-        if let Some(body) = notification_body(prefs, foreground == std::process::id(), response)
-            && let Err(error) = self.show(workspace, &body)
+        if let Some(body) = notification_body(prefs, spindle_is_foreground(), response)
+            && let Err(error) = self.show(workspace, "Spindle reply ready", &body)
         {
             eprintln!("Spindle notification: {error:#}");
         }
     }
 
-    fn show(&mut self, workspace: &Path, body: &str) -> Result<()> {
+    pub(crate) fn attention(&mut self, workspace: &Path, view: &crate::engine::View) {
+        let waiting = crate::attention::waiting(view);
+        let viewed = if spindle_is_foreground() { view.state.viewed_chat } else { None };
+        let prefs = view.state.preferences.reply_notifications;
+        let chats = self.approvals.update(&waiting, viewed, prefs.approvals);
+        if chats.is_empty() { return; }
+        let body = approval_body(&view.state, &chats, prefs.show_text);
+        if let Err(error) = self.show(workspace, "Spindle needs your attention", &body) {
+            eprintln!("Spindle approval notification: {error:#}");
+        }
+    }
+
+    fn show(&mut self, workspace: &Path, title: &str, body: &str) -> Result<()> {
         let _runtime = Runtime::initialize()?;
         if !self.registered {
             register(workspace).context("Register Spindle for Windows notifications")?;
@@ -69,7 +108,7 @@ impl Notifications {
         let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?;
         notifier
             .Show(&ToastNotification::CreateToastNotification(
-                &toast_document(body)?,
+                &toast_document(title, body)?,
             )?)
             .context("Send native Windows notification")
     }
@@ -119,18 +158,34 @@ fn register(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
-fn toast_document(body: &str) -> windows::core::Result<XmlDocument> {
+fn toast_document(title: &str, body: &str) -> windows::core::Result<XmlDocument> {
     let document = XmlDocument::new()?;
     document.LoadXml(&HSTRING::from(concat!(
         r#"<toast><visual><binding template="ToastGeneric">"#,
-        r#"<text>Spindle reply ready</text><text hint-maxLines="4"/>"#,
+        r#"<text/><text hint-maxLines="4"/>"#,
         "</binding></visual></toast>",
     )))?;
-    document
-        .GetElementsByTagName(&HSTRING::from("text"))?
-        .Item(1)?
-        .AppendChild(&document.CreateTextNode(&HSTRING::from(body))?)?;
+    let nodes = document.GetElementsByTagName(&HSTRING::from("text"))?;
+    for (index, line) in [title, body].into_iter().enumerate() {
+        nodes.Item(index as u32)?.AppendChild(&document.CreateTextNode(&HSTRING::from(line))?)?;
+    }
     Ok(document)
+}
+
+fn approval_body(state: &crate::state::State, chats: &BTreeSet<u64>, show_names: bool) -> String {
+    let count = chats.len();
+    if show_names && count == 1
+        && let Some((thread, history)) = chats.first().and_then(|&id| state.thread_data(id))
+    {
+        let label = thread.label(history).split_whitespace().collect::<Vec<_>>().join(" ");
+        let label: String = label.chars().filter(|ch| !ch.is_control()).take(100).collect();
+        return format!("“{label}” is waiting for your decision. Open Needs attention in Spindle.");
+    }
+    if count == 1 {
+        "A conversation is waiting for your decision. Open Needs attention in Spindle.".into()
+    } else {
+        format!("{count} conversations need a decision. Open Needs attention in Spindle.")
+    }
 }
 
 fn notification_body(
@@ -193,5 +248,38 @@ mod tests {
         );
         prefs.enabled = false;
         assert!(notification_body(prefs, false, "private").is_none());
+    }
+
+    #[test]
+    fn approvals_notify_once_until_resolved_and_skip_the_visible_chat() {
+        use crate::attention::Decision::Tool;
+        let mut alerts = ApprovalAlerts::default();
+        let mut waiting = BTreeMap::from([(3, vec![Tool(11), Tool(12)]), (7, vec![Tool(14)])]);
+        assert!(alerts.update(&waiting, None, false).is_empty());
+        assert_eq!(alerts.update(&waiting, Some(3), true), BTreeSet::from([7]));
+        assert_eq!(alerts.update(&waiting, None, true), BTreeSet::from([3]));
+        assert!(alerts.update(&waiting, None, true).is_empty());
+        waiting.get_mut(&3).unwrap().push(Tool(15));
+        assert_eq!(alerts.update(&waiting, None, true), BTreeSet::from([3]));
+        waiting.remove(&3);
+        assert!(alerts.update(&waiting, None, true).is_empty());
+        waiting.insert(3, vec![Tool(15)]);
+        assert_eq!(alerts.update(&waiting, None, true), BTreeSet::from([3]));
+    }
+
+    #[test]
+    fn approval_notifications_respect_privacy_and_escape_names_in_native_xml() -> Result<()> {
+        let _runtime = Runtime::initialize()?;
+        let mut state = crate::state::State::default();
+        state.thread.title = "Private & <draft>".into();
+        let chats = BTreeSet::from([state.chat_id]);
+        assert!(!approval_body(&state, &chats, false).contains("Private"));
+        let body = approval_body(&state, &chats, true);
+        assert!(body.contains("Private & <draft>"));
+        let document = toast_document("Spindle needs your attention", &body)?;
+        let xml = document.GetXml()?.to_string_lossy();
+        assert!(xml.contains("Private &amp; &lt;draft&gt;"), "{xml}");
+        ToastNotification::CreateToastNotification(&document)?;
+        Ok(())
     }
 }

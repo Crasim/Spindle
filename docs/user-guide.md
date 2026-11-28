@@ -65,7 +65,7 @@ Spindle checks the selected model's published output and context limits when ava
 
 Your prompts appear on the right and model replies on the left. For file deliverables, ask for a file such as “Create a Snake game in snake.html”, or name a format (“as a .csv”). Spindle saves the output in the project's **artifacts** folder or the thread's scratch folder in Windows Temp. Each file appears as a card where the reply placed it, with its name, type and size, a primary **Open** (or **Preview** for HTML), and **More** for View source, Edit, Download, Show in folder, Copy path and Save a copy. A file name mentioned in the reply is a link that opens it. Markdown, spreadsheets, Word, RTF and PDF open in the Viewer. HTML opens in the built-in **Browser** tab and uses the isolated preview renderer. Code blocks that stay in the message have Copy and Save file. **/preview <file>** opens a workspace file in the same panel.
 
-On Windows, Spindle sends a system notification when a reply finishes and its window is out of focus. **Settings → Preferences → Windows notifications** lets you hide reply text or turn notifications off. Windows can show notifications on the lock screen.
+On Windows, Spindle sends a system notification when a reply finishes and its window is out of focus, or when another conversation needs a permission decision. **Needs attention** in the sidebar lists waiting conversations. Select **Review in conversation** to open the chat at its approval prompts. **Settings → Preferences → Windows notifications** has separate switches for replies and approvals. Turn off **Show reply text and chat names in notifications** for private alerts on the lock screen and in Notification Center.
 
 ### Revising work in progress
 
