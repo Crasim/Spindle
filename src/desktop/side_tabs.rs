@@ -133,11 +133,15 @@ fn file_row(
                 .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
         }).filter(|size| width - controls - gap - size.size().x >= 40.);
         let metadata = size.as_ref().map_or(0., |size| size.size().x + gap);
+        let name_width = (width - controls - metadata).max(0.);
         let open = ui
             .allocate_ui_with_layout(
-                egui::vec2((width - controls - metadata).max(0.), FILE_ROW_HEIGHT),
+                egui::vec2(name_width, FILE_ROW_HEIGHT),
                 egui::Layout::left_to_right(egui::Align::Center),
-                |ui| ui.add(egui::Label::new(Text::new(shown).size(13.)).truncate().sense(egui::Sense::click())),
+                |ui| {
+                    ui.set_min_width(name_width);
+                    ui.add(egui::Label::new(Text::new(shown).size(13.)).truncate().sense(egui::Sense::click()))
+                },
             )
             .inner
             .on_hover_text(name)
@@ -981,42 +985,55 @@ mod tests {
     use crate::execution::{BrowserActivity, BrowserPanel};
 
     #[test]
-    fn long_library_filenames_leave_room_for_size_and_folder_icon() {
-        let ctx = egui::Context::default();
-        let name = "artifacts/builds/a-very-long-native-executable-name-0112233445566778899.exe";
-        let path = PathBuf::from(name);
-        let render = |events| {
-            let mut action = None;
-            let mut folder = egui::Pos2::ZERO;
-            let output = ctx.run(egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(190., 160.))),
-                events,
-                ..Default::default()
-            }, |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
-                    let right = ui.max_rect().right();
-                    folder = egui::pos2(right - 16., ui.cursor().top() + FILE_ROW_HEIGHT / 2.);
-                    action = file_row(ui, name, 3_500_000, Some(&path));
-                    assert!(ui.min_rect().right() <= right + 1.);
+    fn file_names_stay_left_and_actions_stay_right_for_short_and_long_names() {
+        for (name, size) in [
+            ("main.rs", 356),
+            ("a-very-long-native-executable-name-0112233445566778899.exe", 3_500_000),
+        ] {
+            let ctx = egui::Context::default();
+            let path = PathBuf::from(name);
+            let render = |events| {
+                let mut action = None;
+                let mut left = 0.;
+                let mut buttons = [egui::Pos2::ZERO; 2];
+                let output = ctx.run(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(190., 160.))),
+                    events,
+                    ..Default::default()
+                }, |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let row = ui.available_rect_before_wrap();
+                        left = row.left();
+                        let center = row.top() + FILE_ROW_HEIGHT / 2.;
+                        let gap = ui.spacing().item_spacing.x;
+                        buttons = [egui::pos2(row.right() - 48. - gap, center), egui::pos2(row.right() - 16., center)];
+                        action = file_row(ui, name, size, Some(&path));
+                        assert!(ui.min_rect().right() <= row.right() + 1.);
+                    });
                 });
-            });
-            (output, action, folder)
-        };
-        let (output, _, pos) = render(vec![]);
-        let text: Vec<_> = output.shapes.iter().filter_map(|s| {
-            if let egui::Shape::Text(text) = &s.shape { Some(text) } else { None }
-        }).collect();
-        let filename = text.iter().find(|s| s.galley.text().starts_with("a-very")).unwrap();
-        let size = text.iter().find(|s| s.galley.text() == "3.3 MB").unwrap();
-        assert!(filename.pos.x + filename.galley.size().x <= size.pos.x);
-        let click = |pressed| render(vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
-            },
-        ]).1;
-        click(true);
-        assert!(matches!(click(false), Some(RowAction::Reveal(found)) if found == path));
+                (output, action, left, buttons)
+            };
+            let (output, _, left, [history, folder]) = render(vec![]);
+            let text: Vec<_> = output.shapes.iter().filter_map(|s| {
+                if let egui::Shape::Text(text) = &s.shape { Some(text) } else { None }
+            }).collect();
+            let filename = text.iter().find(|s| s.galley.text() == name).unwrap();
+            let size_label = text.iter().find(|s| s.galley.text() == size_text(size)).unwrap();
+            assert!((filename.pos.x - left).abs() <= 1.);
+            assert!(filename.pos.x + filename.galley.size().x <= size_label.pos.x);
+            let click = |pos| {
+                let pointer = |pressed| render(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+                    },
+                ]).1;
+                pointer(true);
+                pointer(false)
+            };
+            assert!(matches!(click(history), Some(RowAction::History(found)) if found == path));
+            assert!(matches!(click(folder), Some(RowAction::Reveal(found)) if found == path));
+        }
     }
 
     #[test]
