@@ -1,5 +1,7 @@
 use super::*;
 use crate::bobbins::{AssignmentDraft, Draft, Picture, Profile, home};
+mod sigil;
+use sigil::Activity;
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -41,7 +43,20 @@ pub(super) struct Screen {
     schedule: Option<ScheduleForm>,
     steering: Option<(u64, String)>,
     deleting: Option<String>,
-    art: BTreeMap<String, Option<egui::TextureHandle>>,
+    art: Artwork,
+}
+
+#[derive(Default)]
+struct Artwork {
+    photos: BTreeMap<String, Option<egui::TextureHandle>>,
+    shells: sigil::Textures,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Look<'a> {
+    activity: Activity,
+    model: Option<&'a str>,
+    demo_rate: Option<f32>,
 }
 
 struct Editor {
@@ -55,6 +70,7 @@ struct Editor {
     job: Option<AssetJob>,
     feedback: String,
     saving: Option<std::time::Instant>,
+    demo_rate: f32,
 }
 
 struct AssetJob {
@@ -127,13 +143,16 @@ fn initials(name: &str) -> String {
 fn picture(
     ui: &mut egui::Ui,
     draft: &Draft,
-    assets: &mut BTreeMap<String, Option<egui::TextureHandle>>,
+    artwork: &mut Artwork,
     length: f32,
+    look: Look<'_>,
 ) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(length, length), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) { return; }
     let paint = ui.painter_at(rect);
     let color = PALETTE.get(draft.color).unwrap_or(&PALETTE[0]).0;
     paint.rect_filled(rect, length * 0.24, color.gamma_multiply(0.23));
+    let assets = &mut artwork.photos;
     if let Some(key) = &draft.avatar {
         if assets.len() >= 64 && !assets.contains_key(key) {
             assets.clear();
@@ -168,6 +187,9 @@ fn picture(
     let p = |x: f32, y: f32| c + egui::vec2(x, y) * length;
     let stroke = egui::Stroke::new(length * 0.05, color);
     match draft.picture {
+        Picture::Sigil | Picture::Character => {
+            sigil::preview(ui, rect, &mut artwork.shells, draft, color, look);
+        }
         Picture::Initials => {
             paint.text(
                 c,
@@ -202,6 +224,52 @@ fn picture(
     }
 }
 
+fn run_activity(view: &View, chat: u64, run: &crate::bobbins::Run) -> Activity {
+    use crate::bobbins::Status;
+    if !run.status.active() {
+        return match run.status {
+            Status::Done => Activity::Complete,
+            Status::Failed | Status::Interrupted => Activity::Failed,
+            _ => Activity::Ready,
+        };
+    }
+    if view.state.requests.iter().any(|request| request.chat == chat && !request.approved) {
+        Activity::NeedsApproval
+    } else if matches!(view.stop, Some(crate::engine::StopTarget::Tool { chat: owner, .. }) if owner == chat) {
+        Activity::UsingTools
+    } else if run.held_task.is_some() {
+        Activity::Paused
+    } else if run.status == Status::Running {
+        Activity::Working
+    } else {
+        Activity::Queued
+    }
+}
+
+fn profile_activity(view: &View, id: &str, profile: &Profile) -> Activity {
+    view.state.bobbins.live(id).map(|(&chat, run)| run_activity(view, chat, run)).max()
+        .unwrap_or_else(|| idle_activity(view, profile))
+}
+
+fn idle_activity(view: &View, profile: &Profile) -> Activity {
+    if profile.paused || profile.archived { return Activity::Paused; }
+    if !view.models.contains(&profile.draft.model) { return Activity::Unavailable; }
+    Activity::Ready
+}
+
+fn choice<T: Copy + Eq>(ui: &mut egui::Ui, caption: &str, value: &mut T, options: &[(T, &'static str)]) {
+    ui.vertical(|ui| {
+        ui.label(caption);
+        egui::ComboBox::from_id_salt(caption)
+            .selected_text(sigil::name(options, *value))
+            .show_ui(ui, |ui| {
+                for &(option, name) in options {
+                    ui.selectable_value(value, option, name);
+                }
+            });
+    });
+}
+
 impl Desktop {
     pub(super) fn bobbins_page(&mut self, ui: &mut egui::Ui) {
         let mut screen = std::mem::take(&mut self.bobbins);
@@ -212,14 +280,20 @@ impl Desktop {
     pub(super) fn bobbin_run_footer(&mut self, ctx: &egui::Context) {
         let chat = self.view.state.chat_id;
         let run = &self.view.state.bobbins.runs[&chat];
+        let activity = run_activity(&self.view, chat, run);
         let (back, cancel) = egui::TopBottomPanel::bottom("bobbin-run")
             .frame(egui::Frame::new().fill(panel()).inner_margin(10))
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let back = control(ui, Icon::Back, "Bobbin runs", egui::vec2(126., 30.), false)
                         .clicked();
+                    picture(ui, &run.configuration, &mut self.bobbins.art, 30., Look {
+                        activity,
+                        model: run.actual_model.as_deref(),
+                        ..Default::default()
+                    });
                     ui.strong(&run.configuration.name);
-                    ui.weak(run.status.label());
+                    ui.weak(if run.status.active() { activity.label() } else { run.status.label() });
                     (
                         back,
                         run.status.active() && ui.button("Cancel run").clicked(),
@@ -349,15 +423,18 @@ impl Screen {
         ui.add_space(10.);
         let registry = &app.view.state.bobbins;
         let query = self.search.trim().to_lowercase();
-        let mut active_counts = BTreeMap::<&str, usize>::new();
-        for (_, run) in registry.active_runs() {
-            *active_counts.entry(&run.bobbin).or_default() += 1;
+        let mut activities = BTreeMap::<&str, (usize, Activity)>::new();
+        for (&chat, run) in registry.active_runs() {
+            let status = activities.entry(&run.bobbin).or_default();
+            status.0 += 1;
+            status.1 = status.1.max(run_activity(&app.view, chat, run));
         }
         let mut matches: Vec<_> = registry
             .profiles
             .iter()
             .filter_map(|(id, p)| {
-                let active = active_counts.get(id.as_str()).copied().unwrap_or(0);
+                let (active, activity) = activities.get(id.as_str()).copied()
+                    .unwrap_or_else(|| (0, idle_activity(&app.view, p)));
                 let status = match self.filter.as_str() {
                     "Archived" => p.archived,
                     "Paused" => p.paused && !p.archived,
@@ -373,10 +450,10 @@ impl Screen {
                         || format!("{} {}", p.draft.name, p.draft.purpose)
                             .to_lowercase()
                             .contains(&query));
-                visible.then_some((id, p, active))
+                visible.then_some((id, p, active, activity))
             })
             .collect();
-        matches.sort_by_cached_key(|(_, p, _)| (!p.pinned, p.draft.name.to_lowercase()));
+        matches.sort_by_cached_key(|(_, p, _, _)| (!p.pinned, p.draft.name.to_lowercase()));
         if matches.is_empty() {
             tile(ui, |ui| {
                 ui.strong(if registry.profiles.is_empty() {
@@ -390,10 +467,10 @@ impl Screen {
             });
         }
         let mut command = None;
-        for (id, profile, count) in matches {
+        for (id, profile, count, activity) in matches {
             ui.push_id(id, |ui| tile(ui, |ui| {
                 ui.horizontal(|ui| {
-                    picture(ui, &profile.draft, &mut self.art, 46.);
+                    picture(ui, &profile.draft, &mut self.art, 46., Look { activity, ..Default::default() });
                     ui.vertical(|ui| {
                         ui.add(egui::Label::new(Text::new(&profile.draft.name).size(17.).strong()).wrap());
                         ui.add(egui::Label::new(&profile.draft.purpose).wrap());
@@ -402,8 +479,8 @@ impl Screen {
                 ui.weak(label(app, &profile.draft.model));
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(home());
-                    ui.strong(if profile.archived { "Archived".into() } else if profile.paused { "Paused".into() }
-                        else if count > 0 { format!("{count} active") } else if !app.view.models.contains(&profile.draft.model) { "Model unavailable".into() } else { "Ready".into() });
+                    ui.strong(if profile.archived { "Archived" } else { activity.label() });
+                    if count > 1 { ui.weak(format!("{count} active")); }
                     if !profile.paused && let Some(next) = upcoming(&profile) {
                         ui.weak(format!("Next {}", crate::automation::local_time(next)));
                     }
@@ -428,8 +505,9 @@ impl Screen {
             return;
         }
         ui.add_space(5.);
+        let activity = profile_activity(&app.view, id, profile);
         ui.horizontal(|ui| {
-            picture(ui, &profile.draft, &mut self.art, 52.);
+            picture(ui, &profile.draft, &mut self.art, 52., Look { activity, ..Default::default() });
             ui.vertical(|ui| {
                 ui.heading(&profile.draft.name);
                 ui.label(&profile.draft.purpose);
@@ -472,6 +550,14 @@ impl Screen {
             ui.strong("Model");
             ui.label(label(app, &p.draft.model));
             access(ui, &p.draft);
+            if p.draft.picture.uses_sigil() && p.draft.avatar.is_none() {
+                egui::CollapsingHeader::new("Reading the sigil").show(ui, |ui| {
+                    let activity = profile_activity(&app.view, id, p);
+                    let length = ui.available_width().min(320.);
+                    picture(ui, &p.draft, &mut self.art, length, Look { activity, ..Default::default() });
+                    sigil::details(ui, &p.draft.sigil, &p.draft.model, activity, None);
+                });
+            }
         });
         if !p.archived {
             tile(ui, |ui| {
@@ -523,7 +609,15 @@ impl Screen {
         }
         ui.horizontal_wrapped(|ui| {
             if ui.button(if p.pinned { "Unpin" } else { "Pin" }).clicked() { send(app, json!({"action":"pin","id":id,"pinned":!p.pinned})); }
-            if ui.button("Duplicate").clicked() { send(app, json!({"action":"duplicate","id":id})); }
+            if p.draft.picture.uses_sigil() && p.draft.avatar.is_none() {
+                crate::widgets::InlineChoice::from_label("duplicate Bobbin").selected_text("Duplicate").show_ui(ui, |ui| {
+                    for (mode, label) in [("keep", "Keep exact appearance"), ("lineage", "Create a lineage variant"), ("new", "Start with a new sigil")] {
+                        if ui.button(label).clicked() { send(app, json!({"action":"duplicate","id":id,"appearance":mode})); }
+                    }
+                });
+            } else if ui.button("Duplicate").clicked() {
+                send(app, json!({"action":"duplicate","id":id}));
+            }
             if p.archived {
                 if ui.button("Restore").clicked() { send(app, json!({"action":"restore","id":id})); }
                 if ui.button("Delete Bobbin…").clicked() { self.deleting = Some(String::new()); }
@@ -737,18 +831,16 @@ impl Screen {
         for (&chat, run) in listed {
             let task = queued.get(&chat);
             let held = task.and_then(|task| task.hold_reason.as_deref());
-            let model = label(
-                app,
-                run.actual_model
-                    .as_deref()
-                    .unwrap_or(&run.configuration.model),
-            );
+            let actual = run.actual_model.as_deref().unwrap_or(&run.configuration.model);
+            let model = label(app, actual);
+            let activity = run_activity(&app.view, chat, run);
             let unread = app.view.state.unread.contains(&chat);
             let can_open = app.view.state.thread_data(chat).is_some();
             let ime = &mut app.android_ime;
             ui.push_id(chat, |ui| {
                 tile(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
+                        picture(ui, &run.configuration, &mut self.art, 36., Look { activity, model: Some(actual), demo_rate: None });
                         ui.strong(&run.title);
                         ui.label(if run.held_task.is_some() {
                             "Paused"
@@ -771,6 +863,14 @@ impl Screen {
                         }
                     ));
                     ui.weak(format!("{model} · {}", run.home));
+                    if run.configuration.picture.uses_sigil() && run.configuration.avatar.is_none() {
+                        egui::CollapsingHeader::new("Reading the sigil").show(ui, |ui| {
+                            let rate = app.view.state.thread_data(chat).and_then(|(thread, _)| {
+                                thread.turns.values().rev().filter(|turn| turn.model == actual).find_map(|turn| turn.tokens_per_second)
+                            });
+                            sigil::details(ui, &run.configuration.sigil, actual, activity, rate);
+                        });
+                    }
                     if run.missed > 0 {
                         ui.weak(format!("{} missed occurrences combined", run.missed));
                     }
@@ -889,6 +989,7 @@ impl Editor {
             job: None,
             feedback: String::new(),
             saving: None,
+            demo_rate: 0.,
         }
     }
 
@@ -1026,17 +1127,14 @@ impl Editor {
     }
 
     fn appearance(&mut self, screen: &mut Screen, app: &mut Desktop, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            picture(ui, &self.draft, &mut screen.art, 72.);
-            picture(ui, &self.draft, &mut screen.art, 36.);
-        });
-        ui.add_space(8.);
         ui.horizontal_wrapped(|ui| {
             for (preset, text) in [
                 (Picture::Initials, "Initials"),
                 (Picture::Spool, "Spool"),
                 (Picture::Shuttle, "Shuttle"),
                 (Picture::Loop, "Loop"),
+                (Picture::Sigil, "Sigil only"),
+                (Picture::Character, "Character with display"),
             ] {
                 if ui
                     .selectable_label(
@@ -1047,9 +1145,21 @@ impl Editor {
                 {
                     self.draft.picture = preset;
                     self.draft.avatar = None;
+                    if preset.uses_sigil() && self.draft.sigil.seed == 0 {
+                        self.reroll(false);
+                    }
                 }
             }
         });
+        let sigil_selected = self.draft.picture.uses_sigil() && self.draft.avatar.is_none();
+        let length = if sigil_selected { (ui.available_width() - 49.).clamp(72., 320.) } else { 72. };
+        ui.horizontal(|ui| {
+            ui.push_id("large-preview", |ui| picture(ui, &self.draft, &mut screen.art, length, Look { demo_rate: Some(self.demo_rate), ..Default::default() }));
+            ui.push_id("compact-preview", |ui| picture(ui, &self.draft, &mut screen.art, 32., Look::default()));
+        });
+        if sigil_selected {
+            self.sigil_controls(ui);
+        }
         ui.horizontal_wrapped(|ui| {
             for (index, (color, name)) in PALETTE.iter().enumerate() {
                 if ui
@@ -1061,6 +1171,15 @@ impl Editor {
             }
         });
         ui.separator();
+        egui::CollapsingHeader::new("Artwork").default_open(!sigil_selected || self.job.is_some()).show(ui, |ui| {
+            self.artwork(screen, app, ui);
+        });
+        if !self.feedback.is_empty() {
+            ui.colored_label(accent(), &self.feedback);
+        }
+    }
+
+    fn artwork(&mut self, screen: &mut Screen, app: &mut Desktop, ui: &mut egui::Ui) {
         field(
             &mut app.android_ime,
             ui,
@@ -1182,6 +1301,7 @@ impl Editor {
                         },
                         &mut screen.art,
                         72.,
+                        Look::default(),
                     );
                     if ui
                         .selectable_label(
@@ -1195,8 +1315,82 @@ impl Editor {
                 });
             }
         });
-        if !self.feedback.is_empty() {
-            ui.colored_label(accent(), &self.feedback);
+    }
+
+    fn reroll(&mut self, motion_only: bool) {
+        match crate::bobbins::sigil::Sigil::new_seed() {
+            Ok(seed) if motion_only => self.draft.sigil.motion_seed = seed,
+            Ok(seed) => self.draft.sigil.seed = seed,
+            Err(error) => self.feedback = format!("Could not choose a new seed: {error}"),
         }
+    }
+
+    fn sigil_controls(&mut self, ui: &mut egui::Ui) {
+        use crate::bobbins::sigil::{Architecture, Direction, Kernel, Line, Outline, Rank, Role, Shell, Terms, Ticks};
+        let config = &mut self.draft.sigil;
+        ui.horizontal_wrapped(|ui| {
+            choice(ui, "Work role", &mut config.role, Role::CHOICES);
+            choice(ui, "Responsibility", &mut config.rank, Rank::CHOICES);
+            if self.draft.picture == Picture::Character {
+                choice(ui, "Shell", &mut config.shell, Shell::CHOICES);
+            } else {
+                choice(ui, "Border shape", &mut config.border, Outline::CHOICES);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            let shapes = &Outline::CHOICES[..Outline::CHOICES.len() - 1];
+            choice(ui, "Layer shape", &mut config.geometry, shapes);
+            choice(ui, "Tick marks", &mut config.ticks, Ticks::CHOICES);
+        });
+        ui.checkbox(&mut config.motion, "Animate this avatar");
+        if config.motion {
+            ui.add(egui::Slider::new(&mut self.demo_rate, 0. ..=120.).text("Preview only · tok/s"));
+        }
+        egui::CollapsingHeader::new("Layer lines and directions").show(ui, |ui| {
+            for i in 0..6 {
+                ui.push_id(i, |ui| ui.horizontal_wrapped(|ui| {
+                    ui.label(format!("Layer {}", i + 1));
+                    choice(ui, "Line", &mut config.lines[i], Line::CHOICES);
+                    choice(ui, "Direction", &mut config.directions[i], Direction::CHOICES);
+                }));
+            }
+        });
+        egui::CollapsingHeader::new("Model display details").show(ui, |ui| {
+            if self.draft.model.is_empty() {
+                ui.weak("Choose a model in Profile to set its display details.");
+                return;
+            }
+            let model = &self.draft.model;
+            let mut mark = config.mark(model);
+            ui.weak(format!("Overrides for {}", route(model).1));
+            ui.horizontal_wrapped(|ui| {
+                choice(ui, "Kernel", &mut mark.kernel, Kernel::CHOICES);
+                choice(ui, "Architecture", &mut mark.architecture, Architecture::CHOICES);
+                choice(ui, "Weights terms", &mut mark.terms, Terms::CHOICES);
+            });
+            ui.horizontal_wrapped(|ui| {
+                let tiers = [(None, "Automatic"),(Some(0), "Tier 0"),(Some(1), "Tier 1"),(Some(2), "Tier 2"),(Some(3), "Tier 3"),(Some(4), "Tier 4"),(Some(5), "Tier 5"),(Some(6), "Tier 6")];
+                choice(ui, "Display tier", &mut mark.tier, &tiers);
+                ui.vertical(|ui| {
+                    ui.label("Physical layers");
+                    let mut layers = mark.physical_layers.unwrap_or(0);
+                    if ui.add(egui::DragValue::new(&mut layers).range(0..=4096).speed(0.25).custom_formatter(|n, _| {
+                        if n == 0. { "Unknown".into() } else { format!("{n:.0}") }
+                    })).changed() { mark.physical_layers = (layers > 0).then_some(layers); }
+                });
+            });
+            if mark == Default::default() {
+                config.models.remove(model);
+            } else if config.models.contains_key(model) || config.models.len() < 128 {
+                config.models.insert(model.clone(), mark);
+            }
+        });
+        egui::CollapsingHeader::new("Reading the sigil").show(ui, |ui| {
+            sigil::details(ui, config, &self.draft.model, Activity::Ready, None);
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Reroll identity details").clicked() { self.reroll(false); }
+            if ui.button("Reroll motion").clicked() { self.reroll(true); }
+        });
     }
 }

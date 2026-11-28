@@ -4462,7 +4462,7 @@ dependencies = [
 
 [[package]]
 name = "spindle"
-version = "0.3.0-beta.54"
+version = "0.3.0-beta.55"
 dependencies = [
  "anyhow",
  "arboard",

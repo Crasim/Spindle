@@ -1,4 +1,5 @@
 //! Local Bobbin profiles, assignments, and run records in the encrypted workspace store.
+pub mod sigil;
 use crate::{
     automation,
     state::{Conversation, Mode, State, Task, ThreadInfo},
@@ -29,6 +30,14 @@ pub enum Picture {
     Spool,
     Shuttle,
     Loop,
+    Sigil,
+    Character,
+}
+
+impl Picture {
+    pub fn uses_sigil(self) -> bool {
+        matches!(self, Self::Sigil | Self::Character)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,6 +55,8 @@ pub struct Draft {
     pub color: usize,
     pub picture: Picture,
     pub avatar: Option<String>,
+    #[serde(skip_serializing_if = "sigil::Sigil::is_default")]
+    pub sigil: sigil::Sigil,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -161,6 +172,8 @@ enum Command {
     },
     Duplicate {
         id: String,
+        #[serde(default)]
+        appearance: sigil::DuplicateAppearance,
     },
     Pin {
         id: String,
@@ -320,6 +333,10 @@ fn validate_profile(draft: &mut Draft) -> Result<()> {
     );
     if let Some(asset) = &draft.avatar {
         ensure!(avatar_path(asset)?.is_file(), "Choose a saved avatar.");
+    }
+    draft.sigil.validate()?;
+    if draft.picture.uses_sigil() && draft.sigil.seed == 0 {
+        draft.sigil.seed = sigil::Sigil::new_seed()?;
     }
     Ok(())
 }
@@ -872,8 +889,27 @@ impl crate::engine::Engine {
                 }
                 Ok("Bobbin saved".into())
             }
-            Command::Duplicate { id: key } => {
+            Command::Duplicate { id: key, appearance } => {
                 let mut duplicate = profile(s, &key)?.clone();
+                match appearance {
+                    sigil::DuplicateAppearance::Keep => {}
+                    sigil::DuplicateAppearance::Lineage => {
+                        ensure!(duplicate.draft.picture.uses_sigil() && duplicate.draft.avatar.is_none(), "Choose a sigil or character before making a lineage variant.");
+                        duplicate.draft.sigil.lineage_variant(key.clone())?;
+                    }
+                    sigil::DuplicateAppearance::New => {
+                        let old = std::mem::take(&mut duplicate.draft.sigil);
+                        duplicate.draft.sigil = sigil::Sigil {
+                            seed: sigil::Sigil::new_seed()?,
+                            role: old.role,
+                            rank: old.rank,
+                            models: old.models,
+                            ..Default::default()
+                        };
+                        duplicate.draft.picture = Picture::Sigil;
+                        duplicate.draft.avatar = None;
+                    }
+                }
                 duplicate.draft.name = format!(
                     "{} copy",
                     duplicate.draft.name.chars().take(60).collect::<String>()

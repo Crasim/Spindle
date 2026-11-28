@@ -5740,7 +5740,7 @@ mod tests {
 
     #[test]
     fn bobbins_keep_model_project_and_run_lifecycle_independent() -> Result<()> {
-        use crate::bobbins::{Draft, Status};
+        use crate::bobbins::{Draft, Picture, Status};
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
         std::fs::create_dir(root.join("Orchard"))?;
@@ -5749,11 +5749,15 @@ mod tests {
         let second = crate::projects::create(&root.join("Studio"), "Studio")?;
         let mut engine = fixture(&root);
         let mut ids: Vec<String> = Vec::new();
-        for (name, model, project) in [("Review", "one", first), ("Draft", "two", second)] {
-            let draft = Draft { name: name.into(), purpose: "Test the Bobbin".into(), model: model.into(), project: Some(project.path), ..Default::default() };
+        for (name, model, project, picture) in [
+            ("Review", "one", first, Picture::Sigil),
+            ("Draft", "two", second, Picture::Character),
+        ] {
+            let draft = Draft { name: name.into(), purpose: "Test the Bobbin".into(), model: model.into(), project: Some(project.path), picture, ..Default::default() };
             bobbin_action(&mut engine, serde_json::json!({"action":"save","draft":draft}))?;
             let id = engine.state.bobbins.profiles.keys().find(|key| !ids.contains(*key)).unwrap().clone();
             assert!(engine.state.queue.is_empty(), "saving a draft cannot run anything");
+            assert_ne!(engine.state.bobbins.profiles[&id].draft.sigil.seed, 0);
             ids.push(id);
         }
         for id in &ids { bobbin_action(&mut engine, serde_json::json!({"action":"run","id":id,"prompt":"Say ready"}))?; }
@@ -5773,6 +5777,7 @@ mod tests {
         assert_eq!(engine.state.bobbins.runs[&second_chat].configuration.model, "two");
         let restored: State = serde_json::from_slice(&serde_json::to_vec(&engine.state)?)?;
         assert_eq!(restored.bobbins.runs[&first_chat].id, run.id);
+        assert_eq!(restored.bobbins.runs[&first_chat].configuration.sigil, run.configuration.sigil);
         assert!(restored.thread_data(first_chat).unwrap().1.iter().any(|m| m.content == "Ready."));
         Ok(())
     }

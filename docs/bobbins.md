@@ -19,6 +19,10 @@ On Windows or Linux, open **Assignments → Schedule** and preview the first run
 
 ## Choose an avatar
 
-Open **Appearance** to choose a color, initials, or a preset. Upload PNG or JPEG artwork to preview its square crop. When an image server is configured, enter an avatar description and choose **Generate**. Generation sends the description to that server. Choose a candidate and save the profile. Avatar artwork is stored on this installation.
+Open **Appearance** and choose **Sigil only**, **Character with display**, or an earlier preset. The character option includes seven original shells. Preview the same avatar at card size and in the compact rendition. Enable animation to see the character’s idle poses and sigil motion. Open **Artwork** to upload PNG or JPEG artwork or generate a candidate using your configured image server.
 
-This release runs each Bobbin on the current installation. Android can create profiles and run manual work while Spindle is active. Paired Bobbin control, ownership transfer, remote capability routing, calendar time-zone rules, animation authoring, and delegation are later milestones.
+Choose the border, layer geometry, work role, and responsibility. The top circles indicate responsibility. Configure kernel, architecture, weights terms, tier, and physical layers under **Model display details**. Model overrides are saved per model. Automatic tiers use Ollama’s reported parameter count where available. **Reading the sigil** identifies the source of the tier and shows recorded throughput for the selected run. The preview speed slider is a demonstration.
+
+**Duplicate** offers the exact appearance, a lineage variant, or a new sigil. A lineage variant keeps the visual identity and changes the motion recipe. Copies have fresh run history, access, and schedules.
+
+Bobbins run on the current installation. Android supports manual runs while Spindle is active. The design’s next milestones cover paired homes and remote capability routing.
