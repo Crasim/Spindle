@@ -952,7 +952,7 @@ impl Engine {
                             if current == Some(project) {
                                 let result = crate::native::save_to_project(&self.root, p.chat, project, name);
                                 match result {
-                                    Ok(path) => report.text.push_str(&format!("\nSaved project copy: {path}")),
+                                    Ok(path) => report.text.push_str(&format!("\nSaved project copy: {path}\nProject link: [Download the executable]({path})")),
                                     Err(error) => report.text.push_str(&format!("\nThe tested binary is in Build outputs. Could not save the project copy: {error:#}")),
                                 }
                             }

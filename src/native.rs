@@ -229,6 +229,14 @@ pub(crate) fn valid_name(name: &str) -> bool {
             .is_some_and(|(_, ext)| ext == output_extension())
 }
 
+/// Resolve Markdown aliases to a name in the current project or chat's build outputs.
+pub(crate) fn download_name(link: &str) -> Option<&str> {
+    let name = link.strip_prefix("sandbox:/mnt/data/").unwrap_or(link);
+    let name = name.strip_prefix(PROJECT_OUTPUTS).and_then(|tail| tail.strip_prefix('/')).unwrap_or(name);
+    (component(name) && name.rsplit_once('.').is_some_and(|(_, ext)| matches!(ext, "exe" | "elf")))
+        .then_some(name)
+}
+
 fn checked_args(args: &[String]) -> Result<()> {
     ensure!(
         args.len() <= 16
@@ -360,16 +368,37 @@ pub fn outputs(workspace: &Path, chat: u64) -> Vec<String> {
     names
 }
 
-pub fn export(workspace: &Path, chat: u64, name: &str, destination: &Path) -> Result<()> {
-    let (_, bytes) = artifact(&crate::runtime::data_dir(), workspace, chat, name)?;
+pub(crate) fn download_bytes(
+    data: &Path,
+    workspace: &Path,
+    chat: u64,
+    project: Option<&Path>,
+    name: &str,
+) -> Result<Vec<u8>> {
+    ensure!(download_name(name) == Some(name), "Invalid executable filename");
+    if let Some(project) = project && let Ok(root) = project.canonicalize() {
+        let path = root.join(PROJECT_OUTPUTS).join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let bytes = regular(&path, &root, MAX_BINARY)?;
+                let signature = if name.ends_with(".exe") { b"MZ".as_slice() } else { b"\x7fELF" };
+                ensure!(bytes.starts_with(signature), "The project file is not an executable");
+                return Ok(bytes);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let (_, bytes) = artifact(data, workspace, chat, name)
+        .context("Build output is unavailable in this chat or project")?;
     ensure!(
         is_native(&bytes),
         "The stored file is not a native executable for this device"
     );
-    write_executable(destination, &bytes)
+    Ok(bytes)
 }
 
-fn write_executable(destination: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn write_executable(destination: &Path, bytes: &[u8]) -> Result<()> {
     let parent = destination.parent().context("Choose an output folder")?;
     let mut file = tempfile::NamedTempFile::new_in(parent)?;
     file.write_all(bytes)?;
@@ -637,7 +666,7 @@ pub(crate) fn execute_in(data: &Path, workspace: &Path, chat: u64, work: &Path, 
         output.persist_noclobber(dir.join(&name))?;
         saved = Some(dir.join(&name));
         report.push_str(&format!(
-            "\nSaved {name} to this chat's Build outputs. The user can download it from there."
+            "\nSaved {name} to this chat's Build outputs. Link it as [Download the executable]({name})."
         ));
     }
     Ok(Report { text: report, ok, file: saved })
@@ -671,15 +700,46 @@ mod tests {
             bytes[18..20].copy_from_slice(&machine.to_le_bytes());
         }
         std::fs::write(dir.join(&name), &bytes)?;
+        assert_eq!(download_bytes(&data, &workspace, chat, None, &name)?, bytes);
+        assert!(download_bytes(&data, &workspace, chat + 1, None, &name).is_err());
         assert!(save_to_project_in(&data, &workspace, chat + 1, &project, &name).is_err());
         let relative = save_to_project_in(&data, &workspace, chat, &project, &name)?;
         assert_eq!(relative, format!("{PROJECT_OUTPUTS}/{name}"));
         assert_eq!(std::fs::read(project.join(&relative))?, bytes);
+        let project_bytes = download_bytes(&data, &workspace, chat + 1, Some(&project), &name)?;
+        let download = workspace.join(&name);
+        write_executable(&download, &project_bytes)?;
+        assert_eq!(std::fs::read(&download)?, bytes);
+        assert!(write_executable(&download, b"do not replace").is_err());
+        assert_eq!(std::fs::read(&download)?, bytes);
         assert_eq!(save_to_project_in(&data, &workspace, chat, &project, &name)?, relative);
         std::fs::write(project.join(&relative), b"keep this")?;
         assert!(save_to_project_in(&data, &workspace, chat, &project, &name).is_err());
         assert_eq!(std::fs::read(project.join(&relative))?, b"keep this");
         Ok(())
+    }
+
+    #[test]
+    fn markdown_downloads_only_resolve_exact_build_names() {
+        for link in [
+            "snake.exe",
+            "artifacts/builds/snake.exe",
+            "sandbox:/mnt/data/snake.exe",
+            "sandbox:/mnt/data/artifacts/builds/snake.exe",
+        ] {
+            assert_eq!(download_name(link), Some("snake.exe"), "{link}");
+        }
+        for link in [
+            "../snake.exe",
+            "artifacts/builds/../snake.exe",
+            "sandbox:/mnt/data/../snake.exe",
+            "C:/snake.exe",
+            "file:///snake.exe",
+            "artifacts/builds/COM1.exe",
+            "https://example.com/snake.exe",
+        ] {
+            assert_eq!(download_name(link), None, "{link}");
+        }
     }
 
     #[cfg(windows)]

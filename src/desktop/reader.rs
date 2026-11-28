@@ -1110,6 +1110,7 @@ pub(super) enum CodeAction {
     Save(String, String),
     /// A filename mentioned inline in a reply was clicked.
     OpenFile(String),
+    DownloadBuild(String),
 }
 
 /// What the user chose on a generated-file card.
@@ -1506,7 +1507,13 @@ impl MarkdownBlock {
                             Piece::Job(job) => { selection.label(ui, job.clone(), false); }
                             Piece::File { path, label } => {
                                 let text = label.as_ref().map_or_else(|| Text::new(path).monospace(), Text::new);
-                                if selection.label(ui, text.color(accent()), true)
+                                if let Some(name) = crate::native::download_name(path) {
+                                    if selection.label(ui, text.color(accent()).underline(), true)
+                                        .on_hover_text(format!("Download {name}")).clicked()
+                                    {
+                                        *action = Some(CodeAction::DownloadBuild(name.to_owned()));
+                                    }
+                                } else if selection.label(ui, text.color(accent()), true)
                                     .on_hover_text("Open in the side panel").clicked()
                                 {
                                     *action = Some(CodeAction::OpenFile(path.clone()));
@@ -1719,12 +1726,10 @@ fn markdown_blocks(ui: &egui::Ui, text: &str, files: &[String], images: bool) ->
                         });
                         if let Some(file) = file {
                             link = Some((file.clone(), String::new(), true));
-                        } else if relative_html_link(local) {
+                        } else if relative_html_link(local) || crate::native::download_name(local).is_some() {
                             link = Some((local.to_owned(), String::new(), true));
                         } else if url.starts_with("https://") || url.starts_with("http://") {
                             link = Some((url, String::new(), false));
-                        } else {
-                            style.color = accent();
                         }
                     }
                     Tag::List(start) => {

@@ -2169,6 +2169,7 @@ impl Desktop {
                 let mut action=None;
                 let mut open_file=None;
                 let mut open_document=None;
+                let mut build_download=None;
                 let mut file_versions=None;
                 let state=&self.view.state;
                 if let Some(work)=state.sync.as_ref().and_then(|p|p.remote_work.get(&state.chat_id)) {
@@ -2379,6 +2380,7 @@ impl Desktop {
                     if !message.images.is_empty() { self.transcript.sent_images.show(ui, attachments::Key::Message(index), &message.images); }
                     match clicked {
                         Some(reader::CodeAction::OpenFile(name))=>chosen.push((name,reader::FileAction::Open)),
+                        Some(reader::CodeAction::DownloadBuild(name))=>build_download=Some(name),
                         Some(cmd)=>action=Some((cmd,state.history.get(index.saturating_sub(1)).map(|m|m.content.clone()).unwrap_or_default())),
                         None=>{}
                     }
@@ -2489,6 +2491,12 @@ impl Desktop {
                 }
                 if let Some(key)=toggle_steps { if !self.open_steps.remove(&key) {self.open_steps.insert(key);} }
                 if let Some(path)=file_versions { self.open_file_history(path); }
+                if let Some(name) = build_download {
+                    let project = self.view.state.thread.project.as_deref();
+                    if let Some(notice) = download_build(&self.root, self.view.state.chat_id, project, &name) {
+                        self.notice = notice;
+                    }
+                }
                 if let Some((name,source,raw,disk))=open_file {
                     if raw {
                         self.reader.open_output(name, source);
@@ -2508,7 +2516,7 @@ impl Desktop {
                 }
                 if let Some((cmd,prompt))=action {
                     match cmd {
-                        reader::CodeAction::OpenFile(_)=>{}
+                        reader::CodeAction::OpenFile(_) | reader::CodeAction::DownloadBuild(_)=>{}
                         reader::CodeAction::Preview(info,body)=>{
                             let name=crate::artifacts::name(&info,&prompt).unwrap_or_else(||"index.html".into());
                             self.reader.open_html(name, body, None);
@@ -2664,17 +2672,9 @@ impl Desktop {
                             if !ui.small_button(label).clicked() {
                                 return;
                             }
-                            #[cfg(windows)]
-                            let target = rfd::FileDialog::new().set_file_name(name).save_file();
-                            #[cfg(not(windows))]
-                            let target = std::env::var_os("HOME").map(|home| {
-                                PathBuf::from(home).join("Downloads").join(name)
-                            });
-                            let Some(target) = target else { return; };
-                            self.notice = match crate::native::export(&self.root, chat, name, &target) {
-                                Ok(()) => format!("Exported {}", crate::projects::display_path(&target)),
-                                Err(err) => format!("Export failed: {err:#}"),
-                            };
+                            if let Some(notice) = download_build(&self.root, chat, None, name) {
+                                self.notice = notice;
+                            }
                         });
                     }
                 });
@@ -3634,6 +3634,40 @@ impl eframe::App for Desktop {
 }
 
 /// Save a generated file to a location the user picks. Off Windows, copy it to Downloads.
+fn download_build(workspace: &Path, chat: u64, project: Option<&Path>, name: &str) -> Option<String> {
+    let download = || -> anyhow::Result<Option<PathBuf>> {
+        let bytes = crate::native::download_bytes(&crate::runtime::data_dir(), workspace, chat, project, name)?;
+        #[cfg(target_os = "android")]
+        return crate::android::download_file(name, &bytes).map(|path| Some(path.into()));
+        #[cfg(not(target_os = "android"))]
+        {
+            let Some(target) = download_target(name) else { return Ok(None); };
+            crate::native::write_executable(&target, &bytes)?;
+            Ok(Some(target))
+        }
+    };
+    match download() {
+        Ok(path) => path.map(|p| format!("Downloaded to {}", crate::projects::display_path(&p))),
+        Err(error) => Some(format!("Download failed: {error:#}")),
+    }
+}
+
+fn download_target(name: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut dialog = rfd::FileDialog::new().set_file_name(name);
+        if let Some(dir) = std::env::var_os("USERPROFILE")
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .filter(|d| d.is_dir())
+        {
+            dialog = dialog.set_directory(dir);
+        }
+        dialog.save_file()
+    }
+    #[cfg(not(windows))]
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads").join(name))
+}
+
 fn super_download(
     name: &str,
     disk: Option<&std::path::Path>,
@@ -3652,21 +3686,7 @@ fn super_download(
         Some(path) => std::fs::read(path)?,
         None => snapshot.as_bytes().to_vec(),
     };
-    #[cfg(windows)]
-    let target = {
-        let mut dialog = rfd::FileDialog::new().set_file_name(name);
-        if let Some(dir) = std::env::var_os("USERPROFILE")
-            .map(|home| PathBuf::from(home).join("Downloads"))
-            .filter(|d| d.is_dir())
-        {
-            dialog = dialog.set_directory(dir);
-        }
-        dialog.save_file()
-    };
-    #[cfg(not(windows))]
-    let target =
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads").join(name));
-    let Some(target) = target else {
+    let Some(target) = download_target(name) else {
         return Ok(None);
     };
     #[cfg(target_os = "linux")]
@@ -3817,32 +3837,48 @@ fn preview_disk(state: &crate::state::State, workspace: &Path, name: &str) -> Op
 }
 
 fn reveal_folder(path: &std::path::Path) -> std::io::Result<()> {
+    let path = path.canonicalize()?;
+    if !path.is_dir() {
+        return Err(std::io::Error::new(std::io::ErrorKind::NotADirectory, "Choose a folder"));
+    }
     #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg(path)
-        .spawn()?;
+    {
+        use windows_sys::Win32::{
+            Foundation::RPC_E_CHANGED_MODE,
+            System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize},
+            UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+        };
+        let wide: Vec<u16> = crate::projects::display_path(&path)
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let apartment = unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) };
+        if apartment < 0 && apartment != RPC_E_CHANGED_MODE {
+            return Err(std::io::Error::from_raw_os_error(apartment));
+        }
+        let result = unsafe {
+            let null = std::ptr::null();
+            let result = ShellExecuteW(std::ptr::null_mut(), null, wide.as_ptr(), null, null, SW_SHOWNORMAL);
+            if apartment >= 0 {
+                CoUninitialize();
+            }
+            result as isize
+        };
+        if result <= 32 {
+            return Err(std::io::Error::other(format!("Explorer could not open the folder (error {result})")));
+        }
+    }
     #[cfg(not(windows))]
     std::process::Command::new("xdg-open").arg(path).spawn()?;
     Ok(())
 }
 
-/// Open the system file manager with the file selected.
+/// Open the file's containing folder in the system file manager.
 fn reveal(path: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(windows)]
-    {
-        let mut arg = std::ffi::OsString::from("/select,");
-        arg.push(path.as_os_str());
-        std::process::Command::new("explorer.exe")
-            .arg(arg)
-            .spawn()?;
-    }
-    #[cfg(not(windows))]
-    {
-        std::process::Command::new("xdg-open")
-            .arg(path.parent().unwrap_or(path))
-            .spawn()?;
-    }
-    Ok(())
+    let folder = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "The file has no containing folder")
+    })?;
+    reveal_folder(folder)
 }
 
 #[cfg(test)]
@@ -3892,6 +3928,29 @@ mod transcript_tests {
             }
         }
         output.shapes.iter().find_map(|shape| find(&shape.shape, shape.clip_rect, label))
+    }
+
+    #[test]
+    fn a_build_link_in_the_transcript_dispatches_a_download() {
+        use egui::{Event, Modifiers, PointerButton};
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, mut app) = fixture(dir.path(), 0);
+        app.view.state.history.extend([
+            crate::ollama::Message::new("user", "Build this"),
+            crate::ollama::Message::new(
+                "assistant",
+                "[Download the executable](sandbox:/mnt/data/artifacts/builds/example.exe)",
+            ),
+        ]);
+        draw(&ctx, &mut app, 0, vec![]);
+        let output = draw(&ctx, &mut app, 1, vec![]);
+        let pos = visible_text(&output, "Download the executable").unwrap();
+        for (index, pressed) in [true, false].into_iter().enumerate() {
+            draw(&ctx, &mut app, index + 2, vec![Event::PointerMoved(pos), Event::PointerButton {
+                pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE,
+            }]);
+        }
+        assert!(app.notice.starts_with("Download failed: Build output is unavailable"), "{}", app.notice);
     }
 
     #[test]

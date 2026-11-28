@@ -114,6 +114,8 @@ enum RowAction {
     History(PathBuf),
 }
 
+const FILE_ROW_HEIGHT: f32 = 30.;
+
 fn file_row(
     ui: &mut egui::Ui,
     name: &str,
@@ -123,35 +125,37 @@ fn file_row(
     let mut action = None;
     ui.horizontal(|ui| {
         let shown = name.rsplit(['/', '\\']).next().unwrap_or(name);
+        let gap = ui.spacing().item_spacing.x;
+        let controls = if disk.is_some() { 2. * (32. + gap) } else { 0. };
+        let width = ui.available_width();
+        let size = (size > 0).then(|| {
+            egui::WidgetText::from(Text::new(size_text(size)).weak())
+                .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body)
+        }).filter(|size| width - controls - gap - size.size().x >= 40.);
+        let metadata = size.as_ref().map_or(0., |size| size.size().x + gap);
         let open = ui
-            .add_sized(
-                [(ui.available_width() - if disk.is_some() { 130. } else { 58. }).max(24.), 21.],
-                egui::Button::new(Text::new(shown).size(13.))
-                    .frame(false)
-                    .truncate(),
+            .allocate_ui_with_layout(
+                egui::vec2((width - controls - metadata).max(0.), FILE_ROW_HEIGHT),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| ui.add(egui::Label::new(Text::new(shown).size(13.)).truncate().sense(egui::Sense::click())),
             )
-            .on_hover_text(name);
+            .inner
+            .on_hover_text(name)
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
         if open.clicked() {
             action = Some(RowAction::Open);
         }
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if let Some(path) = disk
-                && ui
-                    .small_button("Folder")
-                    .on_hover_text("Show in its folder")
-                    .clicked()
-            {
-                action = Some(RowAction::Reveal(path.to_owned()));
-            }
-            if let Some(path) = disk
-                && ui.small_button("History").on_hover_text("Compare and restore file versions").clicked()
-            {
+        if let Some(size) = size {
+            ui.label(size);
+        }
+        if let Some(path) = disk {
+            if small(ui, Icon::Clock, "Compare and restore file versions") {
                 action = Some(RowAction::History(path.to_owned()));
             }
-            if size > 0 {
-                ui.weak(size_text(size));
+            if small(ui, Icon::Folder, "Open containing folder") {
+                action = Some(RowAction::Reveal(path.to_owned()));
             }
-        });
+        }
     });
     action
 }
@@ -230,7 +234,7 @@ impl Library {
             ui.label(Text::new(label).strong())
                 .on_hover_text(root.display().to_string());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("Refresh").clicked() {
+                if small(ui, Icon::Cycle, "Refresh project files") {
                     self.scan(root);
                 }
             });
@@ -259,7 +263,7 @@ impl Library {
         egui::ScrollArea::vertical()
             .id_salt("library-files")
             .auto_shrink([false, false])
-            .show_rows(ui, 22., shown.len(), |ui, rows| {
+            .show_rows(ui, FILE_ROW_HEIGHT, shown.len(), |ui, rows| {
                 for (name, size) in &shown[rows] {
                     let path = root.join(name);
                     ui.push_id(("library", name), |ui| {
@@ -973,8 +977,47 @@ impl BrowserTab {
 
 #[cfg(test)]
 mod tests {
-    use super::{BrowserPane, to_url};
+    use super::*;
     use crate::execution::{BrowserActivity, BrowserPanel};
+
+    #[test]
+    fn long_library_filenames_leave_room_for_size_and_folder_icon() {
+        let ctx = egui::Context::default();
+        let name = "artifacts/builds/a-very-long-native-executable-name-0112233445566778899.exe";
+        let path = PathBuf::from(name);
+        let render = |events| {
+            let mut action = None;
+            let mut folder = egui::Pos2::ZERO;
+            let output = ctx.run(egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(190., 160.))),
+                events,
+                ..Default::default()
+            }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let right = ui.max_rect().right();
+                    folder = egui::pos2(right - 16., ui.cursor().top() + FILE_ROW_HEIGHT / 2.);
+                    action = file_row(ui, name, 3_500_000, Some(&path));
+                    assert!(ui.min_rect().right() <= right + 1.);
+                });
+            });
+            (output, action, folder)
+        };
+        let (output, _, pos) = render(vec![]);
+        let text: Vec<_> = output.shapes.iter().filter_map(|s| {
+            if let egui::Shape::Text(text) = &s.shape { Some(text) } else { None }
+        }).collect();
+        let filename = text.iter().find(|s| s.galley.text().starts_with("a-very")).unwrap();
+        let size = text.iter().find(|s| s.galley.text() == "3.3 MB").unwrap();
+        assert!(filename.pos.x + filename.galley.size().x <= size.pos.x);
+        let click = |pressed| render(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE,
+            },
+        ]).1;
+        click(true);
+        assert!(matches!(click(false), Some(RowAction::Reveal(found)) if found == path));
+    }
 
     #[test]
     fn addresses_become_urls() {
